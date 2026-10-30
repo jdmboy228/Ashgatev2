@@ -71,7 +71,7 @@ func TestUIShellServed(t *testing.T) {
 		{"/app.js", "блокировать"},
 		{"/", `src="apps.js"`},
 		{"/apps.js", "Создать группу приложений"},
-		{"/app.css", "#60CDFF"},
+		{"/app.css", "#FF7A45"},
 		{"/", `src="icons.js"`},
 		{"/icons.js", "const FLUENT"},
 		{"/logo.svg", "svg"},

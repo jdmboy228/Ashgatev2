@@ -24,11 +24,11 @@ const ICONS = {
   checkbox: '<rect x="4" y="4" width="16" height="16" rx="4" fill="currentColor" stroke="none"/><path d="m8 12 3 3 5-6" stroke="var(--acc-tx)"/>',
   square: '<rect x="4" y="4" width="16" height="16" rx="4"/>',
 };
-// [page, label, icon]. Settings sit at the bottom of the pane, as in Windows.
+// [page, label, icon]. Settings sit at the bottom of the rail.
 const NAV = [
   ["rules", "Приложения", "rules"],
   ["proxies", "Прокси", "server"],
-  ["log", "Подключения", "activity"],
+  ["log", "Журнал", "activity"],
 ];
 const NAV_FOOT = [["settings", "Настройки", "sliders"]];
 const STATUS = {
@@ -193,13 +193,9 @@ function cfg() { return state.config; }
 
 function paintChrome() {
   const running = !!(state && state.running);
-  document.body.dataset.theme = (state && state.theme) || "dark";
-  const counts = {};
-  if (state) {
-    counts.proxies = String((cfg().proxies || []).length);
-    counts.rules = String((cfg().rules || []).length);
-  }
-  const item = ([id, label, ic]) => `<button class="nav-item${page === id ? " active" : ""}" data-nav="${id}" type="button" title="${esc(label)}" aria-label="${esc(label)}">${icon(ic)}<span>${label}</span>${counts[id] ? `<span class="count">${counts[id]}</span>` : ""}</button>`;
+  // The window is dark only.
+  document.body.dataset.theme = "dark";
+  const item = ([id, label, ic]) => `<button class="nav-item${page === id ? " active" : ""}" data-nav="${id}" type="button" title="${esc(label)}" aria-label="${esc(label)}">${icon(ic, 20)}<span>${label}</span></button>`;
   setHTML(document.getElementById("nav"), NAV.map(item).join(""));
   setHTML(document.getElementById("nav-foot"), NAV_FOOT.map(item).join(""));
   const side = document.getElementById("side-card");
@@ -210,13 +206,13 @@ function paintChrome() {
   const ksBlocked = state && state.killSwitch && state.killSwitch.on && (state.killSwitch.blocked || []).length;
   const sideSub = running ? (state.active || 0) + " потоков · " + traffic : (ksBlocked ? "kill switch: приложения без сети" : "перехват выключен");
   side.className = "side-card" + (running ? " run" : "");
-  // The Start/Stop button is rebuilt only when the state flips; the live
-  // traffic line is updated in place so clicks on the button are not lost.
-  setHTML(side, `<div class="side-meta"><i class="dot"></i><span class="txt"><span class="name">${sideName}</span><span class="sub" id="side-sub"></span></span></div>
-    <button class="btn side-power${running ? " run" : " pri"}" id="side-power" type="button" aria-label="${powerLabel}">${icon("power", 16)}<span>${powerLabel}</span></button>`);
-  setText(document.getElementById("side-sub"), sideSub);
-  const meta = side.querySelector(".side-meta");
-  if (meta) meta.title = sideName + " · " + sideSub;
+  // The button is rebuilt only when the state flips; the live details go
+  // into its tooltip in place, so clicks on it are not lost.
+  setHTML(side, `<button class="side-power" id="side-power" type="button" aria-label="${powerLabel}">${icon("power", 20)}</button>
+    <div class="side-state"><i class="dot"></i><span>${powerLabel}</span></div>`);
+  const btn = document.getElementById("side-power");
+  const tip = sideName + " · " + sideSub;
+  if (btn && btn.title !== tip) btn.title = tip;
   renderDirty();
 }
 
@@ -271,9 +267,6 @@ function settingsHTML() {
   ${group("Запуск и журнал", [
     row("rocket", "Запускать с Windows", "При входе в систему открывается окно и включается перехват", toggle("auto", !!state.autostart)),
     row("doc", "Подробный журнал", "Уровень debug вместо info в ashgate.log", toggle("verbose", c.log && c.log.level === "debug")),
-  ])}
-  ${group("Окно", [
-    row("brush", "Тема", "Тёмная или светлая", segCtrl("theme", ["Тёмная", "Светлая"], ["dark", "light"], state.theme === "light" ? 1 : 0)),
   ])}
   ${group("О программе", [aboutRow()])}`;
 }
@@ -1099,9 +1092,6 @@ function readSettings() {
   c.killSwitch = document.querySelector('[data-key="kill"]').classList.contains("on");
   c.log = c.log || {};
   c.log.level = document.querySelector('[data-key="verbose"]').classList.contains("on") ? "debug" : "info";
-  const theme = document.querySelector('[data-key="theme"].on');
-  c.ui = { theme: theme ? theme.dataset.value : "dark" };
-  state.theme = c.ui.theme;
   const auto = document.querySelector('[data-key="auto"]').classList.contains("on");
   return auto;
 }
@@ -1229,10 +1219,6 @@ function onClick(e) {
   }
   if (id === "seg") {
     act.parentElement.querySelectorAll("button").forEach((b) => b.classList.toggle("on", b === act));
-    if (act.dataset.key === "theme") {
-      state.theme = act.dataset.value;
-      document.body.dataset.theme = state.theme;
-    }
     if (page === "settings") queueSettings();
     return;
   }
@@ -1497,8 +1483,7 @@ function bootChrome() {
 
 function applyRoute() {
   const h = (location.hash || "#rules").replace("#", "");
-  if (h === "light") { page = "rules"; if (state) { state.theme = "light"; state.config.ui = { theme: "light" }; } }
-  else if (h === "tray") page = "tray";
+  if (h === "tray") page = "tray";
   else if (h === "empty") {
     page = "proxies";
     if (state) {
@@ -1516,10 +1501,6 @@ function applyRoute() {
   else if (h === "proxy-dialog" || h === "vless-dialog") { page = "proxies"; }
   else if (h === "rule-dialog") { page = "rules"; }
   else if (["proxies", "rules", "log", "settings"].includes(h)) page = h;
-  else if (h.startsWith("light-") && ["proxies", "rules", "log", "settings"].includes(h.slice(6))) {
-    page = h.slice(6);
-    if (state) { state.theme = "light"; state.config.ui = { theme: "light" }; }
-  }
   built = "";
 }
 
