@@ -27,14 +27,18 @@ if (-not $dll -or -not $sys) { throw "WinDivert x64 files not found in $zip" }
 
 $winres = Join-Path $root "winres\winres.json"
 $out = Join-Path $root "cmd\ashgate\rsrc"
-try {
-    go run github.com/tc-hib/go-winres@v0.3.1 make --in $winres --arch amd64 --out $out
-} catch {
+# Native commands do not throw on failure: check $LASTEXITCODE.
+go run github.com/tc-hib/go-winres@v0.3.1 make --in $winres --arch amd64 --out $out
+if ($LASTEXITCODE -ne 0) {
     Write-Warning "go-winres failed; administrator rights will be requested at runtime"
 }
 
 $env:CGO_ENABLED = "0"
-go build -trimpath -ldflags "-s -w -H windowsgui" -o (Join-Path dist "ashgate.exe") ./cmd/ashgate
+$exe = Join-Path dist "ashgate.exe"
+# A stale exe from an earlier build must never be packaged.
+if (Test-Path $exe) { Remove-Item $exe }
+go build -trimpath -ldflags "-s -w -H windowsgui" -o $exe ./cmd/ashgate
+if ($LASTEXITCODE -ne 0 -or -not (Test-Path $exe)) { throw "go build failed" }
 Copy-Item $dll.FullName (Join-Path dist "WinDivert.dll") -Force
 Copy-Item $sys.FullName (Join-Path dist "WinDivert64.sys") -Force
 Copy-Item (Join-Path $root "configs\ashgate.example.json") (Join-Path dist "ashgate.example.json") -Force

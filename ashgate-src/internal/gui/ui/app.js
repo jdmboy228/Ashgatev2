@@ -249,7 +249,7 @@ function settingsHTML() {
     row("rocket", "Запускать с Windows", "При входе в систему открывается окно и включается перехват", toggle("auto", !!state.autostart)),
     row("doc", "Подробный журнал", "Уровень debug вместо info в ashgate.log", toggle("verbose", c.log && c.log.level === "debug")),
   ])}
-  ${group("О программе", [aboutRow()])}`;
+  ${group("О программе", [aboutRow(), updateRow()])}`;
 }
 // aboutRow shows which exe is running. After "git pull" only a rebuilt exe
 // changes; compare the commit with the newest one on GitHub.
@@ -261,6 +261,41 @@ function aboutRow() {
     : "Exe собран без git, поэтому коммит неизвестен. Соберите его из клона репозитория, чтобы видеть коммит";
   return row("info", "Версия", desc, `<span class="mono">${esc(text)}</span><button class="iconbtn" type="button" data-act="copy-text" data-text="${esc(text)}" title="Копировать" aria-label="Копировать">${icon("copy", 14)}</button>`);
 }
+// Update check. The server reads version.json on GitHub and opens the
+// download page itself, so the page never handles the link.
+let updateCheck = { busy: false, res: null, err: "" };
+function updateRow() {
+  const u = updateCheck;
+  let desc = "Сравнить с последней версией на GitHub";
+  let warn = false;
+  let ctl = `<button class="btn sm" type="button" data-act="update-check"${u.busy ? " disabled" : ""}>${icon("refresh")}${u.busy ? "Проверка…" : "Проверить"}</button>`;
+  if (u.busy) desc = "Проверяю…";
+  else if (u.err) { desc = "Не удалось проверить: " + u.err; warn = true; }
+  else if (u.res && u.res.available) {
+    desc = "Доступна версия " + u.res.latest + (u.res.notes ? ". " + u.res.notes : "");
+    ctl = `<button class="btn sm pri" type="button" data-act="update-open">Скачать</button>` + ctl;
+  } else if (u.res) desc = "У вас последняя версия, " + u.res.current;
+  return row("refresh", "Обновления", desc, ctl, warn, "update-row");
+}
+function paintUpdate() {
+  const el = document.getElementById("update-row");
+  if (el) el.outerHTML = updateRow();
+}
+async function checkUpdate() {
+  if (updateCheck.busy) return;
+  updateCheck = { busy: true, res: null, err: "" };
+  paintUpdate();
+  try {
+    const res = DEMO
+      ? { current: state.version, latest: state.version, available: false }
+      : await post("/api/update/check");
+    updateCheck = { busy: false, res, err: "" };
+  } catch (err) {
+    updateCheck = { busy: false, res: null, err: err.message };
+  }
+  paintUpdate();
+}
+
 function buildText(b) {
   let t = b.version || "";
   if (b.commit) t += " · " + b.commit;
@@ -276,8 +311,8 @@ function group(title, rows) {
 }
 // Settings icons sit on coloured tiles, as in Windows Settings.
 const SET_COLORS = { globe: "blue", server: "teal", sliders: "violet", shield: "green", swap: "pink", link: "teal", rocket: "orange", doc: "yellow", info: "blue" };
-function row(ic, title, desc, ctl, warn) {
-  return `<div class="set"><span class="sico c-${SET_COLORS[ic] || "blue"}">${icon(ic, 20)}</span><div class="txt"><div class="t">${esc(title)}</div><div class="d${warn ? " warn" : ""}">${esc(desc)}</div></div><div class="ctl">${ctl}</div></div>`;
+function row(ic, title, desc, ctl, warn, id) {
+  return `<div class="set"${id ? ` id="${id}"` : ""}><span class="sico c-${SET_COLORS[ic] || "blue"}">${icon(ic, 20)}</span><div class="txt"><div class="t">${esc(title)}</div><div class="d${warn ? " warn" : ""}">${esc(desc)}</div></div><div class="ctl">${ctl}</div></div>`;
 }
 function toggle(key, on) {
   return `<button class="toggle${on ? " on" : ""}" type="button" data-act="toggle" data-key="${key}" aria-pressed="${on ? "true" : "false"}"><i></i></button>`;
@@ -1122,6 +1157,12 @@ function onClick(e) {
     errorsOnly = !errorsOnly;
     built = "";
     render();
+    return;
+  }
+  if (id === "update-check") { checkUpdate(); return; }
+  if (id === "update-open") {
+    if (DEMO) return;
+    post("/api/update/open").catch((err) => showToast(err.message));
     return;
   }
   if (id === "open-folder") {

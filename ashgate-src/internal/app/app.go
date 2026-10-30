@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"ashgate/internal/autostart"
 	"ashgate/internal/config"
 	"ashgate/internal/gui"
 	"ashgate/internal/killswitch"
@@ -32,6 +33,8 @@ const helpText = `Ashgate — прозрачный прокси для отде�
   ashgate service start
   ashgate service stop
   ashgate quit                    закрыть запущенное окно, как «Выход» (для update.bat)
+  ashgate cleanup [-config файл]  перед удалением: закрыть окно, снять правила
+                                  kill switch и задачу автозапуска
   ashgate version
 
 Без -config используется %ProgramData%\Ashgate\config.json
@@ -92,6 +95,12 @@ func dispatch(args []string) int {
 	case "quit":
 		prepareConsole()
 		return cmdQuit()
+	case "cleanup":
+		// Run by the uninstaller; see installer.iss. No console: it runs hidden.
+		if stop, code := ensureElevated(args); stop {
+			return code
+		}
+		return cmdCleanup(rest)
 	case "gui":
 		if stop, code := ensureElevated(args); stop {
 			return code
@@ -119,6 +128,31 @@ func cmdQuit() int {
 		fmt.Fprintln(os.Stderr, "Нужны права администратора: запустите команду из консоли администратора.")
 	default:
 		fmt.Fprintln(os.Stderr, "Ashgate не закрылся за 20 секунд.")
+	}
+	return code
+}
+
+// cmdCleanup undoes what Ashgate set up outside its folder, so uninstalling
+// does not leave proxied programs blocked by the kill switch's firewall
+// rules or an autostart task that points at a deleted exe. The config in
+// ProgramData is kept, like other programs keep their settings.
+func cmdCleanup(args []string) int {
+	path, _, err := parseArgs(args)
+	if err != nil {
+		return 2
+	}
+	code := 0
+	// Close the window first: it would put the firewall rules back.
+	switch gui.Quit(20 * time.Second) {
+	case gui.QuitDone, gui.QuitNotRunning:
+	default:
+		code = 1
+	}
+	if err := killswitch.New(killswitch.StatePath(path)).Unblock(); err != nil && !errors.Is(err, killswitch.ErrUnsupported) {
+		code = 1
+	}
+	if err := autostart.Disable(); err != nil {
+		code = 1
 	}
 	return code
 }

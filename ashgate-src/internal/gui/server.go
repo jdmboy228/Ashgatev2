@@ -27,6 +27,7 @@ import (
 	"ashgate/internal/process"
 	"ashgate/internal/rules"
 	rt "ashgate/internal/runtime"
+	"ashgate/internal/update"
 	"ashgate/internal/version"
 	"ashgate/internal/vless"
 )
@@ -85,6 +86,11 @@ type controller struct {
 	// ksPending/ksRunning coalesce kill-switch syncs requested by saves.
 	ksPending bool
 	ksRunning bool
+
+	// updateURL is the download page from the last update check that found
+	// a newer version. /api/update/open opens only this link, never one the
+	// page sends.
+	updateURL string
 
 	// Per-rule speed sampling; see ruleStatsLocked.
 	statPrev  map[string]engine.RuleStat
@@ -294,6 +300,30 @@ func (c *controller) api(w http.ResponseWriter, r *http.Request) {
 			apps = []process.Installed{}
 		}
 		writeJSON(w, http.StatusOK, apps)
+	case "/api/update/check":
+		c.post(w, r, func() (any, error) {
+			res, err := checkUpdate(r.Context(), nil, update.URL, version.Version)
+			if err != nil {
+				return nil, err
+			}
+			c.mu.Lock()
+			c.updateURL = ""
+			if res.Available {
+				c.updateURL = res.URL
+			}
+			c.mu.Unlock()
+			return res, nil
+		})
+	case "/api/update/open":
+		c.post(w, r, func() (any, error) {
+			c.mu.Lock()
+			link := c.updateURL
+			c.mu.Unlock()
+			if link == "" {
+				return nil, errors.New("сначала проверьте обновления")
+			}
+			return nil, openInBrowser(link)
+		})
 	case "/api/reveal":
 		c.post(w, r, func() (any, error) {
 			return nil, revealConfigDir(c.path)
@@ -767,13 +797,30 @@ func revealConfigDir(path string) error {
 	if runtime.GOOS != "windows" {
 		return errors.New("папка открывается в Windows")
 	}
-	// An absolute path: this process is elevated and must not run an
-	// explorer.exe found on PATH.
+	return exec.Command(explorerExe(), dir).Start()
+}
+
+// openInBrowser opens an https link in the default browser. Explorer hands
+// it to the running desktop shell, so the browser does not inherit this
+// process's administrator rights.
+func openInBrowser(link string) error {
+	if !strings.HasPrefix(link, "https://") {
+		return errors.New("ссылка должна начинаться с https://")
+	}
+	if runtime.GOOS != "windows" {
+		return errors.New("ссылка открывается в Windows")
+	}
+	return exec.Command(explorerExe(), link).Start()
+}
+
+// explorerExe is an absolute path: this process is elevated and must not
+// run an explorer.exe found on PATH.
+func explorerExe() string {
 	root := os.Getenv("SystemRoot")
 	if root == "" {
 		root = `C:\Windows`
 	}
-	return exec.Command(filepath.Join(root, "explorer.exe"), dir).Start()
+	return filepath.Join(root, "explorer.exe")
 }
 
 func ruConfig(err error) string {
@@ -902,6 +949,7 @@ var (
 	listInstalled = process.InstalledApps
 	lookPath      = exec.LookPath
 	statFile      = os.Stat
+	checkUpdate   = update.Check
 )
 
 // iconCache keeps app icons, and the names that have none, so redrawing the
