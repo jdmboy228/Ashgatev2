@@ -18,6 +18,10 @@ const (
 	// instead of opening a second window. The event also allows SetEvent.
 	mutexSDDL = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x00100000;;;WD)(A;;0x00100000;;;AU)"
 	eventSDDL = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x00100002;;;WD)(A;;0x00100002;;;AU)"
+	// The quit event (ashgate quit, used by update.bat) is for SYSTEM and
+	// elevated administrators only: anyone else could switch protection off.
+	instanceQuitEvent = `Global\AshgateQuit`
+	quitSDDL          = "D:P(A;;GA;;;SY)(A;;GA;;;BA)"
 )
 
 const alreadyRunning = "Ashgate уже запущен. Если окна не видно, откройте диспетчер задач и завершите лишний ashgate.exe, затем запустите снова."
@@ -51,10 +55,14 @@ func claimInstance() (release func(), already bool) {
 		}
 		return func() {}, true
 	}
-	ev := createShowEvent()
+	ev := createEvent(eventSDDL, instanceEvent)
+	quit := createEvent(quitSDDL, instanceQuitEvent)
 	stop := make(chan struct{})
 	if ev != 0 {
-		go watchShow(ev, stop)
+		go watchEvent(ev, stop, requestShow)
+	}
+	if quit != 0 {
+		go watchEvent(quit, stop, requestQuit)
 	}
 	return func() {
 		select {
@@ -64,6 +72,9 @@ func claimInstance() (release func(), already bool) {
 		}
 		if ev != 0 {
 			windows.CloseHandle(ev)
+		}
+		if quit != 0 {
+			windows.CloseHandle(quit)
 		}
 		windows.CloseHandle(mutex)
 	}, false
@@ -81,14 +92,14 @@ func createNamed(open func(*uint16) (windows.Handle, error), name string) (windo
 	return h, false, err
 }
 
-func createShowEvent() windows.Handle {
-	sa := sdSA(eventSDDL)
+func createEvent(sddl, name string) windows.Handle {
+	sa := sdSA(sddl)
 	if sa == nil {
 		return 0
 	}
 	ev, _, err := createNamed(func(name *uint16) (windows.Handle, error) {
 		return windows.CreateEvent(sa, 0, 0, name)
-	}, instanceEvent)
+	}, name)
 	if err != nil && !errors.Is(err, windows.ERROR_ALREADY_EXISTS) {
 		if ev != 0 {
 			windows.CloseHandle(ev)
@@ -115,7 +126,7 @@ func accessDenied(err error) bool {
 	return err != nil && errors.Is(err, windows.ERROR_ACCESS_DENIED)
 }
 
-func watchShow(ev windows.Handle, stop <-chan struct{}) {
+func watchEvent(ev windows.Handle, stop <-chan struct{}, fire func()) {
 	for {
 		select {
 		case <-stop:
@@ -132,9 +143,59 @@ func watchShow(ev windows.Handle, stop <-chan struct{}) {
 		default:
 		}
 		if r == windows.WAIT_OBJECT_0 {
-			requestShow()
+			fire()
 		}
 	}
+}
+
+// requestQuit asks the window thread to exit as «Выход» does.
+func requestQuit() {
+	h := appHost
+	if h == nil || h.hwnd == 0 {
+		return
+	}
+	pPostMessage.Call(h.hwnd, wmQuitReq, 0, 0)
+}
+
+// Quit result codes for the ashgate quit command.
+const (
+	QuitDone       = 0 // the running window exited
+	QuitTimeout    = 1 // signalled, but it did not exit in time
+	QuitNotRunning = 2 // no Ashgate window is running
+	QuitTooOld     = 3 // a window runs, but its version has no quit signal
+	QuitDenied     = 4 // not elevated: only administrators may stop Ashgate
+)
+
+// Quit asks the running window to exit the way «Выход» does (stop capture,
+// restore the kill switch, stop the bridges) and waits for it to go.
+func Quit(timeout time.Duration) int {
+	if !instancePresent() {
+		return QuitNotRunning
+	}
+	ptr, err := windows.UTF16PtrFromString(instanceQuitEvent)
+	if err != nil {
+		return QuitTooOld
+	}
+	h, err := windows.OpenEvent(windows.EVENT_MODIFY_STATE, false, ptr)
+	if accessDenied(err) {
+		return QuitDenied
+	}
+	if err != nil || h == 0 {
+		return QuitTooOld
+	}
+	err = windows.SetEvent(h)
+	windows.CloseHandle(h)
+	if err != nil {
+		return QuitTimeout
+	}
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if !instancePresent() {
+			return QuitDone
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	return QuitTimeout
 }
 
 func requestShow() {

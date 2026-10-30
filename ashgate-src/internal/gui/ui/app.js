@@ -18,56 +18,19 @@ function setHTML(el, html) {
 function setText(el, text) {
   if (el && el.textContent !== text) el.textContent = text;
 }
+// Fluent icons live in icons.js (FLUENT). These few are drawn here.
 const ICONS = {
-  home: '<path d="M3 10.5 12 3l9 7.5V20a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z"/>',
-  server: '<rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/><path d="M7 7.5h.01M7 16.5h.01"/>',
-  rules: '<path d="M11 6h10M11 12h10M11 18h10M3 6l1.5 1.5L7.5 4.5M3 12l1.5 1.5 3-3M3 18l1.5 1.5 3-3"/>',
-  activity: '<path d="M3 12h4l3-8 4 16 3-8h4"/>',
-  sliders: '<path d="M4 6h9M19 6h1M4 12h3M13 12h7M4 18h11M21 18h-1"/><circle cx="16" cy="6" r="2.5"/><circle cx="10" cy="12" r="2.5"/><circle cx="18" cy="18" r="2.5"/>',
-  power: '<path d="M12 3v8"/><path d="M6.4 6.6a8 8 0 1 0 11.2 0"/>',
-  plus: '<path d="M12 5v14M5 12h14"/>',
-  search: '<circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/>',
-  folder: '<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>',
-  pause: '<path d="M9 5v14M15 5v14"/>',
-  play: '<path d="M8 5v14l11-7z"/>',
-  trash: '<path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/>',
-  edit: '<path d="M4 20h4L19 9l-4-4L4 16z"/>',
-  refresh: '<path d="M20 12a8 8 0 1 1-2.3-5.6M20 4v5h-5"/>',
-  eye: '<path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',
-  check: '<path d="m5 12 5 5L20 7"/>',
-  info: '<circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8h.01"/>',
-  more: '<circle cx="12" cy="5" r="1.2" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="1.2" fill="currentColor" stroke="none"/><circle cx="12" cy="19" r="1.2" fill="currentColor" stroke="none"/>',
   grip: '<circle cx="9" cy="6" r="1.3" fill="currentColor" stroke="none"/><circle cx="15" cy="6" r="1.3" fill="currentColor" stroke="none"/><circle cx="9" cy="12" r="1.3" fill="currentColor" stroke="none"/><circle cx="15" cy="12" r="1.3" fill="currentColor" stroke="none"/><circle cx="9" cy="18" r="1.3" fill="currentColor" stroke="none"/><circle cx="15" cy="18" r="1.3" fill="currentColor" stroke="none"/>',
-  min: '<path d="M6 12h12"/>',
-  max: '<rect x="6" y="6" width="12" height="12" rx="1.5"/>',
-  close: '<path d="M6 6l12 12M18 6 6 18"/>',
-  shield: '<path d="M12 3 5 6v6c0 4.5 3 7.5 7 9 4-1.5 7-4.5 7-9V6z"/><path d="m9 12 2 2 4-4"/>',
-  exit: '<path d="M15 4h3a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-3M10 8l-4 4 4 4M6 12h10"/>',
-  window: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18"/>',
-  copy: '<rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/>',
-  paste: '<path d="M9 4h6M10 2h4a1 1 0 0 1 1 1v2H9V3a1 1 0 0 1 1-1z"/><rect x="5" y="5" width="14" height="16" rx="2"/>',
-  socks: '<path d="M12 3a7 7 0 0 0-7 7c0 5 7 11 7 11s7-6 7-11a7 7 0 0 0-7-7z"/><circle cx="12" cy="10" r="2.2"/>',
-  http: '<path d="M4 7h16M4 12h16M4 17h10"/>',
-  vless: '<path d="M13 3 5 14h6l-1 7 8-11h-6z"/>',
-  arrow: '<path d="M5 12h14M13 6l6 6-6 6"/>',
-  globe: '<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.5 2.7 3.7 5.7 3.7 9S14.5 18.3 12 21c-2.5-2.7-3.7-5.7-3.7-9S9.5 5.7 12 3z"/>',
-  ban: '<circle cx="12" cy="12" r="9"/><path d="M5.6 5.6l12.8 12.8"/>',
-  chev: '<path d="m6 9 6 6 6-6"/>',
-  chevr: '<path d="m9 6 6 6-6 6"/>',
-  up: '<path d="M12 19V5M6 11l6-6 6 6"/>',
-  down: '<path d="M12 5v14M6 13l6 6 6-6"/>',
-  branch: '<circle cx="6" cy="5" r="2"/><circle cx="6" cy="19" r="2"/><circle cx="18" cy="9" r="2"/><path d="M6 7v10M18 11c0 4-6 3-12 6"/>',
-  alert: '<path d="M12 3 2 20h20z"/><path d="M12 10v4M12 17h.01"/>',
   checkbox: '<rect x="4" y="4" width="16" height="16" rx="4" fill="currentColor" stroke="none"/><path d="m8 12 3 3 5-6" stroke="var(--acc-tx)"/>',
   square: '<rect x="4" y="4" width="16" height="16" rx="4"/>',
 };
+// [page, label, icon]. Settings sit at the bottom of the pane, as in Windows.
 const NAV = [
-  ["home", "Главная"],
-  ["server", "Прокси"],
-  ["rules", "Приложения"],
-  ["activity", "Подключения"],
-  ["sliders", "Настройки"],
+  ["rules", "Приложения", "rules"],
+  ["proxies", "Прокси", "server"],
+  ["log", "Подключения", "activity"],
 ];
+const NAV_FOOT = [["settings", "Настройки", "sliders"]];
 const STATUS = {
   open: ["открыто", "ok"],
   closed: ["закрыто", "neu"],
@@ -82,7 +45,7 @@ const ACTION = {
 };
 
 let state = null;
-let page = "home";
+let page = "rules";
 let modal = null;
 let paused = false;
 let frozen = null;
@@ -91,7 +54,6 @@ let logProto = "all";
 let sel = { proxy: 0, rule: -1, log: "" };
 let dragging = false;
 let built = "";
-let homeKey = "";
 let lastErr = "";
 let lastBridge = "";
 let tipEl = null;
@@ -105,7 +67,9 @@ let settingsTimer = null;
 
 function icon(name, size) {
   size = size || 16;
-  const fill = name === "more" || name === "grip" ? "currentColor" : "none";
+  const f = (size >= 18 && FLUENT[name + "20"]) || FLUENT[name] || FLUENT[name + "20"];
+  if (f) return `<svg width="${size}" height="${size}" viewBox="0 0 ${f[0]} ${f[0]}" fill="currentColor" aria-hidden="true"><path d="${f[1]}"/></svg>`;
+  const fill = name === "grip" ? "currentColor" : "none";
   return `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="${fill}" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">${ICONS[name] || ""}</svg>`;
 }
 function esc(s) {
@@ -148,8 +112,8 @@ function demoState() {
   const on = true;
   const off = false;
   return {
-    version: "0.7.2",
-    build: { version: "0.7.2", commit: "912208e", time: "2026-10-26T18:40:00Z" },
+    version: "0.7.3",
+    build: { version: "0.7.3", commit: "912208e", time: "2026-10-26T18:40:00Z" },
     path: "C:\\ProgramData\\Ashgate\\config.json",
     running: true,
     active: 12,
@@ -230,17 +194,14 @@ function cfg() { return state.config; }
 function paintChrome() {
   const running = !!(state && state.running);
   document.body.dataset.theme = (state && state.theme) || "dark";
-  const nav = document.getElementById("nav");
   const counts = {};
   if (state) {
-    counts[1] = String((cfg().proxies || []).length);
-    counts[2] = String((cfg().rules || []).length);
+    counts.proxies = String((cfg().proxies || []).length);
+    counts.rules = String((cfg().rules || []).length);
   }
-  setHTML(nav, NAV.map((n, i) => {
-    const active = page === ["home", "proxies", "rules", "log", "settings"][i];
-    const id = ["home", "proxies", "rules", "log", "settings"][i];
-    return `<button class="nav-item${active ? " active" : ""}" data-nav="${id}" type="button" title="${esc(n[1])}" aria-label="${esc(n[1])}">${icon(n[0])}<span>${n[1]}</span>${counts[i] ? `<span class="count">${counts[i]}</span>` : ""}</button>`;
-  }).join(""));
+  const item = ([id, label, ic]) => `<button class="nav-item${page === id ? " active" : ""}" data-nav="${id}" type="button" title="${esc(label)}" aria-label="${esc(label)}">${icon(ic)}<span>${label}</span>${counts[id] ? `<span class="count">${counts[id]}</span>` : ""}</button>`;
+  setHTML(document.getElementById("nav"), NAV.map(item).join(""));
+  setHTML(document.getElementById("nav-foot"), NAV_FOOT.map(item).join(""));
   const side = document.getElementById("side-card");
   if (!side) return;
   const sideName = running ? "Работает" : "Остановлен";
@@ -251,17 +212,15 @@ function paintChrome() {
   side.className = "side-card" + (running ? " run" : "");
   // The Start/Stop button is rebuilt only when the state flips; the live
   // traffic line is updated in place so clicks on the button are not lost.
-  // As in the design: status beacon and label, then one large button.
-  // The details stay in the tooltip; the Home page shows them in full.
-  setHTML(side, `<button class="side-meta" id="side-status" type="button" aria-label="${esc(sideName)}"><span class="beacon"><i class="dot"></i></span><span class="name">${sideName}</span></button>
-    <button class="side-power${running ? " run" : ""}" id="side-power" type="button" aria-label="${powerLabel}">${icon("power", 16)}<span>${powerLabel}</span></button>`);
+  setHTML(side, `<div class="side-meta"><i class="dot"></i><span class="txt"><span class="name">${sideName}</span><span class="sub" id="side-sub"></span></span></div>
+    <button class="btn side-power${running ? " run" : " pri"}" id="side-power" type="button" aria-label="${powerLabel}">${icon("power", 16)}<span>${powerLabel}</span></button>`);
+  setText(document.getElementById("side-sub"), sideSub);
   const meta = side.querySelector(".side-meta");
   if (meta) meta.title = sideName + " · " + sideSub;
   renderDirty();
 }
 
 function pageHTML() {
-  if (page === "home") return homeHTML();
   if (page === "proxies") return proxiesHTML();
   if (page === "rules") return appsHTML();
   if (page === "log") return logHTML();
@@ -269,18 +228,13 @@ function pageHTML() {
   return "";
 }
 
-function homeHTML() {
-  return `<div class="head"><div><h1>Главная</h1><p class="sub">Сводка перехвата. Запуск и остановка — кнопка в панели слева.</p></div></div>
-  <div id="home-body"></div>`;
-}
 function headMore() {
   return `<button class="iconbtn head-more" data-act="head-more" type="button" aria-label="Ещё" title="Ещё">${icon("more")}</button>`;
 }
 function proxiesHTML() {
-  return `<div class="head"><div><h1>Прокси</h1><p class="sub">SOCKS5, HTTP и VLESS. Правила направляют через них трафик выбранных приложений.</p></div>
+  return `<div class="head"><div><h1>Прокси</h1><p class="sub">SOCKS5, HTTP и VLESS. Через них идёт трафик приложений.</p></div>
   <div class="head-actions"><button class="btn secondary" data-act="probe-all" type="button">${icon("refresh")}Проверить все</button><button class="btn secondary" data-act="paste-vless" type="button">${icon("paste")}Вставить vless://</button><button class="btn pri" data-act="proxy-add" type="button">${icon("plus")}Добавить</button>${headMore()}</div></div>
-  <div id="proxy-table" style="margin-top:16px"></div>
-  <div class="note">${icon("info", 18)}<strong>VLESS для Dolphin{anty} и других антидетектов</strong><p>В профиле — SOCKS5 127.0.0.1 и порт моста (HTTP — порт + 1). Правило на dolphin.exe не нужно.</p></div>`;
+  <div id="proxy-table"></div>`;
 }
 function logHTML() {
   const onlyOn = errorsOnly ? " on" : "";
@@ -303,23 +257,23 @@ function settingsHTML() {
   return `<div class="head"><div><h1>Настройки</h1><p class="sub">Применяются сразу · ${esc(state.path || "config.json")}</p></div>
   <div class="head-actions"><button class="btn ghost" data-act="open-folder" type="button">${icon("folder")}Открыть папку</button></div></div>
   ${group("DNS", [
-    row("DNS приложений через прокси", "Порт 53 выбранных приложений уходит через прокси их правила", toggle("dns", dnsOn)),
-    row("DNS-серверы", "Куда отправлять эти запросы", `<input class="mono" id="dns-servers" value="${esc((c.dns.servers || []).join(", "))}" ${dnsOn ? "" : "disabled"}>`),
-    row("Системный резолвер (svchost.exe)", "Влияет на DNS всех программ, не только выбранных", `${select("sys-proxy", names, selProxy, !sys)}${toggle("sys", sys)}`, true),
+    row("globe", "DNS приложений через прокси", "Порт 53 выбранных приложений уходит через прокси их правила", toggle("dns", dnsOn)),
+    row("server", "DNS-серверы", "Куда отправлять эти запросы", `<input class="mono" id="dns-servers" value="${esc((c.dns.servers || []).join(", "))}" ${dnsOn ? "" : "disabled"}>`),
+    row("sliders", "Системный резолвер (svchost.exe)", "Влияет на DNS всех программ, не только выбранных", `${select("sys-proxy", names, selProxy, !sys)}${toggle("sys", sys)}`, true),
   ])}
   ${group("Защита от утечек", [
-    row("Kill switch", "Приложения с правилом «прокси» и их дочерние процессы никогда не выходят в сеть напрямую. Пока перехват выключен или Ashgate закрыт, Брандмауэр Windows отключает их от сети", toggle("kill", !!c.killSwitch), true),
+    row("shield", "Kill switch", "Приложения с правилом «прокси» и их дочерние процессы никогда не выходят в сеть напрямую. Пока перехват выключен или Ashgate закрыт, Брандмауэр Windows отключает их от сети", toggle("kill", !!c.killSwitch), true),
   ])}
   ${group("UDP и сеть", [
-    row("UDP, который прокси не умеет", "Для HTTP-прокси: QUIC и игры. «Блокировать» не даёт обойти прокси", segCtrl("udp", ["Блокировать", "Напрямую"], ["block", "direct"], udp)),
-    row("Не проксировать частные сети", "10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, fc00::/7 — напрямую", toggle("bypass", !!c.bypassPrivate)),
+    row("swap", "UDP, который прокси не умеет", "Для HTTP-прокси: QUIC и игры. «Блокировать» не даёт обойти прокси", segCtrl("udp", ["Блокировать", "Напрямую"], ["block", "direct"], udp)),
+    row("link", "Не проксировать частные сети", "10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, fc00::/7 — напрямую", toggle("bypass", !!c.bypassPrivate)),
   ])}
   ${group("Запуск и журнал", [
-    row("Запускать с Windows", "При входе в систему открывается окно и включается перехват", toggle("auto", !!state.autostart)),
-    row("Подробный журнал", "Уровень debug вместо info в ashgate.log", toggle("verbose", c.log && c.log.level === "debug")),
+    row("rocket", "Запускать с Windows", "При входе в систему открывается окно и включается перехват", toggle("auto", !!state.autostart)),
+    row("doc", "Подробный журнал", "Уровень debug вместо info в ashgate.log", toggle("verbose", c.log && c.log.level === "debug")),
   ])}
   ${group("Окно", [
-    row("Тема", "Тёмная графитовая или светлая", segCtrl("theme", ["Тёмная", "Светлая"], ["dark", "light"], state.theme === "light" ? 1 : 0)),
+    row("brush", "Тема", "Тёмная или светлая", segCtrl("theme", ["Тёмная", "Светлая"], ["dark", "light"], state.theme === "light" ? 1 : 0)),
   ])}
   ${group("О программе", [aboutRow()])}`;
 }
@@ -329,9 +283,9 @@ function aboutRow() {
   const b = state.build || { version: state.version };
   const text = buildText(b);
   const desc = b.commit
-    ? "Коммит должен совпадать с последним в репозитории. Иначе пересоберите exe из свежего кода и перезапустите Ashgate (трей → «Выход»)"
+    ? "Коммит должен совпадать с последним в репозитории. Иначе обновите Ashgate: update.bat в клоне репозитория соберёт и поставит свежий exe"
     : "Exe собран без git, поэтому коммит неизвестен. Соберите его из клона репозитория, чтобы видеть коммит";
-  return row("Версия", desc, `<span class="mono">${esc(text)}</span><button class="iconbtn" type="button" data-act="copy-text" data-text="${esc(text)}" title="Копировать" aria-label="Копировать">${icon("copy", 14)}</button>`);
+  return row("info", "Версия", desc, `<span class="mono">${esc(text)}</span><button class="iconbtn" type="button" data-act="copy-text" data-text="${esc(text)}" title="Копировать" aria-label="Копировать">${icon("copy", 14)}</button>`);
 }
 function buildText(b) {
   let t = b.version || "";
@@ -344,10 +298,10 @@ function buildText(b) {
   return t;
 }
 function group(title, rows) {
-  return `<div class="group-title">${esc(title)}</div><div class="group">${rows.join("")}</div>`;
+  return `<div class="group-title">${esc(title)}</div><div class="sgroup">${rows.join("")}</div>`;
 }
-function row(title, desc, ctl, warn) {
-  return `<div class="set"><div class="t">${esc(title)}</div><div class="ctl">${ctl}</div><div class="d${warn ? " warn" : ""}">${esc(desc)}</div></div>`;
+function row(ic, title, desc, ctl, warn) {
+  return `<div class="set">${icon(ic, 20)}<div class="txt"><div class="t">${esc(title)}</div><div class="d${warn ? " warn" : ""}">${esc(desc)}</div></div><div class="ctl">${ctl}</div></div>`;
 }
 function toggle(key, on) {
   return `<button class="toggle${on ? " on" : ""}" type="button" data-act="toggle" data-key="${key}" aria-pressed="${on ? "true" : "false"}"><i></i></button>`;
@@ -362,65 +316,20 @@ function select(id, names, value, disabled) {
 
 function fillPage() {
   if (!state) return;
-  if (page === "home") fillHome();
   if (page === "proxies") fillProxies();
   if (page === "rules") fillApps();
   if (page === "log") fillLog();
 }
 
-function fillHome() {
-  const host = document.getElementById("home-body");
-  if (!host) return;
-  const rules = cfg().rules || [];
-  const proxies = cfg().proxies || [];
-  // A grouped rule follows its group's switch and route.
-  const via = rules.filter((r) => { const e = apEffective(r); return e.enabled && e.action === "proxy" && e.proxy; })
-    .map((r) => ({ ...r, proxy: apEffective(r).proxy }));
-  const errs = (state.events || []).filter((e) => e.status === "error");
-  const checkKey = proxies.map((p) => {
-    const c = state.checks && state.checks[p.name];
-    return c ? (c.ok ? c.label : c.detail) : "";
-  }).join(",");
-  const trafficV = bytes((state.bytesUp || 0) + (state.bytesDown || 0));
-  const trafficS = `↑ ${bytes(state.bytesUp)} · ↓ ${bytes(state.bytesDown)}`;
-  const ks = state.killSwitch || {};
-  const key = [state.running, via.length, proxies.length, errs.length, checkKey, errs.slice(0, 4).map(eventKey).join(","),
-    !!ks.on, (ks.blocked || []).join(","), (ks.missing || []).join(","), ks.error || ""].join("|");
-  if (homeKey === key && host.childElementCount) {
-    setText(document.getElementById("traffic-v"), trafficV);
-    setText(document.getElementById("traffic-s"), trafficS);
-    return;
-  }
-  homeKey = key;
-  if (!proxies.length && !rules.length) {
-    host.innerHTML = `<div class="onboard"><h2>Сначала добавьте прокси</h2><p>Вставьте ссылку vless:// или укажите SOCKS5 и HTTP. Затем выберите приложения. Запуск перехвата — кнопка в панели слева.</p><button class="btn pri" type="button" data-act="proxy-add">${icon("plus")}Добавить прокси</button></div>`;
-    return;
-  }
-  const names = new Set(via.map((r) => r.proxy));
-  const active = proxies.filter((p) => names.has(p.name));
-  const stats = [
-    ["Через прокси", String(via.length), via.length ? "включённых приложений" : "приложений нет"],
-    ["Активные прокси", String(active.length), `из ${proxies.length}`],
-    ["Трафик", trafficV, trafficS, "traffic"],
-    ["Ошибки", String(errs.length), errs.length ? "в журнале на экране" : "свежих нет"],
-  ];
-  const lines = (active.length ? active : proxies.slice(0, 4)).map((p) => {
-    const view = probeView(p);
-    return `<div class="proxy-line">${typeTag(p.type)}<span class="main">${esc(p.name)}</span><span class="sub">${esc(proxyAddrText(p))}</span>${badge(view.label, view.kind, true, view.detail)}</div>`;
-  }).join("");
-  const recent = errs.slice(0, 4);
-  host.innerHTML = `${killBanner(ks)}<div class="stats">${stats.map((s) => `<div class="stat"><div class="k">${s[0]}</div><div class="v"${s[3] ? ` id="${s[3]}-v"` : ""}>${esc(s[1])}</div><div class="s"${s[3] ? ` id="${s[3]}-s"` : ""}>${esc(s[2])}</div></div>`).join("")}</div>
-    <div class="section-row"><h3>${active.length ? "Активные прокси" : "Прокси"}</h3><button class="link" data-act="goto" data-page="proxies" type="button">Все прокси</button></div>
-    <div class="proxy-list">${lines || `<div class="empty">Прокси ещё нет.</div>`}</div>
-    <div class="section-row"><h3>Последние ошибки</h3><button class="link" data-act="goto" data-page="log" type="button">Журнал</button></div>
-    ${table(["Время", "Процесс", "Назначение", "Текст"], recent.map((e) => [
-      `<span class="mono">${esc(e.time)}</span>`,
-      `<span class="main">${esc(appLabel(e.process))}</span>`,
-      `<span class="mono">${esc(e.dest)}</span>`,
-      esc(e.error || "ошибка"),
-    ]), recent.length ? "" : "Ошибок на экране нет.")}`;
+// ksNotice is the kill switch notice at the top of the Apps tab. It shows
+// only when something needs attention: apps without network while capture
+// is off, an exe that was not found, or a firewall error.
+function ksNotice() {
+  const ks = (state && state.killSwitch) || {};
+  if (!ks.on) return "";
+  const need = (!state.running && (ks.blocked || []).length) || (ks.missing || []).length || ks.error;
+  return need ? killBanner(ks) : "";
 }
-
 // killBanner tells what the kill switch is doing right now.
 function killBanner(ks) {
   if (!ks || !ks.on) return "";
@@ -457,27 +366,27 @@ function fillProxies() {
   if (!host) return;
   const list = cfg().proxies || [];
   if (!list.length) {
-    setHTML(host, `<div class="table"><div class="empty-card"><h3>Прокси ещё нет</h3><p>Добавьте SOCKS5, HTTP или вставьте ссылку vless://.</p><button class="btn pri" type="button" data-act="proxy-add">${icon("plus")}Добавить прокси</button></div></div>`);
+    setHTML(host, `<div class="empty-card"><h3>Прокси ещё нет</h3><p>Добавьте SOCKS5, HTTP или вставьте ссылку vless://.</p><button class="btn pri" type="button" data-act="proxy-add">${icon("plus")}Добавить прокси</button></div>`);
     return;
   }
-  const head = ["#", "Имя", "Тип", "Адрес", "Проверка", ""];
+  // One card per proxy. The selected card shows edit and delete; the
+  // actions column keeps its width so the other columns stay aligned.
   const rows = list.map((p, i) => {
     const view = probeView(p);
     const why = view.detail ? `<div class="why">${esc(view.detail)}</div>` : "";
     const selected = sel.proxy === i;
     const acts = selected
-      ? `<button class="iconbtn" data-act="proxy-edit" data-i="${i}" type="button" aria-label="Изменить">${icon("edit")}</button><button class="iconbtn danger" data-act="proxy-del" data-i="${i}" type="button" aria-label="Удалить">${icon("trash")}</button>`
+      ? `<button class="iconbtn" data-act="proxy-edit" data-i="${i}" type="button" aria-label="Изменить" title="Изменить">${icon("edit")}</button><button class="iconbtn danger" data-act="proxy-del" data-i="${i}" type="button" aria-label="Удалить" title="Удалить">${icon("trash")}</button>`
       : "";
-    return `<tr class="${selected ? "sel" : ""}" data-act="sel-proxy" data-i="${i}">
-      <td class="num">${i + 1}</td>
-      <td><div class="stack"><span class="main">${esc(p.name)}</span><span class="sub">${esc(proxySub(p))}</span></div></td>
-      <td>${typeTag(p.type)}</td>
-      <td class="mono">${proxyAddrCell(p)}</td>
-      <td><div class="checkcell">${badge(view.label, view.kind, true, view.detail || view.label)}${why}</div></td>
-      <td><div class="row-actions">${acts}<button class="iconbtn" data-act="menu-proxy" data-i="${i}" type="button" aria-label="Ещё">${icon("more")}</button></div></td>
-    </tr>`;
+    return `<div class="prow${selected ? " sel" : ""}" data-act="sel-proxy" data-i="${i}">
+      <span class="ptype k-${esc(p.type || "socks5")}" title="${esc(proxyTypeLabel(p.type))}">${icon(typeIconName(p.type), 16)}</span>
+      <div class="stack"><span class="main">${esc(p.name)}</span><span class="sub">${esc(proxyTypeLabel(p.type) + " · " + proxySub(p))}</span></div>
+      <div class="paddr mono">${proxyAddrCell(p)}</div>
+      <div class="checkcell">${badge(view.label, view.kind, true, view.detail || view.label)}${why}</div>
+      <div class="row-actions">${acts}<button class="iconbtn" data-act="menu-proxy" data-i="${i}" type="button" aria-label="Ещё" title="Ещё">${icon("more")}</button></div>
+    </div>`;
   });
-  setHTML(host, `<table class="table tall"><thead><tr>${head.map((h) => `<th>${h}</th>`).join("")}</tr></thead><tbody>${rows.join("")}</tbody></table>`);
+  setHTML(host, `<div class="plist">${rows.join("")}</div>`);
 }
 
 function baseName(process) {
@@ -592,7 +501,6 @@ function render() {
     host.innerHTML = pageHTML();
     host.dataset.page = page;
     built = page;
-    homeKey = "";
   }
   if (!modal && !dragging) fillPage();
   renderModal();
@@ -724,10 +632,6 @@ function typeIconName(t) {
   if (t === "http") return "http";
   if (t === "vless") return "vless";
   return "socks";
-}
-function typeTag(t) {
-  const cls = t === "vless" ? " info" : "";
-  return `<span class="tag${cls}">${icon(typeIconName(t), 14)}${esc(proxyTypeLabel(t))}</span>`;
 }
 function ruleWord(n) {
   const m10 = n % 10;
@@ -1205,7 +1109,6 @@ function readSettings() {
 function onClick(e) {
   const nav = e.target.closest("[data-nav]");
   if (nav) { page = nav.dataset.nav; built = ""; modal = null; closeMenu(); render(); return; }
-  if (e.target.closest("#side-status")) { page = "home"; built = ""; render(); return; }
   const act = e.target.closest("[data-act]");
   if (!act) return;
   const id = act.dataset.act;
@@ -1459,7 +1362,6 @@ function startStop() {
   if (DEMO) {
     state.running = !state.running;
     state.driver = state.running;
-    homeKey = "";
     render();
     return;
   }
@@ -1518,15 +1420,23 @@ function win(op) {
 }
 
 function bootChrome() {
-  document.getElementById("win-min").innerHTML = icon("min");
-  document.getElementById("win-max").innerHTML = icon("max");
-  document.getElementById("win-close").innerHTML = icon("close");
+  document.getElementById("win-min").innerHTML = icon("min", 12);
+  document.getElementById("win-max").innerHTML = icon("max", 12);
+  document.getElementById("win-close").innerHTML = icon("close", 12);
+  // The window has no native top border; these strips resize from the top.
+  document.querySelectorAll("#titlebar [data-edge]").forEach((el) => {
+    el.addEventListener("mousedown", (e) => {
+      if (e.button !== 0) return;
+      e.stopPropagation();
+      if (typeof window.ashgateResize === "function") window.ashgateResize(el.dataset.edge);
+    });
+  });
   document.getElementById("titlebar").addEventListener("mousedown", (e) => {
-    if (e.button !== 0 || e.target.closest("button")) return;
+    if (e.button !== 0 || e.target.closest("button") || e.target.closest("[data-edge]")) return;
     win("Drag");
   });
   document.getElementById("titlebar").addEventListener("dblclick", (e) => {
-    if (e.target.closest("button")) return;
+    if (e.target.closest("button") || e.target.closest("[data-edge]")) return;
     win("Max");
   });
   document.getElementById("win-min").onclick = () => win("Min");
@@ -1586,11 +1496,11 @@ function bootChrome() {
 }
 
 function applyRoute() {
-  const h = (location.hash || "#home").replace("#", "");
-  if (h === "light") { page = "home"; if (state) { state.theme = "light"; state.config.ui = { theme: "light" }; } }
+  const h = (location.hash || "#rules").replace("#", "");
+  if (h === "light") { page = "rules"; if (state) { state.theme = "light"; state.config.ui = { theme: "light" }; } }
   else if (h === "tray") page = "tray";
   else if (h === "empty") {
-    page = "home";
+    page = "proxies";
     if (state) {
       state.running = false;
       state.config.proxies = [];
@@ -1602,10 +1512,14 @@ function applyRoute() {
       state.bytesDown = 0;
       state.active = 0;
     }
-  } else if (h === "start-error") page = "home";
+  } else if (h === "start-error") page = "rules";
   else if (h === "proxy-dialog" || h === "vless-dialog") { page = "proxies"; }
   else if (h === "rule-dialog") { page = "rules"; }
-  else if (["home", "proxies", "rules", "log", "settings"].includes(h)) page = h;
+  else if (["proxies", "rules", "log", "settings"].includes(h)) page = h;
+  else if (h.startsWith("light-") && ["proxies", "rules", "log", "settings"].includes(h.slice(6))) {
+    page = h.slice(6);
+    if (state) { state.theme = "light"; state.config.ui = { theme: "light" }; }
+  }
   built = "";
 }
 
@@ -1629,7 +1543,8 @@ async function main() {
     return;
   }
   await refresh();
-  if (state && !(cfg().proxies || []).length) pasteVLESS(true);
+  // Without proxies there is nothing to route yet: start on the Proxies tab.
+  if (state && !(cfg().proxies || []).length) { page = "proxies"; built = ""; render(); pasteVLESS(true); }
   clipboardTried = true;
   poll();
   document.addEventListener("visibilitychange", () => { if (!document.hidden && !modal) refresh(); });

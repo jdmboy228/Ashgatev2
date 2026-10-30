@@ -102,11 +102,11 @@ function apRoutes() {
   return list;
 }
 function apRouteIcon(action, p) {
-  if (action === "direct") return icon("globe", 14);
-  if (action === "block") return icon("ban", 14);
+  if (action === "direct") return icon("globe", 16);
+  if (action === "block") return icon("ban", 16);
   const t = p && p.type;
-  if (t === "vless") return icon("vless", 14);
-  return icon(t === "http" ? "http" : "shield", 14);
+  if (t === "vless") return icon("vless", 16);
+  return icon(t === "http" ? "http" : "socks", 16);
 }
 function apRouteKind(action, p) {
   if (action === "direct") return "direct";
@@ -119,15 +119,16 @@ function apRouteText(action, proxy) {
   const p = (cfg().proxies || []).find((x) => x.name === proxy);
   return { kind: p ? proxyTypeLabel(p.type) : "Прокси", name: proxy || "не выбран" };
 }
-// apRouteBadge is the compact route button: type icon, type, endpoint,
-// chevron. The proxy's name is in the tooltip and in the list.
+// apRouteBadge is the route dropdown: type icon, proxy name (or «Напрямую»,
+// «Блокировать»), chevron. Type and endpoint are in the tooltip.
 function apRouteBadge(target, action, proxy, bad) {
   const p = (cfg().proxies || []).find((x) => x.name === proxy);
   const t = apRouteText(action, proxy);
   const ep = action === "proxy" ? (p ? proxyAddrText(p) : "не выбран") : "";
   const open = apOpen === "route:" + target;
-  const tip = action === "proxy" ? `${proxy} · ${ep}` : t.kind;
-  return `<div class="ap-pop-wrap"><button class="ap-route k-${apRouteKind(action, p)}${bad ? " bad" : ""}" type="button" data-act="ap-route" data-target="${esc(target)}" title="${esc(tip)}">${apRouteIcon(action, p)}<b>${esc(t.kind)}</b>${ep ? `<span class="sep">·</span><span class="ep">${esc(ep)}</span>` : ""}${icon("chev", 12)}</button>${open ? apRoutePopover(target, action, proxy) : ""}</div>`;
+  const label = action === "proxy" ? (proxy || "не выбран") : t.kind;
+  const tip = action === "proxy" ? `${proxy} · ${t.kind} · ${ep}` : t.kind;
+  return `<div class="ap-pop-wrap"><button class="ap-route k-${apRouteKind(action, p)}${bad ? " bad" : ""}" type="button" data-act="ap-route" data-target="${esc(target)}" title="${esc(tip)}">${apRouteIcon(action, p)}<b>${esc(label)}</b>${icon("chev", 12)}</button>${open ? apRoutePopover(target, action, proxy) : ""}</div>`;
 }
 function apRoutePopover(target, action, proxy) {
   const items = apRoutes().map((r) => {
@@ -152,7 +153,8 @@ function apStat(r) {
   return (state.ruleStats || {})[apKey(r.process)] || null;
 }
 function apRate(n) {
-  return bytes(n || 0) + "/с";
+  // "132,0 КБ" -> "132 КБ": the rate column stays narrow.
+  return bytes(n || 0).replace(/,0 /, " ") + "/с";
 }
 // apStatus describes a rule's state for its dot, badge and telemetry.
 function apStatus(r) {
@@ -175,13 +177,13 @@ function apStatus(r) {
     };
   }
   if (st && st.flows) {
-    return { dot: "ok", flows: st.flows, down: st.downRate, up: st.upRate, sub: bytes((st.up || 0) + (st.down || 0)) + " за сессию" };
+    return { dot: "ok", flows: st.flows, down: st.downRate, up: st.upRate, sub: bytes((st.up || 0) + (st.down || 0)) };
   }
   return { dot: "ok idle", line: "Нет соединений", sub: st && (st.up || st.down) ? bytes(st.up + st.down) + " за сессию" : "Ждёт подключений приложения" };
 }
 function apTelemetry(s) {
   if (s.flows) {
-    return `<div class="l1"><span class="n">${s.flows} ${flowWord(s.flows)}</span><span class="dim">·</span><span class="dn">↓ ${esc(apRate(s.down))}</span><span class="up">↑ ${esc(apRate(s.up))}</span></div><div class="l2">${esc(s.sub)}</div>`;
+    return `<div class="l1"><span class="dn">↓ ${esc(apRate(s.down))}</span><span class="dim">·</span><span class="up">↑ ${esc(apRate(s.up))}</span></div><div class="l2">${s.flows} ${flowWord(s.flows)} · ${esc(s.sub)}</div>`;
   }
   return `<div class="l1${s.bad ? " bad" : ""}" title="${esc(s.error || s.line)}">${esc(s.line)}</div><div class="l2">${esc(s.sub)}</div>`;
 }
@@ -196,8 +198,8 @@ function flowWord(n) {
 // ---------- page ----------
 
 function appsHTML() {
-  return `<div class="head"><div><h1>Приложения</h1><p class="sub">Маршрутизация трафика выбранных программ. Остальные работают напрямую.</p><p class="ap-help">Проверяются сверху вниз — срабатывает первое совпадение.</p></div>
-  <div class="head-actions"><label class="field search ap-search">${icon("search")}<input id="ap-q" placeholder="Поиск по приложениям" value="${esc(apQuery)}" autocomplete="off"></label>
+  return `<div class="head"><div><h1>Приложения</h1><p class="sub">Правила проверяются сверху вниз. Остальные программы работают напрямую.</p></div>
+  <div class="head-actions"><label class="field search ap-search">${icon("search")}<input id="ap-q" placeholder="Поиск" value="${esc(apQuery)}" autocomplete="off"></label>
   <button class="btn secondary" data-act="ap-windows" type="button">${icon("window")}Из окон</button>
   <button class="btn pri" data-act="ap-add" type="button">${icon("plus")}Добавить</button>${headMore()}</div></div>
   <div id="ap-body"></div>`;
@@ -229,7 +231,7 @@ function fillApps() {
   const inactiveCount = rules.filter((r) => apMatches(r)).length - activeCount;
   const groupsOn = active.filter((u) => u.group).length;
   const sel = apSelected.size ? apSelectionBar(activeCount) : "";
-  const body = `${apKillBanner()}${sel}
+  const body = `${ksNotice()}${apKillBanner()}${sel}
     <div class="ap-sec"><div class="ap-sec-h"><span class="t">Активные правила</span><span class="c">${activeCount}</span>${groupsOn ? `<span class="g">(${groupsOn} ${groupWord(groupsOn)})</span>` : ""}</div>
     ${active.length ? `<div class="ap-list">${active.map((u) => apUnitHTML(u)).join("")}</div>` : `<div class="ap-none">${apQuery ? "Ничего не найдено." : "Нет активных правил. Включите правило ниже или добавьте приложение."}</div>`}</div>
     <div class="ap-sec off"><div class="ap-sec-h"><span class="t">Отключённые и неактивные</span><span class="c">${Math.max(0, inactiveCount)}</span><span class="note">Трафик направляется напрямую в обход прокси</span></div>
@@ -274,7 +276,7 @@ function apKillBanner() {
   const names = hit.map((r) => apLabel(r.process)).join(", ");
   const err = (apStat(hit[0]) || {}).error || "";
   const ks = hit.some((r) => apRuleKS(r));
-  return `<div class="ap-alert">${icon("alert", 16)}<div class="txt"><b>Прокси не отвечает.</b> ${esc(names)}: ${ks ? "трафик заблокирован kill switch, напрямую не выпущен." : "соединения не устанавливаются."}<span class="err">${esc(err)}</span></div><button class="btn sm" type="button" data-act="goto" data-page="proxies">К прокси</button></div>`;
+  return `<div class="ap-alert">${icon("alert", 16)}<div class="txt"><b>Прокси не отвечает</b><span>${esc(names)}: ${ks ? "трафик заблокирован kill switch, напрямую не выпущен." : "соединения не устанавливаются."}</span><span class="err">${esc(err)}</span></div><button class="btn sm" type="button" data-act="goto" data-page="proxies">К прокси</button></div>`;
 }
 
 function apSelectionBar(activeCount) {
@@ -298,15 +300,15 @@ function apRuleHTML(i, inGroup) {
   const s = apStatus(r);
   const eff = apEffective(r);
   const selected = apSelected.has(i);
-  const childBadge = r.children !== false ? `<span class="chip" title="Дочерние процессы идут по этому же правилу">${icon("branch", 10)}+дочерние</span>` : "";
+  const childBadge = r.children !== false ? `<span class="chip" title="Дочерние процессы идут по этому же правилу">${icon("branch", 12)}+дочерние</span>` : "";
   // Grouped rules take the group's selection, route and switch.
-  const check = inGroup ? "" : `<button class="ap-check${selected ? " on" : ""}" type="button" data-act="ap-select" data-i="${i}" title="${selected ? "Снять выбор" : "Выбрать правило для группировки"}" aria-pressed="${selected}">${selected ? icon("check", 11) : ""}</button>`;
+  const check = inGroup ? "" : `<button class="ap-check${selected ? " on" : ""}" type="button" data-act="ap-select" data-i="${i}" title="${selected ? "Снять выбор" : "Выбрать правило для группировки"}" aria-pressed="${selected}">${selected ? icon("check", 12) : ""}</button>`;
   const route = inGroup ? "" : apRouteBadge("r" + i, r.action, r.proxy || "", s.bad);
   apTele["r" + i] = apTelemetry(s);
   return `<div class="ap-card${eff.enabled ? "" : " dim"}${inGroup ? " member" : ""}${selected ? " picked" : ""}" draggable="${inGroup ? "false" : "true"}" data-unit="r:${i}">
-    <div class="ap-left"><span class="ap-slot">${check}</span><span class="ap-dotslot"><i class="ap-dot ${s.dot}" title="${esc(s.error || (s.flows ? "Трафик идёт через прокси" : s.line))}"></i></span><span class="ap-ic">${appIconHTML(apPath(r.process))}</span>
-      <div class="ap-name"><div class="nm"><span>${esc(apLabel(r.process))}</span>${s.badge ? `<em class="bad">${esc(s.badge)}</em>` : ""}</div>
-      <div class="sub"><span class="path">${esc(apPath(r.process))}</span>${childBadge}</div></div></div>
+    <div class="ap-left">${inGroup ? "" : `<span class="ap-slot">${check}</span>`}<span class="ap-ic">${appIconHTML(apPath(r.process))}<i class="ap-dot ${s.dot}" title="${esc(s.error || (s.flows ? "Трафик идёт через прокси" : s.line))}"></i></span>
+      <div class="ap-name"><div class="nm"><span>${esc(apLabel(r.process))}</span>${childBadge}${s.badge ? `<em class="bad">${esc(s.badge)}</em>` : ""}</div>
+      <div class="sub"><span class="path">${esc(apPath(r.process))}</span></div></div></div>
     <div class="ap-tele" data-tele="r${i}"></div>
     <div class="ap-routecell">${route}</div>
     <div class="ap-right">${apSwitch("ap-toggle", `data-i="${i}"`, apOn(r.enabled), apOn(r.enabled) ? "Выключить правило" : "Включить правило")}
@@ -351,17 +353,16 @@ function apGroupHTML(u) {
   if (!on) tele = `<div class="l1">Группа отключена · —</div><div class="l2">Приложения группы работают напрямую</div>`;
   else if (g.action !== "proxy") tele = `<div class="l1">${g.action === "direct" ? "Напрямую" : "Блокируется"}</div><div class="l2">${members.length} ${appWord(members.length)}</div>`;
   else if (!state.running) tele = `<div class="l1">Перехват выключен</div><div class="l2">${members.length} ${appWord(members.length)}</div>`;
-  else if (flows) tele = `<div class="l1"><span class="n">${flows} ${flowWord(flows)}</span><span class="dim">·</span><span class="dn">↓ ${esc(apRate(down))}</span><span class="up">↑ ${esc(apRate(up))}</span></div><div class="l2">${bytes(total)} за сессию · ${members.length} ${appWord(members.length)}</div>`;
+  else if (flows) tele = `<div class="l1"><span class="dn">↓ ${esc(apRate(down))}</span><span class="dim">·</span><span class="up">↑ ${esc(apRate(up))}</span></div><div class="l2">${flows} ${flowWord(flows)} · ${bytes(total)}</div>`;
   else tele = `<div class="l1">Нет соединений</div><div class="l2">${members.length} ${appWord(members.length)} суммарно</div>`;
-  const icons = members.slice(0, 4).map((r) => `<span class="mini" title="${esc(apLabel(r.process))}">${appIconHTML(apPath(r.process), "width:16px;height:16px;border-radius:50%;font-size:8px")}</span>`).join("");
   const target = "g:" + g.name;
   apTele[target] = tele;
   const open = !g.collapsed;
   const dot = !on ? "off" : bad ? "err" : g.action === "proxy" ? "ok" : g.action === "direct" ? "info" : "warn";
   return `<div class="ap-group${on ? "" : " dim"}" draggable="true" data-unit="g:${esc(g.name)}">
     <div class="ap-card group">
-      <div class="ap-left"><span class="ap-slot"><button class="ap-chev${open ? " open" : ""}" type="button" data-act="ap-collapse" data-group="${esc(g.name)}" title="${open ? "Свернуть группу" : "Развернуть группу"}">${icon("chevr", 16)}</button></span><span class="ap-dotslot"><i class="ap-dot ${dot}"></i></span><span class="ap-folder">${icon("folder", 16)}</span>
-        <div class="ap-name"><div class="nm"><span>${esc(g.name)}</span></div><div class="sub g"><span class="stack">${icons}</span><span class="names">${esc(members.map((r) => apLabel(r.process)).join(", "))}</span></div></div></div>
+      <div class="ap-left"><span class="ap-slot"><button class="ap-chev${open ? " open" : ""}" type="button" data-act="ap-collapse" data-group="${esc(g.name)}" title="${open ? "Свернуть группу" : "Развернуть группу"}">${icon("chevr", 16)}</button></span><span class="ap-folder">${icon("folder", 16)}<i class="ap-dot ${dot}"></i></span>
+        <div class="ap-name"><div class="nm"><span>${esc(g.name)}</span></div><div class="sub g"><span class="names">${esc(members.map((r) => apLabel(r.process)).join(", "))}</span></div></div></div>
       <div class="ap-tele" data-tele="${esc(target)}"></div>
       <div class="ap-routecell">${apRouteBadge(target, g.action, g.proxy || "", bad)}</div>
       <div class="ap-right">${apSwitch("ap-gtoggle", `data-group="${esc(g.name)}"`, on, on ? "Отключить всю группу правил" : "Включить всю группу правил")}

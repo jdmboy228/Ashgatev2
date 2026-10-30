@@ -31,6 +31,7 @@ const helpText = `Ashgate — прозрачный прокси для отде�
   ashgate service uninstall
   ashgate service start
   ashgate service stop
+  ashgate quit                    закрыть запущенное окно, как «Выход» (для update.bat)
   ashgate version
 
 Без -config используется %ProgramData%\Ashgate\config.json
@@ -88,6 +89,9 @@ func dispatch(args []string) int {
 			return code
 		}
 		return cmdService(rest)
+	case "quit":
+		prepareConsole()
+		return cmdQuit()
 	case "gui":
 		if stop, code := ensureElevated(args); stop {
 			return code
@@ -98,6 +102,25 @@ func dispatch(args []string) int {
 		fmt.Fprintf(os.Stderr, "неизвестная команда %q\n\n%s", cmd, helpText)
 		return 2
 	}
+}
+
+// cmdQuit closes the running window the way «Выход» does. update.bat uses
+// it before replacing the exe; capture comes back on after the restart.
+func cmdQuit() int {
+	code := gui.Quit(20 * time.Second)
+	switch code {
+	case gui.QuitDone:
+		fmt.Println("Ashgate закрыт.")
+	case gui.QuitNotRunning:
+		fmt.Println("Ashgate не запущен.")
+	case gui.QuitTooOld:
+		fmt.Fprintln(os.Stderr, "Запущенная версия Ashgate не умеет закрываться по команде. Закройте её из трея: «Выход».")
+	case gui.QuitDenied:
+		fmt.Fprintln(os.Stderr, "Нужны права администратора: запустите команду из консоли администратора.")
+	default:
+		fmt.Fprintln(os.Stderr, "Ashgate не закрылся за 20 секунд.")
+	}
+	return code
 }
 
 func cmdGUI(args []string) int {

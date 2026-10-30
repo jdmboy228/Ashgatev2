@@ -70,13 +70,31 @@ func TestUIShellServed(t *testing.T) {
 		{"/app.js", "блокировать"},
 		{"/", `src="apps.js"`},
 		{"/apps.js", "Создать группу приложений"},
-		{"/app.css", "#FF7A45"},
+		{"/app.css", "#60CDFF"},
+		{"/", `src="icons.js"`},
+		{"/icons.js", "const FLUENT"},
 		{"/logo.svg", "svg"},
 	} {
 		rr := httptest.NewRecorder()
 		h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, tc.path, nil))
 		if rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), tc.want) {
 			t.Fatalf("%s: %d %q", tc.path, rr.Code, rr.Body.String()[:min(80, rr.Body.Len())])
+		}
+	}
+}
+
+// 0.7.3 removed the Home tab and the VLESS-for-Dolphin note on Proxies.
+func TestUIHasNoHomeOrDolphinNote(t *testing.T) {
+	c := newController(filepath.Join(t.TempDir(), "config.json"), config.Default(), nil, hooks{})
+	h := c.Handler()
+	for _, path := range []string{"/", "/app.js", "/apps.js"} {
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, path, nil))
+		body := rr.Body.String()
+		for _, gone := range []string{"Главная", "homeHTML", "VLESS для Dolphin"} {
+			if strings.Contains(body, gone) {
+				t.Fatalf("%s still has %q", path, gone)
+			}
 		}
 	}
 }

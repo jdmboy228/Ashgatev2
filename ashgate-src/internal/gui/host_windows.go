@@ -70,6 +70,10 @@ func Run(configPath string, startCapture bool) error {
 	if configPath == "" {
 		configPath = config.DefaultPath()
 	}
+	// After an update (ashgate quit) capture comes back as it was.
+	if consumeResume(configPath) {
+		startCapture = true
+	}
 	cfg, err := config.LoadOrInit(configPath)
 	if err != nil {
 		alert(err.Error())
@@ -159,6 +163,12 @@ func Run(configPath string, startCapture bool) error {
 	_ = w.Bind("ashgateMin", func() { pPostMessage.Call(h.hwnd, wmMin, 0, 0) })
 	_ = w.Bind("ashgateMax", func() { pPostMessage.Call(h.hwnd, wmMax, 0, 0) })
 	_ = w.Bind("ashgateClose", func() { pPostMessage.Call(h.hwnd, wmClose, 0, 0) })
+	// The window has no top frame, so the page's title bar resizes from the top edge.
+	_ = w.Bind("ashgateResize", func(edge string) {
+		if ht := topEdgeHit(edge); ht != 0 {
+			pPostMessage.Call(h.hwnd, wmResize, ht, 0)
+		}
+	})
 	// Hand the API token to the page before it loads. json.Marshal yields a
 	// safe JavaScript string literal.
 	tok, _ := json.Marshal(h.ctrl.token)
@@ -310,6 +320,16 @@ func hostProc(hwnd, msg, wp, lp uintptr) uintptr {
 	case wmShow:
 		showMain()
 		return 0
+	case wmQuitReq:
+		// An update is replacing this exe. If capture is on, leave a mark so
+		// the new version turns it back on at start.
+		if h.ctrl != nil {
+			if on, _, _ := h.ctrl.running(); on {
+				_ = markResume(h.path)
+			}
+		}
+		hostQuit()
+		return 0
 	case wmClose:
 		if !h.quitting {
 			if !tray.added {
@@ -323,6 +343,26 @@ func hostProc(hwnd, msg, wp, lp uintptr) uintptr {
 			pShowWindow.Call(hwnd, swHide)
 			return 0
 		}
+	case wmNcCalcSize:
+		// Without a caption Windows still draws the top resize border as a
+		// white strip. Keep the side and bottom borders (resizing, shadow) and
+		// give the top to the page. A maximized window keeps the default
+		// inset: its frame lies outside the screen.
+		if wp == 0 || lp == 0 || windowMaximized(hwnd) {
+			break
+		}
+		r := (*Rect)(unsafe.Pointer(lp))
+		top := r.Top
+		ret, _, _ := pCallWindowProc.Call(h.orig, hwnd, msg, wp, lp)
+		r.Top = top
+		return ret
+	case wmResize:
+		if windowMaximized(hwnd) {
+			return 0
+		}
+		pReleaseCapture.Call()
+		pSendMessage.Call(hwnd, wmNCLeftDown, wp, 0)
+		return 0
 	case wmGetMinMaxInfo:
 		applyMinMax(hwnd, lp)
 		return 0
@@ -372,6 +412,19 @@ func hostProc(hwnd, msg, wp, lp uintptr) uintptr {
 	return r
 }
 
+// topEdgeHit maps the page's top-edge grip to a hit-test code.
+func topEdgeHit(edge string) uintptr {
+	switch edge {
+	case "top":
+		return htTop
+	case "topleft":
+		return htTopLeft
+	case "topright":
+		return htTopRight
+	}
+	return 0
+}
+
 func showMain() {
 	h := appHost
 	if h == nil || h.hwnd == 0 {
@@ -412,6 +465,8 @@ func styleWindow(hwnd uintptr) {
 	// WM_NCCALCSIZE makes the client fill the window, WebView2 then covers
 	// every edge, and the parent never receives the hit-test that 0.3.1 used
 	// to resize. A client-area hit-test cannot see those pixels either.
+	// Only the top border is dropped (WM_NCCALCSIZE in hostProc); the page
+	// resizes from there through ashgateResize.
 	style, _, _ := pGetWindowLong.Call(hwnd, gwlStyle)
 	style &^= wsCaption
 	style |= wsThickFrame | wsMinimizeBox | wsMaximizeBox | wsSysMenu | wsClipChildren
