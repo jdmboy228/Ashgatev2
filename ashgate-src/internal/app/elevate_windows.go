@@ -53,7 +53,6 @@ func ensureElevated(args []string) (bool, int) {
 	params, _ := windows.UTF16PtrFromString(strings.Join(quoted, " "))
 	dir, _ := windows.UTF16PtrFromString(filepath.Dir(exe))
 	err = windows.ShellExecute(0, verb, file, params, dir, 1)
-	runtimeKeep(verb, file, params, dir)
 	if err != nil {
 		text, _ := windows.UTF16PtrFromString("Не удалось запросить права администратора: " + err.Error())
 		caption, _ := windows.UTF16PtrFromString("Ashgate")
@@ -70,12 +69,4 @@ func elevated() bool {
 	}
 	defer token.Close()
 	return token.IsElevated()
-}
-
-func runtimeKeep(p ...*uint16) {
-	for _, v := range p {
-		if v != nil {
-			_ = *v
-		}
-	}
 }

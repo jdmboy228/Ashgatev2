@@ -3,7 +3,6 @@ package logbuf
 
 import (
 	"encoding/json"
-	"io"
 	"os"
 	"sync"
 	"time"
@@ -95,11 +94,14 @@ func (b *Buffer) attach(f *os.File) {
 
 // Close closes the optional log file.
 func (b *Buffer) Close() error {
-	if b == nil || b.file == nil {
+	if b == nil {
 		return nil
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.file == nil {
+		return nil
+	}
 	err := b.file.Close()
 	b.file = nil
 	b.enc = nil
@@ -190,34 +192,36 @@ func (b *Buffer) Generation() uint64 {
 
 // Snapshot returns events from oldest to newest.
 func (b *Buffer) Snapshot() []Event {
+	return b.Recent(0)
+}
+
+// Recent returns the newest n events (all of them when n < 1), oldest
+// first. The window asks for a few hundred on every poll; copying only
+// those keeps the poll cheap.
+func (b *Buffer) Recent(n int) []Event {
 	if b == nil {
 		return nil
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if !b.full && b.pos == 0 {
+	size := b.pos
+	if b.full {
+		size = b.cap
+	}
+	if size == 0 {
 		return nil
 	}
-	if !b.full {
-		out := make([]Event, b.pos)
-		copy(out, b.ev[:b.pos])
+	if n < 1 || n > size {
+		n = size
+	}
+	out := make([]Event, n)
+	// The newest event is at pos-1; the oldest wanted one is n before pos.
+	start := b.pos - n
+	if start >= 0 {
+		copy(out, b.ev[start:b.pos])
 		return out
 	}
-	out := make([]Event, b.cap)
-	n := copy(out, b.ev[b.pos:])
-	copy(out[n:], b.ev[:b.pos])
+	k := copy(out, b.ev[b.cap+start:])
+	copy(out[k:], b.ev[:b.pos])
 	return out
-}
-
-// WriteTo writes the snapshot as JSON lines.
-func (b *Buffer) WriteTo(w io.Writer) (int64, error) {
-	enc := json.NewEncoder(w)
-	var n int64
-	for _, e := range b.Snapshot() {
-		if err := enc.Encode(e); err != nil {
-			return n, err
-		}
-		n++
-	}
-	return n, nil
 }

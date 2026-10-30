@@ -69,10 +69,16 @@ func (m *Manager) Sync(ctx context.Context, items []Endpoint) (map[string]Status
 	var errs []error
 	for _, item := range items {
 		fp := fingerprint(item)
-		if cur, ok := m.by[item.Name]; ok && cur.fp == fp {
-			next[item.Name] = cur
-			status[item.Name] = statusOf(cur.bridge)
-			continue
+		if cur, ok := m.by[item.Name]; ok {
+			if cur.fp == fp {
+				next[item.Name] = cur
+				status[item.Name] = statusOf(cur.bridge)
+				continue
+			}
+			// Changed: stop the old bridge first. It is replaced either way,
+			// and a fixed SOCKSPort it still held would make Listen fail.
+			cur.bridge.Close()
+			delete(m.by, item.Name)
 		}
 		br, err := Listen(m.ctx, item.Address, item.Params, item.Inbound)
 		if err != nil {

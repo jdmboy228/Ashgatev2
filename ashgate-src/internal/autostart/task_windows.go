@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"os/user"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"unicode/utf16"
@@ -17,7 +18,7 @@ const taskName = `\Ashgate`
 
 // Enabled reports whether the logon task that opens the Ashgate window exists.
 func Enabled() (bool, error) {
-	cmd := exec.Command("schtasks", "/Query", "/TN", taskName)
+	cmd := exec.Command(schtasks(), "/Query", "/TN", taskName)
 	cmd.SysProcAttr = noWindow()
 	if err := cmd.Run(); err != nil {
 		return false, nil
@@ -49,7 +50,7 @@ func Enable(exe, configPath string) error {
 	if err := f.Close(); err != nil {
 		return err
 	}
-	cmd := exec.Command("schtasks", "/Create", "/TN", taskName, "/XML", path, "/F")
+	cmd := exec.Command(schtasks(), "/Create", "/TN", taskName, "/XML", path, "/F")
 	cmd.SysProcAttr = noWindow()
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -64,7 +65,7 @@ func Enable(exe, configPath string) error {
 
 // Disable removes the logon task. A missing task is not an error.
 func Disable() error {
-	cmd := exec.Command("schtasks", "/Delete", "/TN", taskName, "/F")
+	cmd := exec.Command(schtasks(), "/Delete", "/TN", taskName, "/F")
 	cmd.SysProcAttr = noWindow()
 	out, err := cmd.CombinedOutput()
 	if err == nil {
@@ -175,6 +176,16 @@ func encodeUTF16(s string) []byte {
 		binary.LittleEndian.PutUint16(b[2+i*2:], r)
 	}
 	return b
+}
+
+// schtasks is the absolute path of schtasks.exe. This process is elevated,
+// so it must not pick up a schtasks.exe from a directory on PATH.
+func schtasks() string {
+	root := os.Getenv("SystemRoot")
+	if root == "" {
+		root = `C:\Windows`
+	}
+	return filepath.Join(root, "System32", "schtasks.exe")
 }
 
 func noWindow() *syscall.SysProcAttr {

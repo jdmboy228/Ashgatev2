@@ -426,6 +426,9 @@ func Load(path string) (*Config, error) {
 
 // LoadOrInit loads the file or writes the defaults when it does not exist.
 func LoadOrInit(path string) (*Config, error) {
+	// The window, "run" and the service all start here: lock down the
+	// shared folder before reading anything from it.
+	secureDir(filepath.Dir(path))
 	cfg, err := Load(path)
 	if err == nil {
 		return cfg, nil
@@ -462,20 +465,31 @@ func Save(path string, cfg *Config) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
+	secureDir(dir)
 	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+	// A leftover or planted temp file would keep its own owner and access
+	// list through the rename. Start from a new file.
+	if err := os.Remove(tmp); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	return os.Rename(tmp, path)
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 func (c *Config) marshal() ([]byte, error) {
+	if len(c.Extra) == 0 {
+		return json.MarshalIndent(c, "", "  ")
+	}
 	body, err := json.Marshal(c)
 	if err != nil {
 		return nil, err
-	}
-	if len(c.Extra) == 0 {
-		return json.MarshalIndent(c, "", "  ")
 	}
 	var doc map[string]json.RawMessage
 	if err := json.Unmarshal(body, &doc); err != nil {

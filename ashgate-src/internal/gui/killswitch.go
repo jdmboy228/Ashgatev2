@@ -65,6 +65,7 @@ func killTargets(cfg *config.Config) (paths, missing []string) {
 		for _, p := range running {
 			if one.Match(rules.Process{Name: p.Name, Path: p.Path}).Action != "" {
 				found = true
+				break
 			}
 		}
 		if installed == nil {

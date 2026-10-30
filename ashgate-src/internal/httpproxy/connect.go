@@ -83,6 +83,11 @@ func DNSQuery(ctx context.Context, p config.Proxy, server string, query []byte) 
 
 // handshake runs under the deadline set by Dial.
 func handshake(conn net.Conn, p config.Proxy, host string, port uint16) error {
+	// host goes into the request line and a header: CR, LF or a space
+	// would let it inject headers or a second request.
+	if host == "" || strings.ContainsAny(host, "\r\n\t ") {
+		return fmt.Errorf("http proxy: invalid host %q", host)
+	}
 	target := net.JoinHostPort(host, strconv.Itoa(int(port)))
 	var b strings.Builder
 	fmt.Fprintf(&b, "CONNECT %s HTTP/1.1\r\n", target)

@@ -731,10 +731,7 @@ func eventViews(logs *logbuf.Buffer) []eventView {
 	if logs == nil {
 		return []eventView{}
 	}
-	all := logs.Snapshot()
-	if len(all) > 300 {
-		all = all[len(all)-300:]
-	}
+	all := logs.Recent(300)
 	out := make([]eventView, 0, len(all))
 	for i := len(all) - 1; i >= 0; i-- {
 		e := all[i]
@@ -770,7 +767,13 @@ func revealConfigDir(path string) error {
 	if runtime.GOOS != "windows" {
 		return errors.New("папка открывается в Windows")
 	}
-	return exec.Command("explorer", dir).Start()
+	// An absolute path: this process is elevated and must not run an
+	// explorer.exe found on PATH.
+	root := os.Getenv("SystemRoot")
+	if root == "" {
+		root = `C:\Windows`
+	}
+	return exec.Command(filepath.Join(root, "explorer.exe"), dir).Start()
 }
 
 func ruConfig(err error) string {

@@ -100,7 +100,9 @@ func ParseLink(raw string) (Parsed, error) {
 		}
 		p.Extra = json.RawMessage(extra)
 	}
-	if p.Security == "" && p.PublicKey != "" {
+	// canonicalSecurity already turned a missing value into "none", so look
+	// at the raw parameter: a public key without security= means REALITY.
+	if strings.TrimSpace(q.Get("security")) == "" && p.PublicKey != "" {
 		p.Security = "reality"
 	}
 	if p.Network == "grpc" && p.ServiceName == "" && p.Path != "" {

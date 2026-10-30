@@ -70,14 +70,15 @@ func Run(configPath string, startCapture bool) error {
 	if configPath == "" {
 		configPath = config.DefaultPath()
 	}
-	// After an update (ashgate quit) capture comes back as it was.
-	if consumeResume(configPath) {
-		startCapture = true
-	}
 	cfg, err := config.LoadOrInit(configPath)
 	if err != nil {
 		alert(err.Error())
 		return err
+	}
+	// After an update (ashgate quit) capture comes back as it was. Read
+	// after LoadOrInit, which locks down the shared folder first.
+	if consumeResume(configPath) {
+		startCapture = true
 	}
 	logs, logErr := openLog(cfg, configPath)
 	h := &host{path: configPath, logs: logs}
@@ -100,6 +101,15 @@ func Run(configPath string, startCapture bool) error {
 			return on != 0 && iconic == 0
 		},
 	})
+	// Registered before anything below can fail, so an early return still
+	// stops capture and the VLESS bridges and closes the log.
+	defer func() {
+		_ = h.ctrl.stop()
+		h.ctrl.shutdown()
+		if h.logs != nil {
+			_ = h.logs.Close()
+		}
+	}()
 	h.ctrl.setNotice(notice)
 	if logErr != nil {
 		h.ctrl.mu.Lock()
@@ -122,11 +132,6 @@ func Run(configPath string, startCapture bool) error {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(ctx)
-		_ = h.ctrl.stop()
-		h.ctrl.shutdown()
-		if h.logs != nil {
-			_ = h.logs.Close()
-		}
 	}()
 
 	data := filepath.Join(os.Getenv("LOCALAPPDATA"), "Ashgate", "WebView2")

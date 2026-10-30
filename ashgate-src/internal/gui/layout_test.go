@@ -12,9 +12,6 @@ func TestWin32LayoutAMD64(t *testing.T) {
 	if unsafe.Sizeof(WndClassEx{}) != 80 || unsafe.Offsetof(WndClassEx{}.LpszClassName) != 64 {
 		t.Fatalf("WNDCLASSEX size %d class %d", unsafe.Sizeof(WndClassEx{}), unsafe.Offsetof(WndClassEx{}.LpszClassName))
 	}
-	if unsafe.Sizeof(Msg{}) != 48 || unsafe.Offsetof(Msg{}.WParam) != 16 {
-		t.Fatalf("MSG size %d wparam %d", unsafe.Sizeof(Msg{}), unsafe.Offsetof(Msg{}.WParam))
-	}
 	if unsafe.Offsetof(MinMaxInfo{}.MinTrack) != 24 {
 		t.Fatal(unsafe.Offsetof(MinMaxInfo{}.MinTrack))
 	}
@@ -23,18 +20,6 @@ func TestWin32LayoutAMD64(t *testing.T) {
 	}
 	if unsafe.Sizeof(WindowPlacement{}) != 44 || unsafe.Offsetof(WindowPlacement{}.NormalPosition) != 28 {
 		t.Fatalf("WINDOWPLACEMENT size %d normal %d", unsafe.Sizeof(WindowPlacement{}), unsafe.Offsetof(WindowPlacement{}.NormalPosition))
-	}
-	if unsafe.Sizeof(NcCalcSizeParams{}) != 56 || unsafe.Offsetof(NcCalcSizeParams{}.Lppos) != 48 {
-		t.Fatalf("NCCALCSIZE_PARAMS size %d lppos %d", unsafe.Sizeof(NcCalcSizeParams{}), unsafe.Offsetof(NcCalcSizeParams{}.Lppos))
-	}
-	if unsafe.Offsetof(NMHdr{}.Code) != 16 {
-		t.Fatal(unsafe.Offsetof(NMHdr{}.Code))
-	}
-	if unsafe.Offsetof(LVItem{}.PszText) != 24 || unsafe.Offsetof(LVItem{}.LParam) != 40 {
-		t.Fatalf("LVITEM text %d lparam %d", unsafe.Offsetof(LVItem{}.PszText), unsafe.Offsetof(LVItem{}.LParam))
-	}
-	if unsafe.Offsetof(LVColumn{}.PszText) != 16 {
-		t.Fatal(unsafe.Offsetof(LVColumn{}.PszText))
 	}
 	if unsafe.Sizeof(IconInfo{}) != 32 || unsafe.Offsetof(IconInfo{}.Mask) != 16 {
 		t.Fatalf("ICONINFO size %d mask %d", unsafe.Sizeof(IconInfo{}), unsafe.Offsetof(IconInfo{}.Mask))
@@ -114,20 +99,4 @@ func TestApplyMinTrackLeavesMaximums(t *testing.T) {
 		t.Fatalf("maximums changed: %+v", mmi)
 	}
 	applyMinTrack(nil, 96, 0, 0)
-}
-
-func TestHitTestResize(t *testing.T) {
-	wr := Rect{Left: 10, Top: 20, Right: 810, Bottom: 620}
-	if hitTestResize(wr, 400, 300, 8) != 0 {
-		t.Fatal("interior")
-	}
-	if hitTestResize(wr, 12, 300, 8) != htLeft || hitTestResize(wr, 12, 22, 8) != htTopLeft {
-		t.Fatal("left edge")
-	}
-	if hitTestResize(wr, 806, 22, 8) != htTopRight || hitTestResize(wr, 400, 616, 8) != htBottom {
-		t.Fatal("other edges")
-	}
-	if hitTestResize(wr, 0, 20, 8) != 0 || hitTestResize(wr, 400, 300, 0) != 0 {
-		t.Fatal("outside or no border")
-	}
 }

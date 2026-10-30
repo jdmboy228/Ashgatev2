@@ -93,12 +93,10 @@ func queryImage(pid uint32) rules.Process {
 
 // readImage returns the image path, parent PID and creation time.
 func readImage(h windows.Handle, pid uint32) rules.Process {
-	buf := make([]uint16, 32768)
-	n := uint32(len(buf))
-	if err := windows.QueryFullProcessImageName(h, 0, &buf[0], &n); err != nil {
+	path, ok := imageName(h)
+	if !ok {
 		return rules.Process{PID: pid}
 	}
-	path := windows.UTF16ToString(buf[:n])
 	p := rules.Process{PID: pid, Name: rules.Base(path), Path: path}
 	var pbi windows.PROCESS_BASIC_INFORMATION
 	if windows.NtQueryInformationProcess(h, windows.ProcessBasicInformation, unsafe.Pointer(&pbi), uint32(unsafe.Sizeof(pbi)), nil) == nil {
@@ -109,6 +107,24 @@ func readImage(h windows.Handle, pid uint32) rules.Process {
 		p.Started = created.Nanoseconds()
 	}
 	return p
+}
+
+// imageName reads the full image path. Snapshot calls it for every process
+// every few seconds, so it starts with a buffer that fits nearly every path
+// and only retries with the 32K-character maximum when that is too small.
+func imageName(h windows.Handle) (string, bool) {
+	for _, size := range []int{520, 32768} {
+		buf := make([]uint16, size)
+		n := uint32(len(buf))
+		err := windows.QueryFullProcessImageName(h, 0, &buf[0], &n)
+		if err == nil {
+			return windows.UTF16ToString(buf[:n]), true
+		}
+		if err != windows.ERROR_INSUFFICIENT_BUFFER {
+			return "", false
+		}
+	}
+	return "", false
 }
 
 func loadTables() ([]Endpoint, error) {

@@ -35,7 +35,7 @@ const helpText = `Ashgate — прозрачный прокси для отде�
   ashgate version
 
 Без -config используется %ProgramData%\Ashgate\config.json
-(или %%AppData%%\Ashgate\config.json, если ProgramData недоступен).
+(или %AppData%\Ashgate\config.json, если ProgramData недоступен).
 --autostart открывает окно и сразу включает перехват. Его ставит задача
 планировщика «Запускать с Windows». Запуск перехвата и окна требует прав
 администратора. Команда run остаётся для ручного запуска без окна.

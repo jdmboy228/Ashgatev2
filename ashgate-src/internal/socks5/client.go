@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"strconv"
 	"time"
 
 	"ashgate/internal/config"
@@ -71,6 +70,9 @@ type Assoc struct {
 	tcp   net.Conn
 	udp   net.PacketConn
 	relay *net.UDPAddr
+	// buf is Recv's read buffer, reused for every datagram. DecodeUDP copies
+	// the payload out, so it is not retained.
+	buf []byte
 }
 
 // Associate negotiates a UDP association. The returned Assoc is ready for Send and Recv.
@@ -137,9 +139,13 @@ func (a *Assoc) Send(ctx context.Context, dst *net.UDPAddr, payload []byte) erro
 	return err
 }
 
-// Recv reads one unfragmented datagram from the relay.
+// Recv reads one unfragmented datagram from the relay. It reuses one read
+// buffer, so only one goroutine may call it at a time.
 func (a *Assoc) Recv(ctx context.Context) (*net.UDPAddr, []byte, error) {
-	buf := make([]byte, 65535)
+	if a.buf == nil {
+		a.buf = make([]byte, 65535)
+	}
+	buf := a.buf
 	if err := a.udp.SetReadDeadline(deadline(ctx, 2*time.Minute)); err != nil {
 		return nil, nil, err
 	}
@@ -449,9 +455,4 @@ func sameUDP(from net.Addr, relay *net.UDPAddr) bool {
 		return false
 	}
 	return ua.Port == relay.Port && ua.IP.Equal(relay.IP)
-}
-
-// HostPort formats host and port the same way Dial expects.
-func HostPort(host string, port uint16) string {
-	return net.JoinHostPort(host, strconv.Itoa(int(port)))
 }

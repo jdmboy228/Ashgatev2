@@ -93,21 +93,6 @@ func RemoveLegacy() (existed bool, wasAuto bool, err error) {
 	return true, wasAuto, nil
 }
 
-// Installed reports whether the Ashgate service is registered.
-func Installed() (bool, error) {
-	m, err := mgr.Connect()
-	if err != nil {
-		return false, err
-	}
-	defer m.Disconnect()
-	s, err := m.OpenService(Name)
-	if err != nil {
-		return false, nil
-	}
-	s.Close()
-	return true, nil
-}
-
 // Start starts the installed service.
 func Start() error {
 	m, err := mgr.Connect()

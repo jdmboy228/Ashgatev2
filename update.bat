@@ -6,11 +6,15 @@ rem Ashgate runs as administrator, so replacing it needs the same rights.
 rem No ( ) blocks here: a folder such as "Program Files (x86)" would break them.
 fltmc >nul 2>&1 && goto :admin
 echo Requesting administrator rights...
+rem Paths go through variables, not into the PowerShell text: a quote in a
+rem folder name (C:\Users\O'Neil) would break or inject the command.
+set "ASHGATE_UPDATE_SELF=%~f0"
+set "ASHGATE_UPDATE_TARGET=%~1"
 if "%~1"=="" goto :elevate
-powershell -NoProfile -Command "Start-Process -FilePath '%~f0' -ArgumentList '\"%~1\"' -Verb RunAs"
+powershell -NoProfile -Command "Start-Process -FilePath $env:ASHGATE_UPDATE_SELF -ArgumentList ('\"' + $env:ASHGATE_UPDATE_TARGET + '\"') -Verb RunAs"
 exit /b
 :elevate
-powershell -NoProfile -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
+powershell -NoProfile -Command "Start-Process -FilePath $env:ASHGATE_UPDATE_SELF -Verb RunAs"
 exit /b
 :admin
 set "ASHGATE_UPDATE_SELF=%~f0"

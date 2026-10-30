@@ -7,8 +7,23 @@ ver=2.2.2
 mkdir -p build dist
 zip="build/WinDivert-${ver}-A.zip"
 url="https://github.com/basil00/WinDivert/releases/download/v${ver}/WinDivert-${ver}-A.zip"
+# SHA-256 of the official release zip (the same as in update.bat). The
+# driver ships inside the package, so a tampered or partial download must
+# never be used.
+sum=$(printf '%s' "63CB41763BB4B20F600B6DE04E991A9C2BE73279E317D4D82F237B150C5F3F15" | tr 'A-F' 'a-f')
+sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1"; else shasum -a 256 "$1"; fi | cut -d' ' -f1
+}
+if [ -f "$zip" ] && [ "$(sha256 "$zip")" != "$sum" ]; then
+  rm -f "$zip"
+fi
 if [ ! -f "$zip" ]; then
   curl -fsSL -o "$zip" "$url"
+fi
+if [ "$(sha256 "$zip")" != "$sum" ]; then
+  rm -f "$zip"
+  echo "$zip: SHA-256 does not match the official release" >&2
+  exit 1
 fi
 rm -rf build/windivert
 unzip -q "$zip" -d build/windivert

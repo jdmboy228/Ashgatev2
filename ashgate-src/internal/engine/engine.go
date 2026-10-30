@@ -106,8 +106,9 @@ type Engine struct {
 	selfPID  uint32
 	verbose  bool
 
-	snap   atomic.Pointer[snapshot]
-	bypass atomic.Pointer[map[string]struct{}]
+	snap atomic.Pointer[snapshot]
+	// bypass holds the proxies' own IPs (ports zero); see RefreshBypass.
+	bypass atomic.Pointer[map[packet.Addr]struct{}]
 	inj    atomic.Pointer[Injector]
 
 	mu        sync.Mutex
@@ -289,14 +290,14 @@ func (e *Engine) RefreshBypass(ctx context.Context) {
 	if snap == nil {
 		return
 	}
-	m := map[string]struct{}{}
+	m := map[packet.Addr]struct{}{}
 	for _, p := range snap.proxies {
 		host, _, err := net.SplitHostPort(p.Address)
 		if err != nil {
 			continue
 		}
 		if ip := net.ParseIP(host); ip != nil {
-			m[ip.String()] = struct{}{}
+			m[packet.FromIP(ip, 0)] = struct{}{}
 			continue
 		}
 		ctx2, cancel := context.WithTimeout(ctx, 5*time.Second)
@@ -306,7 +307,7 @@ func (e *Engine) RefreshBypass(ctx context.Context) {
 			continue
 		}
 		for _, ip := range ips {
-			m[ip.String()] = struct{}{}
+			m[packet.FromIP(ip, 0)] = struct{}{}
 		}
 	}
 	e.bypass.Store(&m)
@@ -712,13 +713,18 @@ func (e *Engine) tcpReturn(pkt []byte, h *packet.Header, snap *snapshot) (Result
 	return Result{Action: ActionModified, Inbound: true, IfIdx: flow.ifIdx, SubIfIdx: flow.subIfIdx}, true
 }
 
+// loopback6 is ::1, the source of redirected IPv6 handshakes. It is built
+// once: rewriteForward runs for every packet of a proxied TCP flow.
+var loopback6 = packet.FromIP(net.IPv6loopback, 0)
+
 func (e *Engine) rewriteForward(pkt []byte, h *packet.Header, flow *tcpFlow, snap *snapshot) Result {
 	var src, dst packet.Addr
 	if h.Ver == 4 {
 		src = packet.V4(127, 0, 0, 1, flow.alloc)
 		dst = snap.relay4
 	} else {
-		src = packet.FromIP(net.ParseIP("::1"), flow.alloc)
+		src = loopback6
+		src.Port = flow.alloc
 		dst = snap.relay6
 	}
 	if err := packet.Rewrite(pkt, h, src, dst); err != nil {
@@ -754,7 +760,8 @@ func (e *Engine) destinationBypass(dst packet.Addr, private bool) bool {
 	if m == nil {
 		return false
 	}
-	_, ok := (*m)[dst.NetIP().String()]
+	dst.Port = 0
+	_, ok := (*m)[dst]
 	return ok
 }
 

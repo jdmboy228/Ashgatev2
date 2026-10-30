@@ -6,8 +6,17 @@ Set-Location $root
 $ver = "2.2.2"
 New-Item -ItemType Directory -Force -Path build, dist | Out-Null
 $zip = Join-Path build "WinDivert-$ver-A.zip"
+# SHA-256 of the official release zip (the same as in update.bat). The
+# driver ships inside the package, so a tampered or partial download must
+# never be used.
+$zipHash = "63CB41763BB4B20F600B6DE04E991A9C2BE73279E317D4D82F237B150C5F3F15"
+if ((Test-Path $zip) -and (Get-FileHash $zip -Algorithm SHA256).Hash -ne $zipHash) { Remove-Item $zip }
 if (-not (Test-Path $zip)) {
     Invoke-WebRequest -Uri "https://github.com/basil00/WinDivert/releases/download/v$ver/WinDivert-$ver-A.zip" -OutFile $zip
+}
+if ((Get-FileHash $zip -Algorithm SHA256).Hash -ne $zipHash) {
+    Remove-Item $zip
+    throw "WinDivert-$ver-A.zip: SHA-256 does not match the official release"
 }
 $dest = Join-Path build "windivert"
 if (Test-Path $dest) { Remove-Item -Recurse -Force $dest }

@@ -4,7 +4,6 @@ package process
 
 import (
 	"bytes"
-	"encoding/binary"
 	"errors"
 	"image"
 	"image/png"
@@ -155,6 +154,5 @@ func hiconPNG(icon uintptr, size int) ([]byte, error) {
 	if err := png.Encode(&buf, img); err != nil {
 		return nil, err
 	}
-	_ = binary.Size(bi)
 	return buf.Bytes(), nil
 }

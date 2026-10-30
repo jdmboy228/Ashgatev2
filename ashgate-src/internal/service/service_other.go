@@ -28,9 +28,6 @@ func Serve() error { return windowsOnly() }
 // RemoveLegacy is a no-op outside Windows.
 func RemoveLegacy() (bool, bool, error) { return false, false, nil }
 
-// Installed reports whether the Ashgate service is registered.
-func Installed() (bool, error) { return false, nil }
-
 func windowsOnly() error {
 	return errors.New("служба Windows доступна только в Windows")
 }

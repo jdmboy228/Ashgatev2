@@ -15,9 +15,6 @@ function setHTML(el, html) {
   el._html = html;
   return true;
 }
-function setText(el, text) {
-  if (el && el.textContent !== text) el.textContent = text;
-}
 // Fluent icons live in icons.js (FLUENT). These few are drawn here.
 const ICONS = {
   grip: '<circle cx="9" cy="6" r="1.3" fill="currentColor" stroke="none"/><circle cx="15" cy="6" r="1.3" fill="currentColor" stroke="none"/><circle cx="9" cy="12" r="1.3" fill="currentColor" stroke="none"/><circle cx="15" cy="12" r="1.3" fill="currentColor" stroke="none"/><circle cx="9" cy="18" r="1.3" fill="currentColor" stroke="none"/><circle cx="15" cy="18" r="1.3" fill="currentColor" stroke="none"/>',
@@ -37,11 +34,6 @@ const STATUS = {
   direct: ["напрямую", "info"],
   blocked: ["блокировано", "warn"],
   error: ["ошибка", "err"],
-};
-const ACTION = {
-  proxy: ["прокси", "neu"],
-  direct: ["напрямую", "neu"],
-  block: ["блокировать", "warn"],
 };
 
 let state = null;
@@ -83,14 +75,6 @@ function bytes(n) {
   const text = i === 0 ? String(Math.round(n)) : n.toFixed(1).replace(".", ",");
   return text + " " + units[i];
 }
-function enabledCount(rules) {
-  return (rules || []).filter((r) => r.enabled !== false).length;
-}
-function usedProxies(cfg) {
-  const s = new Set();
-  (cfg.rules || []).forEach((r) => { if (r.enabled !== false && r.action === "proxy" && r.proxy) s.add(r.proxy); });
-  return s.size;
-}
 function viaText(v) {
   if (!v || v === "direct" || v === "block" || v === "relay") return "—";
   return v;
@@ -102,10 +86,6 @@ function badge(label, kind, dot, title) {
 function statusBadge(st) {
   const m = STATUS[st] || [st || "—", "neu"];
   return badge(m[0], m[1], true);
-}
-function actionBadge(a) {
-  const m = ACTION[a] || [a, "neu"];
-  return badge(m[0], m[1], false);
 }
 
 function demoState() {
@@ -479,10 +459,6 @@ function fillLog() {
     return main + `<tr class="errline"><td colspan="7"><div class="errpanel"><span class="msg">${esc(err)}</span><button class="btn sm" type="button" data-act="copy-text" data-text="${esc(err)}">Копировать</button><button class="btn sm" type="button" data-act="goto-rule" data-proc="${esc(e.process || "")}">К правилу</button></div></td></tr>`;
   }).join("");
   setHTML(host, `<table class="table"><thead><tr>${head.map((h) => `<th>${h}</th>`).join("")}</tr></thead><tbody>${body}</tbody></table>`);
-}
-function table(head, rows, empty) {
-  if (!rows.length) return `<div class="table"><div class="empty">${esc(empty || "")}</div></div>`;
-  return `<table class="table"><thead><tr>${head.map((h) => `<th>${h}</th>`).join("")}</tr></thead><tbody>${rows.map((r) => `<tr>${r.map((c) => `<td>${c}</td>`).join("")}</tr>`).join("")}</tbody></table>`;
 }
 
 function render() {

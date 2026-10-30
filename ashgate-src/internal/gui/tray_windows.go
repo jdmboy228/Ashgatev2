@@ -48,6 +48,9 @@ var tray trayState
 
 func trayAdd(owner uintptr) error {
 	tray.hwnd = owner
+	// A retry (wmClose re-adds the icon when it is missing) must not leak
+	// the handles of the previous attempt.
+	freeStateIcons()
 	px := 32
 	if n, _, _ := pGetSystemMet.Call(49); n >= 16 { // SM_CXSMICON
 		px = int(n)
@@ -81,14 +84,23 @@ func trayRemove() {
 		tray.added = false
 	}
 	trayHideMenu()
-	for _, ic := range []uintptr{tray.iconRun, tray.iconStop, tray.iconErr, tray.logo} {
+	freeStateIcons()
+	if tray.logo != 0 {
+		pDestroyIcon.Call(tray.logo)
+		tray.logo = 0
+	}
+	freeFonts()
+}
+
+// freeStateIcons destroys the running, stopped and error icons.
+func freeStateIcons() {
+	for _, ic := range []uintptr{tray.iconRun, tray.iconStop, tray.iconErr} {
 		if ic != 0 {
 			pDestroyIcon.Call(ic)
 		}
 	}
-	tray.iconRun, tray.iconStop, tray.iconErr, tray.logo = 0, 0, 0, 0
+	tray.iconRun, tray.iconStop, tray.iconErr = 0, 0, 0
 	tray.cur = 0
-	freeFonts()
 }
 
 func trayUpdate(running bool, flows int64, errText string) {

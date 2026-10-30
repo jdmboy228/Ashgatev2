@@ -45,7 +45,11 @@ func New(state string) *Firewall {
 		var list []string
 		if json.Unmarshal(data, &list) == nil {
 			for _, p := range list {
-				f.cur[strings.ToLower(p)] = p
+				// The file is outside this process's control; a quote in
+				// a path would inject arguments into the netsh command line.
+				if valid(p) {
+					f.cur[strings.ToLower(p)] = p
+				}
 			}
 		}
 	}
