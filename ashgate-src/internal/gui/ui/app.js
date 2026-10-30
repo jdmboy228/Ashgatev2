@@ -167,10 +167,11 @@ function demoState() {
       ],
       groups: [{ name: "Связь и звонки", enabled: on, action: "proxy", proxy: "aeza", collapsed: false }],
     },
+    alive: { "curl.exe": true, "spotify.exe": true, "cursor.exe": false, "telemetry.exe": false, "*\\discord\\app-*\\discord.exe": true, "c:\\users\\user\\appdata\\roaming\\telegram desktop\\telegram.exe": true },
     ruleStats: {
       "*\\discord\\app-*\\discord.exe": { flows: 18, up: 9200000, down: 842000000, upRate: 122880, downRate: 2516582 },
       "c:\\users\\user\\appdata\\roaming\\telegram desktop\\telegram.exe": { flows: 6, up: 31000000, down: 1150000000, upRate: 12288, downRate: 184320 },
-      "cursor.exe": { flows: 8, up: 4100000, down: 210000000, upRate: 34816, downRate: 430080 },
+      "cursor.exe": { flows: 0, up: 4100000, down: 210000000, upRate: 0, downRate: 0 },
       "spotify.exe": { flows: 0, up: 120000, down: 14200000, upRate: 0, downRate: 0, error: "SOCKS5: нет ответа от proxy.example.com:1080 (таймаут)" },
       "curl.exe": { flows: 0, up: 800, down: 4100, upRate: 0, downRate: 0 },
     },
@@ -293,8 +294,10 @@ function buildText(b) {
 function group(title, rows) {
   return `<div class="group-title">${esc(title)}</div><div class="sgroup">${rows.join("")}</div>`;
 }
+// Settings icons sit on coloured tiles, as in Windows Settings.
+const SET_COLORS = { globe: "blue", server: "teal", sliders: "violet", shield: "green", swap: "pink", link: "teal", rocket: "orange", doc: "yellow", info: "blue" };
 function row(ic, title, desc, ctl, warn) {
-  return `<div class="set">${icon(ic, 20)}<div class="txt"><div class="t">${esc(title)}</div><div class="d${warn ? " warn" : ""}">${esc(desc)}</div></div><div class="ctl">${ctl}</div></div>`;
+  return `<div class="set"><span class="sico c-${SET_COLORS[ic] || "blue"}">${icon(ic, 20)}</span><div class="txt"><div class="t">${esc(title)}</div><div class="d${warn ? " warn" : ""}">${esc(desc)}</div></div><div class="ctl">${ctl}</div></div>`;
 }
 function toggle(key, on) {
   return `<button class="toggle${on ? " on" : ""}" type="button" data-act="toggle" data-key="${key}" aria-pressed="${on ? "true" : "false"}"><i></i></button>`;
@@ -397,10 +400,16 @@ function iconMiss(img) {
   iconMisses.add(img.dataset.key || "");
   img.remove();
 }
+// appHue gives every app its own tile colour, the same on every redraw.
+function appHue(name) {
+  let h = 0;
+  for (const ch of String(name || "").toLowerCase()) h = (h * 31 + ch.charCodeAt(0)) >>> 0;
+  return [210, 265, 330, 150, 185, 45, 290, 100][h % 8];
+}
 function appIconHTML(process, style) {
   const letter = esc((appLabel(process) || "?").slice(0, 1).toUpperCase());
   const path = String(process || "");
-  const st = style ? ` style="${style}"` : "";
+  const st = ` style="--hue:${appHue(appLabel(process))};${style || ""}"`;
   // Names and masks are resolved to an exe by the server; 404 keeps the letter.
   if (DEMO || !path.trim()) return `<span class="appicon"${st}>${letter}</span>`;
   // Names without an icon are remembered, so a redraw does not ask again.
@@ -459,7 +468,7 @@ function fillLog() {
     const main = `<tr class="${sel.log === key ? "sel" : ""}" data-act="sel-log" data-key="${esc(key)}">
     <td class="mono">${esc(e.time)}</td>
     <td><div class="stack"><span class="main">${esc(appLabel(e.process))}</span><span class="sub mono">PID ${e.pid || 0}${e.parent ? " · от " + esc(appLabel(e.parent)) : ""}</span></div></td>
-    <td><span class="tag${e.proto === "UDP" ? " udp" : ""}">${esc(e.proto || "")}</span></td>
+    <td><span class="tag ${e.proto === "UDP" ? "udp" : "tcp"}">${esc(e.proto || "")}</span></td>
     <td class="mono" style="color:var(--tx)">${esc(e.dest)}</td>
     <td>${esc(viaText(e.via))}</td>
     <td>${statusBadge(e.status)}</td>

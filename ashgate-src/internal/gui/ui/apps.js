@@ -149,6 +149,12 @@ function apRoutePopover(target, action, proxy) {
 
 // ---------- telemetry ----------
 
+// apAlive tells whether the rule's app is running. Unknown (no scan yet,
+// or an older server) counts as running, so nothing jumps around.
+function apAlive(r) {
+  const a = state && state.alive;
+  return !a || a[apKey(r.process)] !== false;
+}
 function apStat(r) {
   return (state.ruleStats || {})[apKey(r.process)] || null;
 }
@@ -179,6 +185,7 @@ function apStatus(r) {
   if (st && st.flows) {
     return { dot: "ok", flows: st.flows, down: st.downRate, up: st.upRate, sub: bytes((st.up || 0) + (st.down || 0)) };
   }
+  if (!apAlive(r)) return { dot: "ok idle", line: "Не запущено", sub: "Правило сработает при запуске" };
   return { dot: "ok idle", line: "Нет соединений", sub: st && (st.up || st.down) ? bytes(st.up + st.down) + " за сессию" : "Ждёт подключений приложения" };
 }
 function apTelemetry(s) {
@@ -225,7 +232,10 @@ function fillApps() {
     ? u.group.name.toLowerCase().includes(apQuery.trim().toLowerCase()) || u.members.some((j) => apMatches(rules[j]))
     : apMatches(rules[u.index]));
   const isOn = (u) => (u.group ? apOn(u.group.enabled) : apOn(rules[u.index].enabled));
-  const active = visible.filter(isOn);
+  // Running apps first; rules whose app is not running go to the end.
+  const live = (u) => (u.group ? u.members.some((j) => apAlive(rules[j])) : apAlive(rules[u.index]));
+  const onUnits = visible.filter(isOn);
+  const active = onUnits.filter(live).concat(onUnits.filter((u) => !live(u)));
   const inactive = visible.filter((u) => !isOn(u));
   const activeCount = active.reduce((n, u) => n + (u.group ? u.members.filter((j) => apOn(rules[j].enabled)).length : 1), 0);
   const inactiveCount = rules.filter((r) => apMatches(r)).length - activeCount;
@@ -300,14 +310,13 @@ function apRuleHTML(i, inGroup) {
   const s = apStatus(r);
   const eff = apEffective(r);
   const selected = apSelected.has(i);
-  const childBadge = r.children !== false ? `<span class="chip" title="Дочерние процессы идут по этому же правилу">${icon("branch", 12)}+дочерние</span>` : "";
   // Grouped rules take the group's selection, route and switch.
   const check = inGroup ? "" : `<button class="ap-check${selected ? " on" : ""}" type="button" data-act="ap-select" data-i="${i}" title="${selected ? "Снять выбор" : "Выбрать правило для группировки"}" aria-pressed="${selected}">${selected ? icon("check", 12) : ""}</button>`;
   const route = inGroup ? "" : apRouteBadge("r" + i, r.action, r.proxy || "", s.bad);
   apTele["r" + i] = apTelemetry(s);
   return `<div class="ap-card${eff.enabled ? "" : " dim"}${inGroup ? " member" : ""}${selected ? " picked" : ""}" draggable="${inGroup ? "false" : "true"}" data-unit="r:${i}">
     <div class="ap-left">${inGroup ? "" : `<span class="ap-slot">${check}</span>`}<span class="ap-ic">${appIconHTML(apPath(r.process))}<i class="ap-dot ${s.dot}" title="${esc(s.error || (s.flows ? "Трафик идёт через прокси" : s.line))}"></i></span>
-      <div class="ap-name"><div class="nm"><span>${esc(apLabel(r.process))}</span>${childBadge}${s.badge ? `<em class="bad">${esc(s.badge)}</em>` : ""}</div>
+      <div class="ap-name"><div class="nm"><span>${esc(apLabel(r.process))}</span>${s.badge ? `<em class="bad">${esc(s.badge)}</em>` : ""}</div>
       <div class="sub"><span class="path">${esc(apPath(r.process))}</span></div></div></div>
     <div class="ap-tele" data-tele="r${i}"></div>
     <div class="ap-routecell">${route}</div>

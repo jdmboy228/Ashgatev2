@@ -16,6 +16,7 @@ import (
 	"ashgate/internal/logbuf"
 	"ashgate/internal/probe"
 	"ashgate/internal/process"
+	"ashgate/internal/rules"
 	rt "ashgate/internal/runtime"
 	"ashgate/internal/vless"
 )
@@ -319,5 +320,26 @@ func TestStartDoesNotDeadlock(t *testing.T) {
 	case <-stopped:
 	case <-time.After(5 * time.Second):
 		t.Fatal("stop or save hangs after start")
+	}
+}
+
+func TestAliveRules(t *testing.T) {
+	procs := []rules.Process{
+		{Name: "Discord.exe", Path: `C:\U\Discord\app-1.0.9\Discord.exe`},
+		{Name: "curl.exe", Path: `C:\Windows\System32\curl.exe`},
+	}
+	got := aliveRules([]config.Rule{
+		{Process: `*\Discord\app-*\Discord.exe`},
+		{Process: "curl"},
+		{Process: `"C:\T\Telegram.exe"`},
+	}, procs)
+	want := map[string]bool{`*\discord\app-*\discord.exe`: true, "curl": true, `c:\t\telegram.exe`: false}
+	if len(got) != len(want) {
+		t.Fatalf("%v", got)
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Fatalf("%q = %v, want %v (%v)", k, got[k], v, got)
+		}
 	}
 }

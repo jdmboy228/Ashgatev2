@@ -68,6 +68,10 @@ type controller struct {
 	startSession func(context.Context, *config.Config, *logbuf.Buffer, *vless.Manager) (*rt.Session, error)
 	// autoBusy is set while a background autostart read runs.
 	autoBusy bool
+	// alive says, per rule key, whether the rule's app is running; see alive.go.
+	alive     map[string]bool
+	aliveAt   time.Time
+	aliveBusy bool
 	// startMu keeps two Start clicks from opening two capture sessions.
 	startMu sync.Mutex
 
@@ -367,6 +371,8 @@ type stateView struct {
 	Bridges    map[string]vless.Status `json:"bridges"`
 	KillSwitch ksView                  `json:"killSwitch"`
 	RuleStats  map[string]ruleStatView `json:"ruleStats"`
+	// Alive: rule key -> its app is running. Absent until the first scan.
+	Alive map[string]bool `json:"alive,omitempty"`
 	// Hidden tells the page it is in the tray, so it polls slowly.
 	Hidden     bool        `json:"hidden,omitempty"`
 	Events     []eventView `json:"events"`
@@ -396,6 +402,7 @@ func (c *controller) snapshot() stateView {
 // already saw log generation since.
 func (c *controller) snapshotSince(since uint64) stateView {
 	c.refreshAuto()
+	c.refreshAlive()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	cfg := cloneCfg(c.cfg)
@@ -453,6 +460,7 @@ func (c *controller) snapshotSince(since uint64) stateView {
 		Bridges:    bridges,
 		KillSwitch: c.ksSnapshot(killWanted(cfg)),
 		RuleStats:  c.ruleStatsLocked(time.Now()),
+		Alive:      c.alive,
 		Hidden:     c.hooks.visible != nil && !c.hooks.visible(),
 		Events:     events,
 		EventsSame: same,

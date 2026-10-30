@@ -62,13 +62,13 @@
    -------------------------------------------------------------------------- */
 
 :root {
-  --mica: #202020;
-  --layer: #272727;
-  --card: #2E2E2E;
-  --card-h: #333333;
-  --dlg: #2B2B2B;
-  --flyout: #2C2C2C;
-  --footer: #202020;
+  --mica: #1C1918;
+  --layer: #24201E;
+  --card: #2D2826;
+  --card-h: #342E2B;
+  --dlg: #2A2523;
+  --flyout: #2C2725;
+  --footer: #1F1B1A;
   --ctl: #FFFFFF0F;
   --ctl-h: #FFFFFF15;
   --ctl-p: #FFFFFF08;
@@ -76,6 +76,14 @@
   --sub-h: #FFFFFF0A;
   --sub-sel: #FFFFFF0F;
   --rail-sel: #FF7A451F;
+  /* Supporting colours; orange stays the accent. */
+  --c-blue: #4CC2FF;
+  --c-teal: #3DD6C4;
+  --c-violet: #B794F6;
+  --c-pink: #FF8FB8;
+  --c-green: #6CCB5F;
+  --c-yellow: #FFD54A;
+  --c-orange: #FF7A45;
   --neutral: #FFFFFF14;
   --stroke: #FFFFFF12;
   --stroke-ctl: #FFFFFF14;
@@ -162,7 +170,8 @@ nav { display: flex; flex-direction: column; gap: 4px; }
 
 /* ---- content layer ---- */
 .content {
-  flex: 1; min-width: 0; background: var(--layer); border-top-left-radius: 14px;
+  flex: 1; min-width: 0; border-top-left-radius: 14px;
+  background: radial-gradient(900px 260px at 0 0, #FF7A4512, transparent 70%), var(--layer);
   border-top: 1px solid var(--stroke); border-left: 1px solid var(--stroke); display: flex; flex-direction: column;
 }
 .page { flex: 1; min-height: 0; min-width: 0; overflow: auto; padding: 28px 28px 24px 32px; position: relative; container: page / inline-size; }
@@ -497,7 +506,7 @@ table.table { min-width: 560px; }
 .ap-name .stack .mini:last-child { margin-right: 0; }
 .ap-name .stack .appicon { border-radius: 50%; }
 
-.ap-tele { width: 208px; flex: none; display: flex; flex-direction: column; justify-content: center; gap: 2px; font-variant-numeric: tabular-nums; min-width: 0; }
+.ap-tele { width: 224px; flex: none; display: flex; flex-direction: column; justify-content: center; gap: 2px; font-variant-numeric: tabular-nums; min-width: 0; }
 .ap-tele .l1 { display: flex; align-items: center; gap: 5px; font-size: 12px; line-height: 16px; color: var(--tx); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .ap-tele .l1 .dim { opacity: 1; color: var(--tx3); }
 .ap-tele .l1.bad { display: block; color: var(--err); }
@@ -751,3 +760,34 @@ table.table { min-width: 560px; }
 .taskbar .apps { display: flex; gap: 16px; margin-right: auto; margin-left: 360px; }
 .taskbar .apps i { width: 28px; height: 28px; border-radius: 6px; background: #3A3A44; display: block; }
 .clock { text-align: right; font-size: 12px; line-height: 1.35; }
+
+/* ---- colour (0.7.3) ---- */
+/* App tiles without an exe icon: a colour per app. */
+.appicon { background: hsl(var(--hue, 210) 45% 30%); color: hsl(var(--hue, 210) 95% 88%); }
+.appicon.hasimg { background: transparent; }
+/* Speeds: download green, upload blue. */
+.ap-tele .l1 .dn { color: var(--c-green); }
+.ap-tele .l1 .up { color: var(--c-blue); }
+/* Proxy types: VLESS orange, SOCKS5 blue, HTTP violet. */
+.ptype.k-vless { color: var(--c-orange); background: #FF7A4524; }
+.ptype.k-socks5 { color: var(--c-blue); background: #4CC2FF24; }
+.ptype.k-http { color: var(--c-violet); background: #B794F624; }
+.ap-route.k-socks5 > svg:first-child, .ap-pop .ri.k-socks5 { color: var(--c-blue); }
+.ap-route.k-http > svg:first-child, .ap-pop .ri.k-http { color: var(--c-violet); }
+.ap-route.k-direct > svg:first-child, .ap-pop .ri.k-direct { color: var(--c-teal); }
+/* Group folder. */
+.ap-folder { color: var(--c-orange); background: #FF7A4524; }
+/* Log protocol tags. */
+.tag.tcp { color: var(--c-blue); background: #4CC2FF1F; }
+.tag.udp { color: var(--c-violet); background: #B794F61F; }
+/* Settings icons on coloured tiles. */
+.set > .sico { flex: none; width: 36px; height: 36px; border-radius: 10px; display: grid; place-items: center; }
+.sico.c-blue { color: var(--c-blue); background: #4CC2FF1F; }
+.sico.c-teal { color: var(--c-teal); background: #3DD6C41F; }
+.sico.c-violet { color: var(--c-violet); background: #B794F61F; }
+.sico.c-green { color: var(--c-green); background: #6CCB5F1F; }
+.sico.c-pink { color: var(--c-pink); background: #FF8FB81F; }
+.sico.c-yellow { color: var(--c-yellow); background: #FFD54A1F; }
+.sico.c-orange { color: var(--c-orange); background: #FF7A451F; }
+/* Section counts. */
+.ap-sec-h .c { color: var(--acc); font-weight: 600; }
