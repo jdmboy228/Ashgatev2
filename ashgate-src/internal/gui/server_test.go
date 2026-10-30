@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -216,6 +217,34 @@ func TestIconPathResolvesNamesAndMasks(t *testing.T) {
 		"telegram":                    `C:\T\Telegram.exe`,
 		`*\Discord\app-*\Discord.exe`: `C:\U\Discord\app-1.0.9\Discord.exe`,
 		"nothere.exe":                 "",
+	} {
+		if got := iconPath(in); got != want {
+			t.Fatalf("iconPath(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestIconPathFallbacks(t *testing.T) {
+	oldRun, oldInst, oldLook, oldStat := listRunning, listInstalled, lookPath, statFile
+	defer func() { listRunning, listInstalled, lookPath, statFile = oldRun, oldInst, oldLook, oldStat }()
+	listRunning = func() ([]process.App, error) { return nil, nil }
+	listInstalled = func() []process.Installed {
+		return []process.Installed{{Name: "Discord", Path: `C:\U\Discord\app-1.0.10\Discord.exe`}}
+	}
+	lookPath = func(name string) (string, error) {
+		if strings.EqualFold(name, "curl.exe") {
+			return `C:\Windows\System32\curl.exe`, nil
+		}
+		return "", errors.New("not found")
+	}
+	statFile = func(string) (os.FileInfo, error) { return nil, os.ErrNotExist }
+	for in, want := range map[string]string{
+		// The rule's path is gone after an update: found by file name.
+		`C:\U\Discord\app-1.0.9\Discord.exe`: `C:\U\Discord\app-1.0.10\Discord.exe`,
+		// Neither running nor installed: found on PATH.
+		"curl":      `C:\Windows\System32\curl.exe`,
+		"curl.exe":  `C:\Windows\System32\curl.exe`,
+		`*\x\*.exe`: "",
 	} {
 		if got := iconPath(in); got != want {
 			t.Fatalf("iconPath(%q) = %q, want %q", in, got, want)

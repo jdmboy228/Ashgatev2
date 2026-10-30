@@ -355,6 +355,7 @@ function apGroupHTML(u) {
   else if (!state.running) tele = `<div class="l1">Перехват выключен</div><div class="l2">${members.length} ${appWord(members.length)}</div>`;
   else if (flows) tele = `<div class="l1"><span class="dn">↓ ${esc(apRate(down))}</span><span class="dim">·</span><span class="up">↑ ${esc(apRate(up))}</span></div><div class="l2">${flows} ${flowWord(flows)} · ${bytes(total)}</div>`;
   else tele = `<div class="l1">Нет соединений</div><div class="l2">${members.length} ${appWord(members.length)} суммарно</div>`;
+  const icons = members.slice(0, 4).map((r) => `<span class="mini" title="${esc(apLabel(r.process))}">${appIconHTML(apPath(r.process), "width:16px;height:16px;font-size:8px")}</span>`).join("");
   const target = "g:" + g.name;
   apTele[target] = tele;
   const open = !g.collapsed;
@@ -362,7 +363,7 @@ function apGroupHTML(u) {
   return `<div class="ap-group${on ? "" : " dim"}" draggable="true" data-unit="g:${esc(g.name)}">
     <div class="ap-card group">
       <div class="ap-left"><span class="ap-slot"><button class="ap-chev${open ? " open" : ""}" type="button" data-act="ap-collapse" data-group="${esc(g.name)}" title="${open ? "Свернуть группу" : "Развернуть группу"}">${icon("chevr", 16)}</button></span><span class="ap-folder">${icon("folder", 16)}<i class="ap-dot ${dot}"></i></span>
-        <div class="ap-name"><div class="nm"><span>${esc(g.name)}</span></div><div class="sub g"><span class="names">${esc(members.map((r) => apLabel(r.process)).join(", "))}</span></div></div></div>
+        <div class="ap-name"><div class="nm"><span>${esc(g.name)}</span></div><div class="sub g"><span class="stack">${icons}</span><span class="names">${esc(members.map((r) => apLabel(r.process)).join(", "))}</span></div></div></div>
       <div class="ap-tele" data-tele="${esc(target)}"></div>
       <div class="ap-routecell">${apRouteBadge(target, g.action, g.proxy || "", bad)}</div>
       <div class="ap-right">${apSwitch("ap-gtoggle", `data-group="${esc(g.name)}"`, on, on ? "Отключить всю группу правил" : "Включить всю группу правил")}

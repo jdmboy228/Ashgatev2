@@ -500,7 +500,9 @@ table.table { min-width: 560px; }
   width: 28px; height: 28px; border-radius: 4px; background: var(--neutral); display: grid; place-items: center;
   color: var(--tx); font-weight: 600; flex: none; position: relative; overflow: hidden; font-size: 13px;
 }
-.appicon img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; padding: 4px; }
+.appicon img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
+/* Only the 32 px tiles get a margin; smaller icons (dialogs, chips) use all their pixels. */
+.ap-ic .appicon img { padding: 3px; }
 .appicon.hasimg { color: transparent; background: transparent; }
 .ap-dot {
   position: absolute; right: -3px; bottom: -3px; width: 10px; height: 10px; border-radius: 50%;
@@ -527,6 +529,11 @@ table.table { min-width: 560px; }
 .ap-name .sub { display: flex; align-items: center; gap: 6px; min-width: 0; margin-top: 2px; font-size: 12px; line-height: 16px; color: var(--tx3); }
 .ap-name .path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: "Cascadia Mono", "Cascadia Code", "JetBrains Mono", Consolas, monospace; }
 .ap-name .names { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ap-name .sub.g { gap: 8px; }
+.ap-name .stack { display: inline-flex; flex-direction: row; flex: none; }
+.ap-name .stack .mini { display: inline-flex; margin-right: -4px; border-radius: 50%; box-shadow: 0 0 0 2px var(--card); }
+.ap-name .stack .mini:last-child { margin-right: 0; }
+.ap-name .stack .appicon { border-radius: 50%; }
 
 .ap-tele { width: 208px; flex: none; display: flex; flex-direction: column; justify-content: center; gap: 2px; font-variant-numeric: tabular-nums; min-width: 0; }
 .ap-tele .l1 { display: flex; align-items: center; gap: 5px; font-size: 12px; line-height: 16px; color: var(--tx); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }

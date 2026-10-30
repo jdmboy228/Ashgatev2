@@ -18,6 +18,7 @@ var (
 	modUser32            = windows.NewLazySystemDLL("user32.dll")
 	modGdi32             = windows.NewLazySystemDLL("gdi32.dll")
 	procExtractIconExW   = modShell32.NewProc("ExtractIconExW")
+	procSHGetFileInfoW   = modShell32.NewProc("SHGetFileInfoW")
 	procDestroyIcon      = modUser32.NewProc("DestroyIcon")
 	procGetDC            = modUser32.NewProc("GetDC")
 	procReleaseDC        = modUser32.NewProc("ReleaseDC")
@@ -29,7 +30,20 @@ var (
 	procDeleteObject     = modGdi32.NewProc("DeleteObject")
 )
 
-const diNormal = 3
+const (
+	diNormal       = 3
+	shgfiIcon      = 0x000000100
+	shgfiLargeIcon = 0x000000000
+)
+
+// shFileInfo is SHFILEINFOW.
+type shFileInfo struct {
+	Icon        uintptr
+	IconIndex   int32
+	Attributes  uint32
+	DisplayName [260]uint16
+	TypeName    [80]uint16
+}
 
 type bitmapInfoHeader struct {
 	Size          uint32
@@ -66,6 +80,11 @@ func ExeIconPNG(path string) ([]byte, error) {
 		defer procDestroyIcon.Call(small)
 	}
 	if r == 0 || large == 0 {
+		// No icon of its own (curl.exe, helpers): take the one Explorer
+		// shows, which for such an exe is the generic program icon.
+		if png, err := shellIconPNG(p); err == nil {
+			return png, nil
+		}
 		if callErr != nil && callErr != windows.ERROR_SUCCESS {
 			return nil, callErr
 		}
@@ -73,6 +92,22 @@ func ExeIconPNG(path string) ([]byte, error) {
 	}
 	defer procDestroyIcon.Call(large)
 	return hiconPNG(large, 32)
+}
+
+func shellIconPNG(path *uint16) ([]byte, error) {
+	var info shFileInfo
+	r, _, _ := procSHGetFileInfoW.Call(
+		uintptr(unsafe.Pointer(path)),
+		0,
+		uintptr(unsafe.Pointer(&info)),
+		unsafe.Sizeof(info),
+		shgfiIcon|shgfiLargeIcon,
+	)
+	if r == 0 || info.Icon == 0 {
+		return nil, errors.New("у файла нет иконки")
+	}
+	defer procDestroyIcon.Call(info.Icon)
+	return hiconPNG(info.Icon, 32)
 }
 
 func hiconPNG(icon uintptr, size int) ([]byte, error) {

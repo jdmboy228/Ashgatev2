@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
@@ -832,13 +833,23 @@ func writeErr(w http.ResponseWriter, err error) {
 // iconPath turns a rule's process field into an exe to take the icon from.
 // A full path is used as is; a name or a mask ("telegram",
 // `*\Discord\app-*\Discord.exe`) is looked up among running and installed
-// programs.
+// programs. A full path that no longer exists (an update moved the exe) is
+// looked up by its file name, and a bare name of a program that is neither
+// running nor installed (curl.exe in System32) is searched on PATH.
 func iconPath(process string) string {
 	process = strings.Trim(strings.TrimSpace(process), `"`)
-	if rules.IsPath(process) && !strings.ContainsAny(process, "*?") {
+	exact := rules.IsPath(process) && !strings.ContainsAny(process, "*?")
+	if exact && fileExists(process) {
 		return process
 	}
-	one := rules.Compile([]config.Rule{{Process: process, Action: "direct"}})
+	match := process
+	if exact {
+		match = rules.Base(process)
+	}
+	if match == "" {
+		return ""
+	}
+	one := rules.Compile([]config.Rule{{Process: match, Action: "direct"}})
 	hit := func(name, path string) bool {
 		return path != "" && one.Match(rules.Process{Name: name, Path: path}).Action != ""
 	}
@@ -854,13 +865,32 @@ func iconPath(process string) string {
 			return a.Path
 		}
 	}
+	if !strings.ContainsAny(match, `*?\/`) {
+		name := match
+		if !strings.HasSuffix(strings.ToLower(name), ".exe") {
+			name += ".exe"
+		}
+		if p, err := lookPath(name); err == nil && p != "" {
+			return p
+		}
+	}
+	if exact {
+		return process
+	}
 	return ""
+}
+
+func fileExists(path string) bool {
+	st, err := statFile(path)
+	return err == nil && !st.IsDir()
 }
 
 // Indirections so tests can run without Windows process lists.
 var (
 	listRunning   = process.List
 	listInstalled = process.InstalledApps
+	lookPath      = exec.LookPath
+	statFile      = os.Stat
 )
 
 // iconCache keeps app icons, and the names that have none, so redrawing the
