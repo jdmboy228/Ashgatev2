@@ -115,27 +115,6 @@ $stage = Join-Path $src 'build\update'
 Remove-Item -Recurse -Force $stage -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $stage | Out-Null
 
-$wdVer = '2.2.2'
-$wdZip = Join-Path $src "build\WinDivert-$wdVer-A.zip"
-if (-not (Test-Path $wdZip)) {
-  Info "Скачиваю драйвер WinDivert $wdVer…"
-  try {
-    Invoke-WebRequest -UseBasicParsing -Uri "https://github.com/basil00/WinDivert/releases/download/v$wdVer/WinDivert-$wdVer-A.zip" -OutFile $wdZip -ErrorAction Stop
-  } catch {
-    Remove-Item $wdZip -ErrorAction SilentlyContinue
-    Warn "Драйвер не скачался: оставлю WinDivert, который уже лежит рядом с ashgate.exe."
-  }
-}
-$wdDll = $null
-$wdSys = $null
-if (Test-Path $wdZip) {
-  $wdDir = Join-Path $src 'build\windivert'
-  Remove-Item -Recurse -Force $wdDir -ErrorAction SilentlyContinue
-  Expand-Archive -Path $wdZip -DestinationPath $wdDir -Force
-  $wdDll = Get-ChildItem -Recurse $wdDir -Filter WinDivert.dll | Where-Object { $_.FullName -match '\\x64\\' } | Select-Object -First 1
-  $wdSys = Get-ChildItem -Recurse $wdDir -Filter WinDivert64.sys | Where-Object { $_.FullName -match '\\x64\\' } | Select-Object -First 1
-}
-
 Push-Location $src
 $env:CGO_ENABLED = '0'
 $env:GOOS = 'windows'
@@ -176,6 +155,62 @@ if (-not $target) { $target = Join-Path $src 'dist'; $how = 'папка сбор
 $target = [IO.Path]::GetFullPath($target)
 $script:oldExe = Join-Path $target 'ashgate.exe'
 Info "$target ($how)"
+
+# WinDivert 2.2.2-A, x64. The hashes are those of the official release, so
+# a copy that is already in place is never downloaded again, and a broken
+# or half-downloaded zip is not used.
+$wdVer = '2.2.2'
+$wdHash = @{
+  'WinDivert.dll'   = 'C1E060EE19444A259B2162F8AF0F3FE8C4428A1C6F694DCE20DE194AC8D7D9A2'
+  'WinDivert64.sys' = '8DA085332782708D8767BCACE5327A6EC7283C17CFB85E40B03CD2323A90DDC2'
+}
+$wdZipHash = '63CB41763BB4B20F600B6DE04E991A9C2BE73279E317D4D82F237B150C5F3F15'
+function WdIn($dir) {
+  foreach ($n in $wdHash.Keys) {
+    $f = Join-Path $dir $n
+    if (-not (Test-Path -LiteralPath $f) -or (Get-FileHash -LiteralPath $f -Algorithm SHA256).Hash -ne $wdHash[$n]) { return $false }
+  }
+  return $true
+}
+$wdDll = $null
+$wdSys = $null
+if (WdIn $target) {
+  Info "WinDivert $wdVer уже стоит рядом с ashgate.exe — не скачиваю."
+} else {
+  $wdFrom = $null
+  $dist = Join-Path $src 'dist'
+  if (($dist -ne $target) -and (WdIn $dist)) { $wdFrom = $dist; Info "WinDivert $wdVer беру из $dist — не скачиваю." }
+  if (-not $wdFrom) {
+    $wdZip = Join-Path $src "build\WinDivert-$wdVer-A.zip"
+    if ((Test-Path $wdZip) -and (Get-FileHash $wdZip -Algorithm SHA256).Hash -ne $wdZipHash) {
+      Remove-Item $wdZip -ErrorAction SilentlyContinue
+    }
+    if (Test-Path $wdZip) {
+      Info "WinDivert $wdVer уже скачан — не скачиваю."
+    } else {
+      Info "Скачиваю драйвер WinDivert $wdVer…"
+      New-Item -ItemType Directory -Force -Path (Split-Path -Parent $wdZip) | Out-Null
+      try {
+        Invoke-WebRequest -UseBasicParsing -Uri "https://github.com/basil00/WinDivert/releases/download/v$wdVer/WinDivert-$wdVer-A.zip" -OutFile $wdZip -ErrorAction Stop
+        if ((Get-FileHash $wdZip -Algorithm SHA256).Hash -ne $wdZipHash) { throw "контрольная сумма не совпала" }
+      } catch {
+        Remove-Item $wdZip -ErrorAction SilentlyContinue
+        Warn "Драйвер не скачался ($($_.Exception.Message)): оставлю WinDivert, который уже лежит рядом с ashgate.exe."
+      }
+    }
+    if (Test-Path $wdZip) {
+      $wdDir = Join-Path $src 'build\windivert'
+      Remove-Item -Recurse -Force $wdDir -ErrorAction SilentlyContinue
+      Expand-Archive -Path $wdZip -DestinationPath $wdDir -Force
+      $x64 = Get-ChildItem -Recurse $wdDir -Filter WinDivert.dll | Where-Object { $_.FullName -match '\\x64\\' } | Select-Object -First 1
+      if ($x64) { $wdFrom = $x64.DirectoryName }
+    }
+  }
+  if ($wdFrom) {
+    $wdDll = Get-Item -LiteralPath (Join-Path $wdFrom 'WinDivert.dll')
+    $wdSys = Get-Item -LiteralPath (Join-Path $wdFrom 'WinDivert64.sys')
+  }
+}
 
 # ---------- 5. close the old version ----------
 Step 5 "Закрываю старую версию"
