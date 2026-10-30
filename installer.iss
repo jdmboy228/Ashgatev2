@@ -73,7 +73,10 @@ Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExe}"
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\{#AppExe}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall skipifsilent
+; postinstall entries run as the original, non-elevated user. ashgate.exe
+; requires administrator, so CreateProcess fails with code 740; shellexec
+; starts it through the shell, which shows the UAC prompt.
+Filename: "{app}\{#AppExe}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall skipifsilent shellexec
 
 [UninstallRun]
 ; Close the window, remove the kill switch's firewall rules and the
