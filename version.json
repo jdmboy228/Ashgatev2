@@ -1,5 +1,5 @@
 {
-  "version": "0.7.3",
+  "version": "0.7.4",
   "download_url": "https://github.com/jdmboy228/Ashgatev2/releases/latest",
-  "release_notes": "Новое окно в стиле Windows 11, исправления безопасности и ошибок, установщик."
+  "release_notes": "Установщик и проверка обновлений в настройках, исправления безопасности и ошибок, меньше нагрузки при работе."
 }
