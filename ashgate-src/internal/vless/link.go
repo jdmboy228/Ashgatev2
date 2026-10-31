@@ -88,6 +88,11 @@ func ParseLink(raw string) (Parsed, error) {
 		ALPN:        strings.TrimSpace(q.Get("alpn")),
 		HeaderType:  strings.TrimSpace(q.Get("headerType")),
 	}
+	if p.Network == "tcp" && p.Flow != "" && !visionFlow(p.Flow) {
+		// Dropping it would connect without the flow the server requires,
+		// and the server would refuse without saying why.
+		return Parsed{}, badLink("flow " + p.Flow + " не поддерживается (нужен xtls-rprx-vision)")
+	}
 	if v := strings.TrimSpace(q.Get("allowInsecure")); v == "1" || strings.EqualFold(v, "true") {
 		p.AllowInsecure = true
 	}
@@ -163,7 +168,7 @@ func (p *Params) Normalize() error {
 		p.Network = "tcp"
 	}
 	if !supportedNetwork(p.Network) {
-		return badLink("транспорт " + p.Network + " не поддерживается")
+		return badLink("транспорт " + p.Network + " не поддерживается (нужен tcp/raw, xhttp, ws, grpc или httpupgrade)")
 	}
 	p.Security = canonicalSecurity(p.Security)
 	if p.Security == "" {
@@ -175,8 +180,10 @@ func (p *Params) Normalize() error {
 		return badLink("защита " + p.Security + " не поддерживается")
 	}
 	p.Flow = strings.TrimSpace(p.Flow)
-	if p.Flow != "" && p.Flow != "xtls-rprx-vision" {
+	if p.Flow != "" && !visionFlow(p.Flow) {
 		// 3x-ui sometimes copies an old flow onto transports that reject it.
+		// A new link with one on TCP is refused in ParseLink; a saved config
+		// must still load, so it is dropped here.
 		p.Flow = ""
 	}
 	if p.Security == "reality" || p.Security == "tls" {
@@ -215,10 +222,15 @@ func (p Params) DialFlow() string {
 	if p.Network != "tcp" {
 		return ""
 	}
-	if p.Flow == "xtls-rprx-vision" {
+	if visionFlow(p.Flow) {
 		return p.Flow
 	}
 	return ""
+}
+
+// visionFlow reports the XTLS Vision flows Xray accepts on RAW (TCP).
+func visionFlow(f string) bool {
+	return f == "xtls-rprx-vision" || f == "xtls-rprx-vision-udp443"
 }
 
 func badLink(detail string) error {

@@ -1,5 +1,5 @@
 {
-  "version": "0.7.4",
+  "version": "0.7.5",
   "download_url": "https://github.com/jdmboy228/Ashgatev2/releases/latest",
-  "release_notes": "Установщик и проверка обновлений в настройках, исправления безопасности и ошибок, меньше нагрузки при работе."
+  "release_notes": "VLESS: транспорт RAW (TCP) с REALITY и Vision передаётся в Xray как raw, понятные ошибки для неизвестного транспорта и flow, ключи скрыты в сообщениях об ошибках."
 }

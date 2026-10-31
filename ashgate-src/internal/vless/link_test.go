@@ -1,6 +1,11 @@
 package vless
 
 import (
+	"encoding/json"
+	"errors"
+	"net"
+	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -187,4 +192,93 @@ func mustClient(t *testing.T, p Params, host string, port int) []byte {
 		t.Fatal(err)
 	}
 	return b
+}
+
+// outboundOf returns the VLESS outbound of the client document for raw.
+func outboundOf(t *testing.T, raw string) any {
+	t.Helper()
+	got, err := ParseLink(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host, port, _ := net.SplitHostPort(got.Address)
+	p, _ := strconv.Atoi(port)
+	body, err := ClientJSON("127.0.0.1", 1080, 0, host, p, "", "", got.Params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Outbounds []any `json:"outbounds"`
+	}
+	if err := json.Unmarshal(body, &doc); err != nil || len(doc.Outbounds) != 1 {
+		t.Fatalf("%v %s", err, body)
+	}
+	return doc.Outbounds[0]
+}
+
+func sameJSON(t *testing.T, got any, want string) {
+	t.Helper()
+	var w any
+	if err := json.Unmarshal([]byte(want), &w); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, w) {
+		g, _ := json.Marshal(got)
+		t.Fatalf("outbound\n got %s\nwant %s", g, want)
+	}
+}
+
+// RAW (TCP) + REALITY + Vision as 3x-ui exports it. Only fake keys.
+func TestOutboundTCPRealityVision(t *testing.T) {
+	for _, typ := range []string{"tcp", "raw"} {
+		raw := "vless://" + sampleUUID + "@1.2.3.4:443?type=" + typ + "&encryption=none&security=reality&pbk=" + samplePBK +
+			"&fp=firefox&sni=example.com&sid=abcd&spx=%2F&flow=xtls-rprx-vision#name"
+		sameJSON(t, outboundOf(t, raw), `{
+			"protocol": "vless",
+			"settings": {"vnext": [{"address": "1.2.3.4", "port": 443,
+				"users": [{"id": "`+sampleUUID+`", "encryption": "none", "flow": "xtls-rprx-vision"}]}]},
+			"streamSettings": {"network": "raw", "security": "reality",
+				"realitySettings": {"serverName": "example.com", "fingerprint": "firefox",
+					"publicKey": "`+samplePBK+`", "shortId": "abcd", "spiderX": "/"}}
+		}`)
+	}
+}
+
+// XHTTP + REALITY keeps its old document: no flow, xhttpSettings.
+func TestOutboundXHTTPReality(t *testing.T) {
+	raw := "vless://" + sampleUUID + "@1.2.3.4:443?type=xhttp&encryption=none&security=reality&pbk=" + samplePBK +
+		"&fp=chrome&sni=example.com&sid=abcd&spx=%2F&path=%2Fxhttp&host=example.com&mode=auto&flow=xtls-rprx-vision#name"
+	sameJSON(t, outboundOf(t, raw), `{
+		"protocol": "vless",
+		"settings": {"vnext": [{"address": "1.2.3.4", "port": 443,
+			"users": [{"id": "`+sampleUUID+`", "encryption": "none"}]}]},
+		"streamSettings": {"network": "xhttp", "security": "reality",
+			"realitySettings": {"serverName": "example.com", "fingerprint": "chrome",
+				"publicKey": "`+samplePBK+`", "shortId": "abcd", "spiderX": "/"},
+			"xhttpSettings": {"path": "/xhttp", "host": "example.com", "mode": "auto"}}
+	}`)
+}
+
+func TestUnknownTypeAndFlowAreErrors(t *testing.T) {
+	base := "vless://" + sampleUUID + "@1.2.3.4:443?encryption=none&security=reality&pbk=" + samplePBK + "&sni=example.com"
+	if _, err := ParseLink(base + "&type=kcp"); err == nil || !strings.Contains(err.Error(), "транспорт kcp не поддерживается") {
+		t.Fatalf("type=kcp: %v", err)
+	}
+	if _, err := ParseLink(base + "&type=tcp&flow=xtls-rprx-direct"); err == nil || !strings.Contains(err.Error(), "flow xtls-rprx-direct") {
+		t.Fatalf("unknown flow on tcp: %v", err)
+	}
+	// On XHTTP a stray flow is still dropped, as before.
+	if _, err := ParseLink(base + "&type=xhttp&flow=xtls-rprx-direct"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestMaskSecrets(t *testing.T) {
+	p := Params{UUID: sampleUUID, PublicKey: samplePBK, ShortID: "abcd"}
+	err := maskSecrets(errors.New("bad user "+sampleUUID+" key "+samplePBK+" sid abcd"), p)
+	for _, secret := range []string{sampleUUID, samplePBK, "abcd"} {
+		if strings.Contains(err.Error(), secret) {
+			t.Fatalf("%q still in %q", secret, err)
+		}
+	}
 }

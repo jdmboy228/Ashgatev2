@@ -70,6 +70,15 @@ func (b *Bridge) Close() {
 // A fixed Inbound.Port also publishes an HTTP proxy on the next port.
 // The bridge stops when ctx is cancelled or Close is called.
 func Listen(ctx context.Context, serverAddr string, p Params, in Inbound) (*Bridge, error) {
+	b, err := listen(ctx, serverAddr, p, in)
+	if err != nil {
+		// The error reaches the window and ashgate.log.
+		return nil, maskSecrets(err, p)
+	}
+	return b, nil
+}
+
+func listen(ctx context.Context, serverAddr string, p Params, in Inbound) (*Bridge, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -184,8 +193,13 @@ func ClientJSON(listen string, socksPort, httpPort int, serverHost string, serve
 	if flow := p.DialFlow(); flow != "" {
 		vuser["flow"] = flow
 	}
+	network := p.Network
+	if network == "tcp" {
+		// Xray calls TCP "raw" since v24.9.30; config.json keeps "tcp".
+		network = "raw"
+	}
 	stream := map[string]any{
-		"network":  p.Network,
+		"network":  network,
 		"security": p.Security,
 	}
 	switch p.Security {
@@ -253,7 +267,7 @@ func ClientJSON(listen string, socksPort, httpPort int, serverHost string, serve
 		stream["httpupgradeSettings"] = hs
 	default:
 		if p.HeaderType != "" && !strings.EqualFold(p.HeaderType, "none") {
-			stream["tcpSettings"] = map[string]any{
+			stream["rawSettings"] = map[string]any{
 				"header": map[string]any{"type": p.HeaderType},
 			}
 		}
@@ -412,6 +426,23 @@ func humanizeStart(err error) error {
 	default:
 		return fmt.Errorf("VLESS: не удалось запустить локальный мост: %s", msg)
 	}
+}
+
+// maskSecrets hides the UUID, public key and short id if an Xray error
+// quotes them. A short id under 4 characters could match ordinary words
+// and is left alone.
+func maskSecrets(err error, p Params) error {
+	msg := err.Error()
+	out := msg
+	for _, v := range []string{p.UUID, strings.ReplaceAll(p.UUID, "-", ""), p.PublicKey, p.ShortID} {
+		if len(v) >= 4 {
+			out = strings.ReplaceAll(out, v, "***")
+		}
+	}
+	if out == msg {
+		return err
+	}
+	return errors.New(out)
 }
 
 func splitComma(s string) []string {
