@@ -653,3 +653,31 @@ func TestRuleStatsCountFlows(t *testing.T) {
 		t.Fatalf("flows after close %d", st.Flows)
 	}
 }
+
+// A proxy given as an IP literal is never looked up in DNS: the lookup
+// would go to the system resolver outside the tunnel.
+func TestRefreshBypassSkipsDNSForIPLiterals(t *testing.T) {
+	var looked []string
+	old := lookupIP
+	lookupIP = func(_ context.Context, _, host string) ([]net.IP, error) {
+		looked = append(looked, host)
+		return []net.IP{net.ParseIP("198.51.100.7")}, nil
+	}
+	t.Cleanup(func() { lookupIP = old })
+	cfg := config.Default()
+	cfg.Proxies = []config.Proxy{
+		{Name: "v4", Type: "socks5", Address: "203.0.113.10:1080"},
+		{Name: "v6", Type: "socks5", Address: "[2001:db8::1]:1080"},
+		{Name: "named", Type: "socks5", Address: "proxy.example.com:1080"},
+	}
+	e, _ := newEngine(t, cfg, nil, nil, nil)
+	e.RefreshBypass(context.Background())
+	if len(looked) != 1 || looked[0] != "proxy.example.com" {
+		t.Fatalf("looked up %v, want only proxy.example.com", looked)
+	}
+	for _, ip := range []string{"203.0.113.10", "2001:db8::1", "198.51.100.7"} {
+		if !e.destinationBypass(packet.FromIP(net.ParseIP(ip), 443), false) {
+			t.Errorf("%s not in the bypass set", ip)
+		}
+	}
+}

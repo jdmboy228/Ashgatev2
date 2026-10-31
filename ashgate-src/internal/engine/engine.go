@@ -284,6 +284,9 @@ func (e *Engine) Traffic() (up, down int64) {
 	return e.bytesUp.Load(), e.bytesDown.Load()
 }
 
+// lookupIP resolves proxy host names; tests count the calls.
+var lookupIP = net.DefaultResolver.LookupIP
+
 // RefreshBypass resolves proxy hostnames so traffic to the proxy itself stays direct.
 func (e *Engine) RefreshBypass(ctx context.Context) {
 	snap := e.snap.Load()
@@ -301,7 +304,7 @@ func (e *Engine) RefreshBypass(ctx context.Context) {
 			continue
 		}
 		ctx2, cancel := context.WithTimeout(ctx, 5*time.Second)
-		ips, err := net.DefaultResolver.LookupIP(ctx2, "ip", host)
+		ips, err := lookupIP(ctx2, "ip", host)
 		cancel()
 		if err != nil {
 			continue
