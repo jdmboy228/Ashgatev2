@@ -16,6 +16,9 @@ type SOCKS struct {
 	Addr string
 	User string
 	Pass string
+	// Dial, when set, replaces net.Dial for CONNECT, so a test can send
+	// a destination somewhere else. Set it before the first connection.
+	Dial func(network, addr string) (net.Conn, error)
 
 	ln  net.Listener
 	udp net.PacketConn
@@ -135,7 +138,11 @@ func (s *SOCKS) readAuth(c net.Conn) error {
 }
 
 func (s *SOCKS) connect(c net.Conn, host string, port uint16) {
-	dst, err := net.Dial("tcp", net.JoinHostPort(host, strconv.Itoa(int(port))))
+	dial := s.Dial
+	if dial == nil {
+		dial = net.Dial
+	}
+	dst, err := dial("tcp", net.JoinHostPort(host, strconv.Itoa(int(port))))
 	if err != nil {
 		_, _ = c.Write([]byte{5, 5, 0, 1, 0, 0, 0, 0, 0, 0})
 		return

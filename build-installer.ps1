@@ -2,13 +2,19 @@
 #
 #   powershell -ExecutionPolicy Bypass -File build-installer.ps1
 #   powershell -ExecutionPolicy Bypass -File build-installer.ps1 -Iscc "D:\Inno Setup 6\ISCC.exe"
+#   powershell -ExecutionPolicy Bypass -File build-installer.ps1 -Strict
+#
+# -Strict (CI) treats every warning as an error: a PowerShell warning (such
+# as go-winres failing, so the exe would lack its manifest) and every
+# "Warning:" line of the Inno Setup compiler.
 #
 # Needs Go and Inno Setup 6.3 or newer (https://jrsoftware.org/isdl.php).
 # The exe is built by ashgate-src\scripts\package.ps1: plain go build, no
 # packer such as UPX, and WinDivert checked against its official SHA-256.
-param([string]$Iscc)
+param([string]$Iscc, [switch]$Strict)
 
 $ErrorActionPreference = 'Stop'
+if ($Strict) { $WarningPreference = 'Stop' }
 $root = $PSScriptRoot
 $src = Join-Path $root 'ashgate-src'
 
@@ -52,8 +58,18 @@ foreach ($f in 'ashgate.exe', 'WinDivert.dll', 'WinDivert64.sys') {
 # 4. Setup.exe.
 $setup = Join-Path $src 'dist\Setup.exe'
 if (Test-Path $setup) { Remove-Item $setup }
-& $Iscc /Q "/DAppVersion=$ver" (Join-Path $root 'installer.iss')
-if ($LASTEXITCODE -ne 0 -or -not (Test-Path $setup)) { throw "Inno Setup failed (exit code $LASTEXITCODE)." }
+if ($Strict) {
+    # Without /Q the compiler prints its warnings; any of them fails the build.
+    $log = & $Iscc "/DAppVersion=$ver" (Join-Path $root 'installer.iss') 2>&1
+    $code = $LASTEXITCODE
+    $log | ForEach-Object { Write-Host $_ }
+    $warn = @($log | Where-Object { "$_" -match '^\s*Warning' })
+    if ($warn.Count -gt 0) { throw "Inno Setup printed $($warn.Count) warning(s): $($warn -join '; ')" }
+} else {
+    & $Iscc /Q "/DAppVersion=$ver" (Join-Path $root 'installer.iss')
+    $code = $LASTEXITCODE
+}
+if ($code -ne 0 -or -not (Test-Path $setup)) { throw "Inno Setup failed (exit code $code)." }
 
 Write-Host ""
 Write-Host "Ashgate $ver installer: $setup" -ForegroundColor Green

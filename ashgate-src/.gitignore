@@ -8,3 +8,5 @@ agent-tools/
 ashgate.json
 *.log
 /vendor/
+e2e/ui/node_modules/
+e2e/ui/out/

@@ -444,6 +444,8 @@ type stateView struct {
 	Events     []eventView `json:"events"`
 	EventsSame bool        `json:"eventsSame,omitempty"`
 	Generation uint64      `json:"generation"`
+	// Goroutines is for the end-to-end leak checks; the window ignores it.
+	Goroutines int `json:"goroutines"`
 }
 
 type eventView struct {
@@ -537,6 +539,7 @@ func (c *controller) snapshotSince(since uint64) stateView {
 		Events:     events,
 		EventsSame: same,
 		Generation: g,
+		Goroutines: runtime.NumGoroutine(),
 	}
 }
 

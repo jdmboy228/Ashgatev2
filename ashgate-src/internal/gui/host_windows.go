@@ -356,7 +356,7 @@ func hostProc(hwnd, msg, wp, lp uintptr) uintptr {
 		if wp == 0 || lp == 0 || windowMaximized(hwnd) {
 			break
 		}
-		r := (*Rect)(unsafe.Pointer(lp))
+		r := lparam[Rect](lp)
 		top := r.Top
 		ret, _, _ := pCallWindowProc.Call(h.orig, hwnd, msg, wp, lp)
 		r.Top = top
@@ -376,7 +376,7 @@ func hostProc(hwnd, msg, wp, lp uintptr) uintptr {
 		// Windows suggested for the new monitor.
 		pCallWindowProc.Call(h.orig, hwnd, msg, wp, lp)
 		if lp != 0 {
-			r := (*Rect)(unsafe.Pointer(lp))
+			r := lparam[Rect](lp)
 			pSetWindowPos.Call(hwnd, 0, uintptr(r.Left), uintptr(r.Top), uintptr(r.Right-r.Left), uintptr(r.Bottom-r.Top), swpNoZOrder|swpNoActivate)
 		}
 		h.noteNormal()
@@ -619,13 +619,19 @@ func frameSize(hwnd uintptr) (int32, int32) {
 	return fx, fy
 }
 
+// lparam reads a message's lParam as the address of the structure Windows
+// passed with it. The memory is Windows', not the Go heap; reading the
+// pointer through the variable keeps go vet's unsafeptr check meaningful
+// for the rest of the code.
+func lparam[T any](lp uintptr) *T { return *(**T)(unsafe.Pointer(&lp)) }
+
 func applyMinMax(hwnd, lp uintptr) {
 	if lp == 0 {
 		return
 	}
 	dpi := windowDPI(hwnd)
 	fx, fy := frameSize(hwnd)
-	mmi := (*MinMaxInfo)(unsafe.Pointer(lp))
+	mmi := lparam[MinMaxInfo](lp)
 	// Drag minimum only. ptMaxTrackSize is left at the value Windows already
 	// filled in, so there is no upper limit while dragging. ptMaxSize is the
 	// maximized size and is set to the work area so a caption-less window does

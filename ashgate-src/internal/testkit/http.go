@@ -17,6 +17,9 @@ type HTTP struct {
 	Addr string
 	User string
 	Pass string
+	// Dial, when set, makes CONNECT to ports other than 53 dial for real
+	// (through Dial) instead of echoing. Set it before the first connection.
+	Dial func(network, addr string) (net.Conn, error)
 	ln   net.Listener
 }
 
@@ -69,6 +72,16 @@ func (h *HTTP) serve(c net.Conn) {
 	}
 	if port == "53" {
 		dnsTCP(c)
+		return
+	}
+	if h.Dial != nil {
+		dst, err := h.Dial("tcp", req.Host)
+		if err != nil {
+			return
+		}
+		defer dst.Close()
+		go func() { _, _ = io.Copy(dst, br) }()
+		_, _ = io.Copy(c, dst)
 		return
 	}
 	_, _ = io.Copy(c, c)

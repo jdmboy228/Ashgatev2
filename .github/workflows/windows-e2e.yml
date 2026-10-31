@@ -1,0 +1,366 @@
+# Windows end-to-end tests of Ashgate on windows-latest (the runner is an
+# administrator). The build job makes Setup.exe; every test job installs it
+# on a fresh runner and runs one part of ashgate-src/e2e. Fake keys only:
+# every server, key and subscription is made up inside the runner.
+#
+# Long tests (failover back to XHTTP after ~20 min, the 10-minute
+# stability run) only run nightly and on workflow_dispatch.
+name: Windows E2E
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 2 * * *"
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: windows-e2e-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: pwsh
+
+env:
+  E2E_LONG: ${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') && '1' || '0' }}
+  E2E_BIN: ${{ github.workspace }}\e2e-bin
+  E2E_SETUP: ${{ github.workspace }}\setup\Setup.exe
+  E2E_DIST: ${{ github.workspace }}\dist
+  E2E_OUT: ${{ github.workspace }}\out
+  GOFLAGS: -mod=readonly
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: ashgate-src/go.mod
+          cache-dependency-path: ashgate-src/go.sum
+      - name: go vet (warnings fail the build)
+        working-directory: ashgate-src
+        run: |
+          go vet ./...
+          if ($LASTEXITCODE) { exit 1 }
+          go vet -tags e2e ./e2e/...
+          if ($LASTEXITCODE) { exit 1 }
+      - name: Inno Setup
+        run: |
+          $iscc = Get-Command ISCC.exe -ErrorAction SilentlyContinue
+          if (-not $iscc -and -not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) {
+            choco install innosetup -y --no-progress
+            if ($LASTEXITCODE) { exit 1 }
+          }
+      - name: Build ashgate.exe and Setup.exe (strict)
+        run: ./build-installer.ps1 -Strict
+      - name: Versions agree
+        run: |
+          $v = (Select-String ashgate-src/internal/version/version.go -Pattern 'const Version = "([^"]+)"').Matches[0].Groups[1].Value
+          $m = (Get-Content -Raw ashgate-src/winres/winres.json | ConvertFrom-Json).RT_MANIFEST.'#1'.'0409'.identity.version
+          $j = (Get-Content -Raw version.json | ConvertFrom-Json).version
+          Write-Host "version.go $v · winres.json $m · version.json $j"
+          if ($j -ne $v) { throw "version.json $j differs from version.go $v" }
+          if ($m -notlike "$v*") { throw "winres.json manifest identity $m differs from version.go $v" }
+      - name: Build e2e binaries
+        working-directory: ashgate-src
+        run: |
+          New-Item -ItemType Directory -Force $env:E2E_BIN | Out-Null
+          go test -c -tags e2e -o "$env:E2E_BIN\e2e.test.exe" ./e2e
+          if ($LASTEXITCODE) { exit 1 }
+          go build -tags e2e -o "$env:E2E_BIN\ashgate-e2e-client.exe" ./e2e/cmd/client
+          if ($LASTEXITCODE) { exit 1 }
+          go build -tags e2e -o "$env:E2E_BIN\ashgate-e2e-servers.exe" ./e2e/cmd/servers
+          if ($LASTEXITCODE) { exit 1 }
+          go build -o "$env:E2E_BIN\test2json.exe" cmd/test2json
+          if ($LASTEXITCODE) { exit 1 }
+          $env:GOBIN = $env:E2E_BIN
+          go install gotest.tools/gotestsum@v1.12.0
+          if ($LASTEXITCODE) { exit 1 }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: setup
+          path: ashgate-src/dist/Setup.exe
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: |
+            ashgate-src/dist/ashgate.exe
+            ashgate-src/dist/WinDivert.dll
+            ashgate-src/dist/WinDivert64.sys
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: e2e-bin
+          path: e2e-bin
+          if-no-files-found: error
+
+  unit:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: ashgate-src/go.mod
+          cache-dependency-path: ashgate-src/go.sum
+      - name: C compiler for -race
+        run: |
+          if (-not (Get-Command gcc -ErrorAction SilentlyContinue)) {
+            choco install mingw -y --no-progress
+            if ($LASTEXITCODE) { exit 1 }
+          }
+          gcc --version | Select-Object -First 1
+      - name: Unit tests with -race
+        working-directory: ashgate-src
+        env:
+          CGO_ENABLED: "1"
+        run: |
+          go install gotest.tools/gotestsum@v1.12.0
+          $gts = Join-Path (go env GOPATH) 'bin\gotestsum.exe'
+          New-Item -ItemType Directory -Force "$env:E2E_OUT\unit" | Out-Null
+          & $gts --junitfile "$env:E2E_OUT\unit\junit-race.xml" --format testname -- -race -count=1 ./...
+          if ($LASTEXITCODE) { exit 1 }
+      - name: Xray end-to-end tests (no -race, Xray trips checkptr)
+        working-directory: ashgate-src
+        run: |
+          $gts = Join-Path (go env GOPATH) 'bin\gotestsum.exe'
+          & $gts --junitfile "$env:E2E_OUT\unit\junit-vless.xml" --format testname -- -count=1 -timeout 300s ./internal/vless/
+          if ($LASTEXITCODE) { exit 1 }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e2e-unit
+          path: out/unit
+
+  build-prev:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Find the previous release
+        id: prev
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          New-Item -ItemType Directory -Force prev-setup | Out-Null
+          $rel = gh release view --repo $env:GITHUB_REPOSITORY --json tagName,assets 2>$null | ConvertFrom-Json
+          if ($rel -and ($rel.assets | Where-Object name -eq 'Setup.exe')) {
+            gh release download $rel.tagName --repo $env:GITHUB_REPOSITORY --pattern Setup.exe --dir prev-setup
+            "mode=release" >> $env:GITHUB_OUTPUT
+            "what=release $($rel.tagName)" >> $env:GITHUB_OUTPUT
+            exit 0
+          }
+          $re = 'const Version = "([^"]+)"'
+          $cur = (Select-String ashgate-src/internal/version/version.go -Pattern $re).Matches[0].Groups[1].Value
+          foreach ($c in (git log --format=%H -- ashgate-src/internal/version/version.go)) {
+            $v = ((git show "${c}:ashgate-src/internal/version/version.go") | Select-String -Pattern $re).Matches[0].Groups[1].Value
+            git cat-file -e "${c}:build-installer.ps1" 2>$null
+            $hasBuild = ($LASTEXITCODE -eq 0)
+            if ($v -and $v -ne $cur -and $hasBuild) {
+              "mode=build" >> $env:GITHUB_OUTPUT
+              "commit=$c" >> $env:GITHUB_OUTPUT
+              "what=version $v built from $($c.Substring(0,7)) (no published release)" >> $env:GITHUB_OUTPUT
+              exit 0
+            }
+          }
+          "mode=none" >> $env:GITHUB_OUTPUT
+          exit 0
+      - uses: actions/setup-go@v5
+        if: steps.prev.outputs.mode == 'build'
+        with:
+          go-version-file: ashgate-src/go.mod
+          cache-dependency-path: ashgate-src/go.sum
+      - name: Inno Setup
+        if: steps.prev.outputs.mode == 'build'
+        run: |
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) { choco install innosetup -y --no-progress }
+      - name: Build the previous version
+        if: steps.prev.outputs.mode == 'build'
+        run: |
+          git worktree add ..\prev ${{ steps.prev.outputs.commit }}
+          Push-Location ..\prev
+          ./build-installer.ps1
+          Pop-Location
+          Copy-Item ..\prev\ashgate-src\dist\Setup.exe prev-setup\Setup.exe
+      - name: Show the previous version
+        run: |
+          Write-Host "Previous: ${{ steps.prev.outputs.what }}"
+      - uses: actions/upload-artifact@v4
+        if: steps.prev.outputs.mode != 'none'
+        with:
+          name: setup-prev
+          path: prev-setup/Setup.exe
+          if-no-files-found: error
+
+  install:
+    needs: [build, build-prev]
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: setup, path: setup }
+      - uses: actions/download-artifact@v4
+        with: { name: dist, path: dist }
+      - uses: actions/download-artifact@v4
+        with: { name: e2e-bin, path: e2e-bin }
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with: { name: setup-prev, path: setup-prev }
+      - name: Run TestInstall
+        run: |
+          if (Test-Path setup-prev\Setup.exe) { $env:E2E_SETUP_PREV = (Resolve-Path setup-prev\Setup.exe).Path }
+          New-Item -ItemType Directory -Force $env:E2E_OUT | Out-Null
+          & "$env:E2E_BIN\gotestsum.exe" --junitfile "$env:E2E_OUT\junit.xml" --format standard-verbose --raw-command -- `
+            "$env:E2E_BIN\test2json.exe" -t -p e2e "$env:E2E_BIN\e2e.test.exe" -test.v=test2json -test.run '^TestInstall$' -test.timeout 40m
+          if ($LASTEXITCODE) { exit 1 }
+      - name: Remove CI-only settings, mask secrets
+        if: always()
+        run: |
+          & "$env:E2E_BIN\ashgate-e2e-servers.exe" debug-off
+          & "$env:E2E_BIN\ashgate-e2e-servers.exe" mask -out $env:E2E_OUT -to "$env:RUNNER_TEMP\art"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e2e-install
+          path: ${{ runner.temp }}\art
+
+  test:
+    needs: build
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { job: processes, run: TestProcesses, timeout: 40 }
+          - { job: connectivity, run: TestConnectivity, timeout: 60 }
+          - { job: leaks, run: TestLeaks, timeout: 45 }
+          - { job: perf, run: TestPerf, timeout: 45 }
+          - { job: netchange, run: TestNetworkChange, timeout: 25 }
+    name: ${{ matrix.job }}
+    timeout-minutes: ${{ matrix.timeout }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: setup, path: setup }
+      - uses: actions/download-artifact@v4
+        with: { name: e2e-bin, path: e2e-bin }
+      - name: Install Setup.exe
+        run: |
+          New-Item -ItemType Directory -Force $env:E2E_OUT | Out-Null
+          $p = Start-Process -FilePath $env:E2E_SETUP -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/SP-',"/LOG=$env:E2E_OUT\setup.log" -Wait -PassThru
+          if ($p.ExitCode) { throw "Setup.exe exit code $($p.ExitCode)" }
+      - name: Run ${{ matrix.run }}
+        run: |
+          & "$env:E2E_BIN\gotestsum.exe" --junitfile "$env:E2E_OUT\junit.xml" --format standard-verbose --raw-command -- `
+            "$env:E2E_BIN\test2json.exe" -t -p e2e "$env:E2E_BIN\e2e.test.exe" -test.v=test2json -test.run '^${{ matrix.run }}$' -test.timeout ${{ matrix.timeout }}m
+          if ($LASTEXITCODE) { exit 1 }
+      - name: Remove CI-only settings, mask secrets
+        if: always()
+        run: |
+          & "$env:E2E_BIN\ashgate-e2e-servers.exe" debug-off
+          & "$env:E2E_BIN\ashgate-e2e-servers.exe" mask -out $env:E2E_OUT -to "$env:RUNNER_TEMP\art"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e2e-${{ matrix.job }}
+          path: ${{ runner.temp }}\art
+
+  ui:
+    needs: build
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: setup, path: setup }
+      - uses: actions/download-artifact@v4
+        with: { name: e2e-bin, path: e2e-bin }
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ashgate-src/e2e/ui/package-lock.json
+      - name: Playwright (no browser download)
+        working-directory: ashgate-src/e2e/ui
+        env:
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+        run: npm ci --no-audit --no-fund
+      - name: Install Setup.exe and start the test servers
+        run: |
+          New-Item -ItemType Directory -Force $env:E2E_OUT, C:\ashgate-e2e\apps | Out-Null
+          $p = Start-Process -FilePath $env:E2E_SETUP -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/SP-',"/LOG=$env:E2E_OUT\setup.log" -Wait -PassThru
+          if ($p.ExitCode) { throw "Setup.exe exit code $($p.ExitCode)" }
+          Copy-Item "$env:E2E_BIN\ashgate-e2e-client.exe" C:\ashgate-e2e\apps\ashgate-e2e-client.exe
+          Start-Process -FilePath "$env:E2E_BIN\ashgate-e2e-servers.exe" -ArgumentList 'serve','-out',$env:E2E_OUT `
+            -RedirectStandardOutput "$env:E2E_OUT\servers.log" -RedirectStandardError "$env:E2E_OUT\servers-err.log"
+          $deadline = (Get-Date).AddSeconds(60)
+          while (-not (Test-Path "$env:E2E_OUT\fixtures.json")) {
+            if ((Get-Date) -gt $deadline) { Get-Content "$env:E2E_OUT\servers-err.log" -ErrorAction SilentlyContinue; throw "test servers did not start" }
+            Start-Sleep -Milliseconds 500
+          }
+      - name: UI tests
+        working-directory: ashgate-src/e2e/ui
+        run: npx playwright test
+      - name: Secret scan, remove CI-only settings, mask
+        if: always()
+        run: |
+          & "$env:E2E_BIN\ashgate-e2e-servers.exe" debug-off
+          $ok = $true
+          & "$env:E2E_BIN\ashgate-e2e-servers.exe" scan -out $env:E2E_OUT
+          if ($LASTEXITCODE) { $ok = $false }
+          Get-Process ashgate-e2e-servers -ErrorAction SilentlyContinue | Stop-Process -Force
+          & "$env:E2E_BIN\ashgate-e2e-servers.exe" mask -out $env:E2E_OUT -to "$env:RUNNER_TEMP\art"
+          if (-not $ok) { throw "secrets found in Ashgate's files after the UI run (see secret-scan.json)" }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e2e-ui
+          path: ${{ runner.temp }}\art
+
+  report:
+    needs: [build, unit, build-prev, install, test, ui]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: e2e-*
+          path: artifacts
+      - name: Previous perf metrics (same kind of run)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          kind=fast; [ "$E2E_LONG" = "1" ] && kind=long
+          for id in $(gh run list --repo "$GITHUB_REPOSITORY" --workflow windows-e2e.yml --branch main --status success --json databaseId,event -L 30 \
+                --jq '.[] | select((.event=="schedule" or .event=="workflow_dispatch") == ('"$( [ $kind = long ] && echo true || echo false )"')) | .databaseId'); do
+            [ "$id" = "$GITHUB_RUN_ID" ] && continue
+            if gh run download "$id" --repo "$GITHUB_REPOSITORY" -n perf-metrics -D prev 2>/dev/null; then echo "compared with run $id"; break; fi
+          done
+          ls prev 2>/dev/null || true
+        shell: bash
+      - name: Summary
+        shell: bash
+        run: |
+          prev=-; [ -f prev/perf.json ] && prev=prev/perf.json
+          python3 ashgate-src/e2e/report/report.py artifacts "$prev" report | tee -a "$GITHUB_STEP_SUMMARY" > /dev/null
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: perf-metrics
+          path: report/perf.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: report
+          path: report

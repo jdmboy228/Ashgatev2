@@ -125,9 +125,9 @@ func hiconPNG(icon uintptr, size int) ([]byte, error) {
 		Size: 40, Width: int32(size), Height: -int32(size),
 		Planes: 1, BitCount: 32,
 	}
-	var bits uintptr
+	var bits unsafe.Pointer // Windows writes the pixel buffer's address here
 	bmp, _, _ := procCreateDIBSection.Call(mem, uintptr(unsafe.Pointer(&bi)), 0, uintptr(unsafe.Pointer(&bits)), 0, 0)
-	if bmp == 0 || bits == 0 {
+	if bmp == 0 || bits == nil {
 		return nil, errors.New("не удалось создать изображение")
 	}
 	defer procDeleteObject.Call(bmp)
@@ -138,7 +138,7 @@ func hiconPNG(icon uintptr, size int) ([]byte, error) {
 		return nil, errors.New("не удалось нарисовать иконку")
 	}
 	n := size * size * 4
-	raw := unsafe.Slice((*byte)(unsafe.Pointer(bits)), n)
+	raw := unsafe.Slice((*byte)(bits), n)
 	img := image.NewNRGBA(image.Rect(0, 0, size, size))
 	for i := 0; i < size*size; i++ {
 		b := raw[i*4]
