@@ -69,7 +69,7 @@ func TestUIShellServed(t *testing.T) {
 		{"/", `id="app"`},
 		{"/app.js", "Вставить ссылку"},
 		{"/app.js", "Локальный SOCKS5-порт"},
-		{"/app.js", "блокировать"},
+		{"/apps.js", "Блокировать"}, // the block route in the Apps tab
 		{"/", `src="apps.js"`},
 		{"/apps.js", "Создать группу приложений"},
 		{"/app.css", "#FF7A45"},

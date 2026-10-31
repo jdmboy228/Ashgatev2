@@ -36,6 +36,9 @@ func TestExplainRussianFailures(t *testing.T) {
 	if got := Explain(errors.New("socks5: connection refused")); got.Error() != "VLESS: сервер отклонил соединение" {
 		t.Fatal(got)
 	}
+	if got := Explain(errors.New("x509: certificate signed by unknown authority")); got.Error() != certFailed {
+		t.Fatal(got)
+	}
 	plain := errors.New("Не удалось разобрать ссылку VLESS: неверный UUID")
 	if Explain(plain) != plain {
 		t.Fatal(Explain(plain))

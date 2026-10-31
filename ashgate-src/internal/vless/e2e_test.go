@@ -11,9 +11,11 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"io"
@@ -61,7 +63,7 @@ func TestTCPRealityEcho(t *testing.T) {
 				},
 			},
 		}},
-		"outbounds": []any{map[string]any{"protocol": "freedom"}},
+		"outbounds": []any{testFreedom},
 	})
 	stop, err := vless.StartRaw(raw)
 	if err != nil {
@@ -162,7 +164,7 @@ func TestXHTTPRealityEcho(t *testing.T) {
 				},
 			},
 		}},
-		"outbounds": []any{map[string]any{"protocol": "freedom"}},
+		"outbounds": []any{testFreedom},
 	})
 	stop, err := vless.StartRaw(raw)
 	if err != nil {
@@ -223,7 +225,7 @@ func TestTLSWSEcho(t *testing.T) {
 				},
 			},
 		}},
-		"outbounds": []any{map[string]any{"protocol": "freedom"}},
+		"outbounds": []any{testFreedom},
 	})
 	stop, err := vless.StartRaw(raw)
 	if err != nil {
@@ -233,7 +235,7 @@ func TestTLSWSEcho(t *testing.T) {
 	_, echoAddr := tcpEcho(t)
 	params := vless.Params{
 		UUID: uuid, Network: "ws", Security: "tls", SNI: "ashgate.test",
-		Path: "/ws", AllowInsecure: true,
+		Path: "/ws", PinnedSHA256: certPin(t, cert),
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -286,7 +288,7 @@ func TestBadRealityKeyIsRussian(t *testing.T) {
 				},
 			},
 		}},
-		"outbounds": []any{map[string]any{"protocol": "freedom"}},
+		"outbounds": []any{testFreedom},
 	})
 	stop, err := vless.StartRaw(raw)
 	if err != nil {
@@ -310,7 +312,7 @@ func TestBadRealityKeyIsRussian(t *testing.T) {
 	conn, err := socks5.Dial(ctx, config.Proxy{Type: "socks5", Address: br.Addr}, "127.0.0.1", 9)
 	if err != nil {
 		got := vless.Explain(err)
-		if got.Error() != "REALITY: рукопожатие не удалось. Проверьте публичный ключ, short id и SNI" {
+		if !wrongKeyExplained(got) {
 			t.Fatalf("err %v\nexplained %v\nlog:\n%s", err, got, vless.RecentLog(time.Now().Add(-30*time.Second)))
 		}
 		return
@@ -326,7 +328,7 @@ func TestBadRealityKeyIsRussian(t *testing.T) {
 		t.Fatal("expected handshake failure")
 	}
 	got := vless.Explain(err)
-	if got.Error() != "REALITY: рукопожатие не удалось. Проверьте публичный ключ, short id и SNI" {
+	if !wrongKeyExplained(got) {
 		t.Fatalf("err %v\nexplained %v\nlog:\n%s", err, got, vless.RecentLog(time.Now().Add(-20*time.Second)))
 	}
 }
@@ -385,7 +387,7 @@ func TestFixedSOCKSCurl(t *testing.T) {
 				"clients":    []any{map[string]any{"id": uuid}},
 			},
 		}},
-		"outbounds": []any{map[string]any{"protocol": "freedom"}},
+		"outbounds": []any{testFreedom},
 	}))
 	if err != nil {
 		t.Fatal(err)
@@ -632,4 +634,40 @@ func writeCert(t *testing.T, dir, host string) (certFile, keyFile string) {
 		t.Fatal(err)
 	}
 	return certFile, keyFile
+}
+
+// testFreedom is the test servers' outbound. Since v26 Xray's freedom
+// blocks private and loopback targets unless a final rule allows them; the
+// echo servers here listen on 127.0.0.1.
+var testFreedom = map[string]any{
+	"protocol": "freedom",
+	"settings": map[string]any{"finalRules": []any{map[string]any{"action": "allow"}}},
+}
+
+// wrongKeyExplained accepts both Russian explanations of a wrong REALITY
+// key. Against a real server Xray logs "REALITY: received real
+// certificate"; here the decoy's certificate is self-signed, so since v26
+// the client stops at its x509 check first.
+func wrongKeyExplained(err error) bool {
+	switch err.Error() {
+	case "REALITY: рукопожатие не удалось. Проверьте публичный ключ, short id и SNI",
+		"VLESS: сервер не прошёл проверку подлинности. Для REALITY проверьте публичный ключ, short id и SNI, для TLS — сертификат сервера (pcs)":
+		return true
+	}
+	return false
+}
+
+// certPin is the SHA-256 of the certificate in a PEM file, as pcs.
+func certPin(t *testing.T, file string) string {
+	t.Helper()
+	raw, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	block, _ := pem.Decode(raw)
+	if block == nil {
+		t.Fatal("no PEM block in", file)
+	}
+	sum := sha256.Sum256(block.Bytes)
+	return hex.EncodeToString(sum[:])
 }

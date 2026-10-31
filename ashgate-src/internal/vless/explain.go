@@ -46,6 +46,8 @@ func RecentLog(since time.Time) string {
 	return b.String()
 }
 
+const certFailed = "VLESS: сервер не прошёл проверку подлинности. Для REALITY проверьте публичный ключ, short id и SNI, для TLS — сертификат сервера (pcs)"
+
 // Explain turns a dial or handshake failure into a short Russian log line.
 // Errors that are already specific are returned unchanged.
 func Explain(err error) error {
@@ -65,6 +67,10 @@ func Explain(err error) error {
 		return err
 	case strings.Contains(blob, "reality") || (strings.Contains(blob, "handshake") && (strings.Contains(blob, "fail") || strings.Contains(blob, "не уда"))):
 		return errors.New("REALITY: рукопожатие не удалось. Проверьте публичный ключ, short id и SNI")
+	case strings.Contains(blob, "x509:") || strings.Contains(blob, "certificate signed by unknown authority"):
+		// REALITY with a wrong key ends up checking the decoy site's
+		// certificate; TLS fails here on an untrusted certificate.
+		return errors.New(certFailed)
 	case strings.Contains(low, "timeout") || strings.Contains(low, "deadline") || strings.Contains(low, "i/o timeout"):
 		return errors.New("VLESS: нет ответа от сервера (таймаут)")
 	case strings.Contains(low, "connection refused") || strings.Contains(low, "general failure") || strings.Contains(low, "host unreachable") || strings.Contains(low, "network unreachable") || strings.Contains(low, "actively refused"):

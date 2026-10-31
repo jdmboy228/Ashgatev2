@@ -213,9 +213,15 @@ func ClientJSON(listen string, socksPort, httpPort int, serverHost string, serve
 		}
 	case "tls":
 		tls := map[string]any{
-			"serverName":    p.SNI,
-			"fingerprint":   p.Fingerprint,
-			"allowInsecure": p.AllowInsecure,
+			"serverName":  p.SNI,
+			"fingerprint": p.Fingerprint,
+		}
+		switch {
+		case p.PinnedSHA256 != "":
+			tls["pinnedPeerCertSha256"] = p.PinnedSHA256
+		case p.AllowInsecure:
+			// Xray 26 refuses to start with allowInsecure.
+			return nil, errors.New("VLESS: Xray больше не поддерживает allowInsecure (insecure=1). Добавьте в ссылку отпечаток сертификата сервера (pcs) или поставьте на сервер действительный сертификат")
 		}
 		if p.ALPN != "" {
 			tls["alpn"] = splitComma(p.ALPN)

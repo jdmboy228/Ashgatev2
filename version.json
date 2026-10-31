@@ -1,5 +1,5 @@
 {
-  "version": "0.7.5",
+  "version": "0.7.6",
   "download_url": "https://github.com/jdmboy228/Ashgatev2/releases/latest",
-  "release_notes": "VLESS: транспорт RAW (TCP) с REALITY и Vision передаётся в Xray как raw, понятные ошибки для неизвестного транспорта и flow, ключи скрыты в сообщениях об ошибках."
+  "release_notes": "Встроенный Xray-core обновлён до v26.10.31: VLESS RAW (TCP) + REALITY + Vision работает с серверами Xray v26. TLS: allowInsecure заменён отпечатком сертификата (pcs)."
 }

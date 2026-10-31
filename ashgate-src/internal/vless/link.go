@@ -14,25 +14,28 @@ import (
 // Params is the VLESS client description stored in config.json.
 // Empty optional fields are omitted so older configs stay small.
 type Params struct {
-	UUID          string          `json:"uuid"`
-	Encryption    string          `json:"encryption,omitempty"`
-	Flow          string          `json:"flow,omitempty"`
-	Network       string          `json:"network"`
-	Security      string          `json:"security"`
-	SNI           string          `json:"sni,omitempty"`
-	Fingerprint   string          `json:"fp,omitempty"`
-	PublicKey     string          `json:"pbk,omitempty"`
-	ShortID       string          `json:"sid,omitempty"`
-	SpiderX       string          `json:"spx,omitempty"`
-	Path          string          `json:"path,omitempty"`
-	Host          string          `json:"host,omitempty"`
-	ServiceName   string          `json:"serviceName,omitempty"`
-	Mode          string          `json:"mode,omitempty"`
-	Authority     string          `json:"authority,omitempty"`
-	ALPN          string          `json:"alpn,omitempty"`
-	HeaderType    string          `json:"headerType,omitempty"`
-	AllowInsecure bool            `json:"allowInsecure,omitempty"`
-	Extra         json.RawMessage `json:"extra,omitempty"`
+	UUID          string `json:"uuid"`
+	Encryption    string `json:"encryption,omitempty"`
+	Flow          string `json:"flow,omitempty"`
+	Network       string `json:"network"`
+	Security      string `json:"security"`
+	SNI           string `json:"sni,omitempty"`
+	Fingerprint   string `json:"fp,omitempty"`
+	PublicKey     string `json:"pbk,omitempty"`
+	ShortID       string `json:"sid,omitempty"`
+	SpiderX       string `json:"spx,omitempty"`
+	Path          string `json:"path,omitempty"`
+	Host          string `json:"host,omitempty"`
+	ServiceName   string `json:"serviceName,omitempty"`
+	Mode          string `json:"mode,omitempty"`
+	Authority     string `json:"authority,omitempty"`
+	ALPN          string `json:"alpn,omitempty"`
+	HeaderType    string `json:"headerType,omitempty"`
+	AllowInsecure bool   `json:"allowInsecure,omitempty"`
+	// PinnedSHA256 is the server certificate's SHA-256 for TLS ("pcs" in
+	// share links), comma-separated hex. Xray replaced allowInsecure with it.
+	PinnedSHA256 string          `json:"pcs,omitempty"`
+	Extra        json.RawMessage `json:"extra,omitempty"`
 }
 
 // Parsed is a share link broken into the fields the proxy dialog shows.
@@ -70,23 +73,24 @@ func ParseLink(raw string) (Parsed, error) {
 	}
 	q := u.Query()
 	p := Params{
-		UUID:        id,
-		Encryption:  strings.ToLower(strings.TrimSpace(q.Get("encryption"))),
-		Flow:        strings.TrimSpace(q.Get("flow")),
-		Network:     canonicalNetwork(q.Get("type")),
-		Security:    canonicalSecurity(q.Get("security")),
-		SNI:         first(q.Get("sni"), q.Get("serverName")),
-		Fingerprint: strings.TrimSpace(q.Get("fp")),
-		PublicKey:   strings.TrimSpace(first(q.Get("pbk"), q.Get("publicKey"))),
-		ShortID:     strings.TrimSpace(first(q.Get("sid"), q.Get("shortId"))),
-		SpiderX:     strings.TrimSpace(first(q.Get("spx"), q.Get("spiderX"))),
-		Path:        strings.TrimSpace(q.Get("path")),
-		Host:        strings.TrimSpace(q.Get("host")),
-		ServiceName: strings.TrimSpace(first(q.Get("serviceName"), q.Get("service"))),
-		Mode:        strings.TrimSpace(q.Get("mode")),
-		Authority:   strings.TrimSpace(q.Get("authority")),
-		ALPN:        strings.TrimSpace(q.Get("alpn")),
-		HeaderType:  strings.TrimSpace(q.Get("headerType")),
+		UUID:         id,
+		Encryption:   strings.ToLower(strings.TrimSpace(q.Get("encryption"))),
+		Flow:         strings.TrimSpace(q.Get("flow")),
+		Network:      canonicalNetwork(q.Get("type")),
+		Security:     canonicalSecurity(q.Get("security")),
+		SNI:          first(q.Get("sni"), q.Get("serverName")),
+		Fingerprint:  strings.TrimSpace(q.Get("fp")),
+		PublicKey:    strings.TrimSpace(first(q.Get("pbk"), q.Get("publicKey"))),
+		ShortID:      strings.TrimSpace(first(q.Get("sid"), q.Get("shortId"))),
+		SpiderX:      strings.TrimSpace(first(q.Get("spx"), q.Get("spiderX"))),
+		Path:         strings.TrimSpace(q.Get("path")),
+		Host:         strings.TrimSpace(q.Get("host")),
+		ServiceName:  strings.TrimSpace(first(q.Get("serviceName"), q.Get("service"))),
+		Mode:         strings.TrimSpace(q.Get("mode")),
+		Authority:    strings.TrimSpace(q.Get("authority")),
+		ALPN:         strings.TrimSpace(q.Get("alpn")),
+		HeaderType:   strings.TrimSpace(q.Get("headerType")),
+		PinnedSHA256: strings.TrimSpace(first(q.Get("pcs"), q.Get("pinnedPeerCertSha256"))),
 	}
 	if p.Network == "tcp" && p.Flow != "" && !visionFlow(p.Flow) {
 		// Dropping it would connect without the flow the server requires,
@@ -207,6 +211,13 @@ func (p *Params) Normalize() error {
 			p.SpiderX = "/"
 		}
 	}
+	if p.PinnedSHA256 != "" {
+		pins, err := normalizePins(p.PinnedSHA256)
+		if err != nil {
+			return err
+		}
+		p.PinnedSHA256 = pins
+	}
 	if p.Network == "grpc" && strings.TrimSpace(p.ServiceName) == "" {
 		return badLink("для gRPC укажите serviceName")
 	}
@@ -272,6 +283,23 @@ func normalizeKey(s string) (string, error) {
 		return "", badLink("неверный публичный ключ (pbk)")
 	}
 	return base64.RawURLEncoding.EncodeToString(raw), nil
+}
+
+// normalizePins checks pinned certificate hashes: 64 hex digits each,
+// OpenSSL-style colons allowed, separated by commas.
+func normalizePins(s string) (string, error) {
+	var out []string
+	for _, v := range strings.Split(s, ",") {
+		v = strings.ToLower(strings.ReplaceAll(strings.TrimSpace(v), ":", ""))
+		if v == "" {
+			continue
+		}
+		if len(v) != 64 || !isHex(v) {
+			return "", badLink("неверный отпечаток сертификата (pcs): нужен SHA-256 из 64 шестнадцатеричных цифр")
+		}
+		out = append(out, v)
+	}
+	return strings.Join(out, ","), nil
 }
 
 func normalizeShortID(s string) error {

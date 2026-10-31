@@ -22,9 +22,9 @@ when you redistribute a build of Ashgate.
 ## Xray-core
 
 - Module: https://github.com/XTLS/Xray-core
-- Version linked into `ashgate.exe`: v1.250803.0
+- Version linked into `ashgate.exe`: v26.10.31 (Go module v1.260327.1-0.20261031132019-a4a3dff5b20c)
 - License: Mozilla Public License 2.0
-- License text: https://github.com/XTLS/Xray-core/blob/v1.250803.0/LICENSE
+- License text: https://github.com/XTLS/Xray-core/blob/v26.10.31/LICENSE
 
 Ashgate links this module as a library. It is not a separate executable.
 MPL-2.0 covers the Xray-core source; Ashgate's own code stays MIT. Source for

@@ -282,3 +282,31 @@ func TestMaskSecrets(t *testing.T) {
 		}
 	}
 }
+
+// Xray 26 removed allowInsecure: a pinned hash replaces it, and a link with
+// only insecure=1 gets a clear error instead of a bridge that cannot start.
+func TestTLSPinnedCertReplacesAllowInsecure(t *testing.T) {
+	pin := strings.Repeat("ab", 32)
+	base := "vless://" + sampleUUID + "@1.2.3.4:443?type=ws&security=tls&sni=example.com&insecure=1"
+	got, err := ParseLink(base + "&pcs=" + strings.ToUpper(pin[:2]) + ":" + pin[2:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Params.PinnedSHA256 != pin {
+		t.Fatalf("pcs %q", got.Params.PinnedSHA256)
+	}
+	body := string(mustClient(t, got.Params, "1.2.3.4", 443))
+	if !strings.Contains(body, `"pinnedPeerCertSha256":"`+pin+`"`) || strings.Contains(body, "allowInsecure") {
+		t.Fatal(body)
+	}
+	only, err := ParseLink(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ClientJSON("127.0.0.1", 1080, 0, "1.2.3.4", 443, "", "", only.Params); err == nil || !strings.Contains(err.Error(), "allowInsecure") {
+		t.Fatalf("insecure=1 only: %v", err)
+	}
+	if _, err := ParseLink(base + "&pcs=1234"); err == nil || !strings.Contains(err.Error(), "pcs") {
+		t.Fatalf("bad pcs: %v", err)
+	}
+}
