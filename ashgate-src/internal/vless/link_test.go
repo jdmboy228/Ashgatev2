@@ -1,6 +1,7 @@
 package vless
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net"
@@ -133,14 +134,22 @@ func TestParseRejectsBadLinks(t *testing.T) {
 }
 
 func TestSuggestNameDropsUnsafeRunes(t *testing.T) {
-	if got := SuggestName("aeza se"); got != "aeza-se" {
-		t.Fatal(got)
+	cases := map[string]string{
+		"aeza se":             "aeza se",
+		"Швеция":              "Швеция",
+		"🇸🇪 Швеция-1 (VLESS)": "Швеция-1 VLESS",
+		"  _node_ ":           "node",
+		"a+b/c":               "a b-c",
+		"🇸🇪":                  "",
+		"":                    "",
 	}
-	if got := SuggestName("Швеция"); got != "" {
-		t.Fatal(got)
+	for in, want := range cases {
+		if got := SuggestName(in); got != want {
+			t.Errorf("SuggestName(%q) = %q, want %q", in, got, want)
+		}
 	}
-	if got := SuggestName("  _node_ "); got != "node" {
-		t.Fatal(got)
+	if got := SuggestName(strings.Repeat("я", 100)); len([]rune(got)) != 64 {
+		t.Fatalf("not capped at 64 runes: %d", len([]rune(got)))
 	}
 }
 
@@ -308,5 +317,14 @@ func TestTLSPinnedCertReplacesAllowInsecure(t *testing.T) {
 	}
 	if _, err := ParseLink(base + "&pcs=1234"); err == nil || !strings.Contains(err.Error(), "pcs") {
 		t.Fatalf("bad pcs: %v", err)
+	}
+}
+
+func TestUnknownFingerprintIsExplained(t *testing.T) {
+	p := Params{UUID: sampleUUID, Network: "tcp", Security: "reality", SNI: "example.com",
+		Fingerprint: "bogus", PublicKey: samplePBK, ShortID: "ab"}
+	_, err := Listen(context.Background(), "127.0.0.1:9", p, Inbound{})
+	if err == nil || !strings.HasPrefix(err.Error(), "VLESS: Xray не знает отпечаток браузера fp=bogus.") {
+		t.Fatal(err)
 	}
 }

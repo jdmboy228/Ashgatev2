@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"ashgate/internal/vless"
 )
@@ -199,10 +201,10 @@ func (c *Config) Validate() error {
 	if c.Version != 1 {
 		return fmt.Errorf("unsupported config version %d", c.Version)
 	}
-	if _, _, err := splitAddr(c.Relay.TCP4); err != nil {
+	if err := loopbackRelay(c.Relay.TCP4, false); err != nil {
 		return fmt.Errorf("relay.tcp4: %w", err)
 	}
-	if _, _, err := splitAddr(c.Relay.TCP6); err != nil {
+	if err := loopbackRelay(c.Relay.TCP6, true); err != nil {
 		return fmt.Errorf("relay.tcp6: %w", err)
 	}
 	switch c.DNS.Mode {
@@ -313,6 +315,23 @@ func (c *Config) Validate() error {
 		if err := checkRoute(r.Action, r.Proxy, names); err != nil {
 			return fmt.Errorf("rules[%d]: %w", i, err)
 		}
+	}
+	return nil
+}
+
+// loopbackRelay requires the engine's relay to listen on loopback: on any
+// other address the network could reach it and ride proxied flows.
+func loopbackRelay(addr string, v6 bool) error {
+	host, _, err := splitAddr(addr)
+	if err != nil {
+		return err
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || !ip.IsLoopback() || (ip.To4() == nil) != v6 {
+		if v6 {
+			return fmt.Errorf("must be [::1]:port, got %q", addr)
+		}
+		return fmt.Errorf("must be a 127.0.0.0/8 address, got %q", addr)
 	}
 	return nil
 }
@@ -566,14 +585,19 @@ func portOf(addr string) (int, error) {
 	return int(p), nil
 }
 
+// validName accepts a proxy name: letters and digits of any script (so a
+// 3x-ui remark such as "Швеция 1" works), spaces, '.', '_' and '-', up to 64
+// characters, starting with a letter or digit and without a trailing space.
+// Names are only labels and keys for rules, groups and DNS; nothing parses
+// them. app.js (validProxyName) mirrors this rule.
 func validName(name string) bool {
-	if name == "" || len(name) > 64 {
+	if name == "" || utf8.RuneCountInString(name) > 64 || strings.TrimSpace(name) != name {
 		return false
 	}
 	for i, r := range name {
 		switch {
-		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
-		case (r == '_' || r == '.' || r == '-') && i > 0:
+		case unicode.IsLetter(r), unicode.IsDigit(r):
+		case (r == ' ' || r == '_' || r == '.' || r == '-') && i > 0:
 		default:
 			return false
 		}

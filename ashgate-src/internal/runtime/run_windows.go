@@ -354,10 +354,16 @@ func acceptLoop(ln net.Listener, eng *engine.Engine, wg *sync.WaitGroup) {
 	}
 }
 
+// bypassEvery is how often proxy host names are resolved again. Each
+// lookup goes to the system resolver outside the tunnel, so a short period
+// would announce the proxy server on a fixed rhythm; Session.Apply resolves
+// at once when the proxies change.
+const bypassEvery = 30 * time.Minute
+
 func refreshLoop(ctx context.Context, eng *engine.Engine, wg *sync.WaitGroup) {
 	defer wg.Done()
 	eng.RefreshBypass(ctx)
-	tick := time.NewTicker(time.Minute)
+	tick := time.NewTicker(bypassEvery)
 	defer tick.Stop()
 	for {
 		select {

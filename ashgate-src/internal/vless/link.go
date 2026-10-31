@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/url"
 	"strings"
+	"unicode"
 )
 
 // Params is the VLESS client description stored in config.json.
@@ -125,30 +126,30 @@ func ParseLink(raw string) (Parsed, error) {
 	return Parsed{Name: SuggestName(u.Fragment), Address: addr, Params: p}, nil
 }
 
-// SuggestName turns a share-link fragment into a proxy name.
-// Characters outside the config name alphabet are dropped. An empty result
-// means the user should type a name.
+// SuggestName turns a share-link fragment into a proxy name that passes
+// config's name check: letters and digits of any script, spaces, '.', '_'
+// and '-'. Anything else (emoji flags, punctuation) is dropped. An empty
+// result means the window picks a name itself.
 func SuggestName(fragment string) string {
-	fragment = strings.TrimSpace(fragment)
 	var b strings.Builder
-	for _, r := range fragment {
+	for _, r := range strings.TrimSpace(fragment) {
 		switch {
-		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case unicode.IsLetter(r), unicode.IsDigit(r), r == '_', r == '.', r == '-':
 			b.WriteRune(r)
-		case r == '_' || r == '.' || r == '-':
-			b.WriteRune(r)
-		case r == ' ' || r == '+' || r == '/':
+		case r == ' ' || r == '+':
+			b.WriteByte(' ')
+		case r == '/':
 			b.WriteByte('-')
 		}
 	}
-	s := strings.Trim(b.String(), "_.-")
+	s := strings.Join(strings.Fields(b.String()), " ")
 	for strings.Contains(s, "--") {
 		s = strings.ReplaceAll(s, "--", "-")
 	}
-	if len(s) > 64 {
-		s = strings.Trim(s[:64], "_.-")
+	if r := []rune(s); len(r) > 64 {
+		s = string(r[:64])
 	}
-	return s
+	return strings.Trim(s, "_.- ")
 }
 
 // Normalize fills defaults and checks fields the user may have edited by hand.

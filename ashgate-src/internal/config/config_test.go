@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"ashgate/internal/vless"
 )
 
 func TestLoadSaveRoundTrip(t *testing.T) {
@@ -377,5 +379,45 @@ func TestMaskMatchingEverythingRejected(t *testing.T) {
 	c.Rules = []Rule{{Process: `*\Discord\*.exe`, Action: "direct"}}
 	if err := c.Validate(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestProxyNames(t *testing.T) {
+	for _, name := range []string{"aeza", "Швеция 1", "Sweden-1.vless", "Узел_2", "我的服务器"} {
+		if !validName(name) {
+			t.Errorf("%q rejected", name)
+		}
+	}
+	for _, name := range []string{"", " lead", "trail ", "-dash", "a/b", "a:b", `quo"te`, "tab\tname", strings.Repeat("я", 65)} {
+		if validName(name) {
+			t.Errorf("%q accepted", name)
+		}
+	}
+	// Every name the link parser suggests must be a valid name.
+	for _, frag := range []string{"🇸🇪 Швеция-1 (VLESS)", "aeza se", "  _node_ ", "a+b/c", strings.Repeat("я", 100)} {
+		if s := vless.SuggestName(frag); s != "" && !validName(s) {
+			t.Errorf("SuggestName(%q) = %q is not a valid name", frag, s)
+		}
+	}
+}
+
+func TestRelayMustBeLoopback(t *testing.T) {
+	for _, tc := range []struct {
+		tcp4, tcp6 string
+		ok         bool
+	}{
+		{"127.0.0.1:34010", "[::1]:34010", true},
+		{"127.0.0.2:34010", "[::1]:34010", true},
+		{"0.0.0.0:34010", "[::1]:34010", false},
+		{"192.168.1.10:34010", "[::1]:34010", false},
+		{"127.0.0.1:34010", "[::]:34010", false},
+		{"[::1]:34010", "[::1]:34010", false},
+		{"localhost:34010", "[::1]:34010", false},
+	} {
+		c := Default()
+		c.Relay.TCP4, c.Relay.TCP6 = tc.tcp4, tc.tcp6
+		if err := c.Validate(); (err == nil) != tc.ok {
+			t.Errorf("relay %s %s: err=%v", tc.tcp4, tc.tcp6, err)
+		}
 	}
 }

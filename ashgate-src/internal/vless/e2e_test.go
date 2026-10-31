@@ -18,6 +18,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
+	"fmt"
 	"io"
 	"math/big"
 	"net"
@@ -25,6 +26,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -670,4 +672,295 @@ func certPin(t *testing.T, file string) string {
 	}
 	sum := sha256.Sum256(block.Bytes)
 	return hex.EncodeToString(sum[:])
+}
+
+// startRealityServer runs a VLESS+REALITY server on 127.0.0.1:port whose
+// only user needs flow ("" for none). It returns the stop function.
+func startRealityServer(t *testing.T, port int, uuid, flow, dest string) func() {
+	t.Helper()
+	raw := mustServer(t, map[string]any{
+		"log": map[string]any{"loglevel": "info"},
+		"inbounds": []any{map[string]any{
+			"listen": "127.0.0.1", "port": port, "protocol": "vless",
+			"settings": map[string]any{
+				"decryption": "none",
+				"clients":    []any{map[string]any{"id": uuid, "flow": flow}},
+			},
+			"streamSettings": map[string]any{
+				"network": "raw", "security": "reality",
+				"realitySettings": map[string]any{
+					"dest": dest, "serverNames": []string{realitySNI},
+					"privateKey": realityPrivate, "shortIds": []string{realityShort},
+				},
+			},
+		}},
+		"outbounds": []any{testFreedom},
+	})
+	stop, err := vless.StartRaw(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return stop
+}
+
+func rawRealityParams(uuid, flow, fp string) vless.Params {
+	return vless.Params{
+		UUID: uuid, Network: "tcp", Security: "reality", Flow: flow, SNI: realitySNI,
+		Fingerprint: fp, PublicKey: realityPublic, ShortID: realityShort,
+	}
+}
+
+// echoThrough sends a line through the bridge to an echo server and waits
+// for it to come back.
+func echoThrough(ctx context.Context, br *vless.Bridge, params vless.Params, echoAddr string) error {
+	host, portStr, _ := net.SplitHostPort(echoAddr)
+	port, _ := strconv.Atoi(portStr)
+	conn, err := dialer.Net{}.DialTCP(ctx, config.Proxy{Type: "vless", Local: br.Addr, VLESS: &params}, host, uint16(port))
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(12 * time.Second))
+	if _, err := conn.Write([]byte("ping")); err != nil {
+		return err
+	}
+	buf := make([]byte, 4)
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		return err
+	}
+	if string(buf) != "ping" {
+		return fmt.Errorf("echo %q", buf)
+	}
+	return nil
+}
+
+// A Vision server refuses a client without the flow. TestTCPRealityEcho
+// passing therefore means Vision is really in use, and the probe must not
+// call such a proxy healthy.
+func TestVisionRequiredByServer(t *testing.T) {
+	const uuid = "55555555-5555-4555-8555-555555555555"
+	port := mustFree(t)
+	t.Cleanup(startRealityServer(t, port, uuid, "xtls-rprx-vision", tlsDest(t)))
+	_, echoAddr := tcpEcho(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+	defer cancel()
+	addr := net.JoinHostPort("127.0.0.1", itoa(port))
+	noFlow := rawRealityParams(uuid, "", "chrome")
+	br, err := vless.Listen(ctx, addr, noFlow, vless.Inbound{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(br.Close)
+	if err := echoThrough(ctx, br, noFlow, echoAddr); err == nil {
+		t.Fatal("a Vision server accepted a client without flow")
+	}
+	host, eport := splitHostPort(t, echoAddr)
+	if rep := probe.CheckTarget(ctx, config.Proxy{Name: "x", Type: "vless", Address: addr, VLESS: &noFlow}, host, eport); rep.OK {
+		t.Fatalf("probe called a refused proxy healthy: %+v", rep)
+	}
+	vision := rawRealityParams(uuid, "xtls-rprx-vision", "chrome")
+	if rep := probe.CheckTarget(ctx, config.Proxy{Name: "x", Type: "vless", Address: addr, VLESS: &vision}, host, eport); !rep.OK {
+		t.Fatalf("probe with Vision: %+v", rep)
+	}
+}
+
+// The server goes away and comes back on the same port: the bridge keeps
+// running, the probe reports the outage in Russian, and new connections
+// work again without restarting anything.
+func TestServerDownThenBack(t *testing.T) {
+	const uuid = "66666666-6666-4666-8666-666666666666"
+	dest := tlsDest(t)
+	port := mustFree(t)
+	stop := startRealityServer(t, port, uuid, "xtls-rprx-vision", dest)
+	_, echoAddr := tcpEcho(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	addr := net.JoinHostPort("127.0.0.1", itoa(port))
+	params := rawRealityParams(uuid, "xtls-rprx-vision", "firefox")
+	br, err := vless.Listen(ctx, addr, params, vless.Inbound{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(br.Close)
+	if err := echoThrough(ctx, br, params, echoAddr); err != nil {
+		t.Fatalf("before: %v", err)
+	}
+	stop()
+	if err := echoThrough(ctx, br, params, echoAddr); err == nil {
+		t.Fatal("echo through a stopped server")
+	}
+	host, eport := splitHostPort(t, echoAddr)
+	rep := probe.CheckTarget(ctx, config.Proxy{Name: "x", Type: "vless", Address: addr, VLESS: &params}, host, eport)
+	if rep.OK || !(strings.HasPrefix(rep.Detail, "VLESS:") || strings.HasPrefix(rep.Detail, "REALITY:")) {
+		t.Fatalf("probe while down: %+v", rep)
+	}
+	t.Cleanup(startRealityServer(t, port, uuid, "xtls-rprx-vision", dest))
+	if err := echoThrough(ctx, br, params, echoAddr); err != nil {
+		t.Fatalf("after the server came back: %v", err)
+	}
+}
+
+// One proxy switched from RAW to XHTTP keeps its fixed SOCKS5 port: the old
+// bridge must release the port before the new one takes it.
+func TestManagerSwitchesTransportOnFixedPort(t *testing.T) {
+	port := 0
+	for i := 0; i < 20 && port == 0; i++ {
+		p := mustFree(t)
+		if ln, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", itoa(p+1))); err == nil {
+			_ = ln.Close()
+			port = p
+		}
+	}
+	if port == 0 {
+		t.Skip("no two free ports in a row")
+	}
+	m := vless.NewManager()
+	t.Cleanup(m.Close)
+	ctx := context.Background()
+	ep := vless.Endpoint{
+		Name: "p", Address: "127.0.0.1:9",
+		Params:  rawRealityParams("77777777-7777-4777-8777-777777777777", "xtls-rprx-vision", "chrome"),
+		Inbound: vless.Inbound{Port: port},
+	}
+	want := "127.0.0.1:" + itoa(port)
+	for _, network := range []string{"tcp", "xhttp", "tcp"} {
+		ep.Params.Network = network
+		st, err := m.Sync(ctx, []vless.Endpoint{ep})
+		if err != nil || !st["p"].Up || st["p"].SOCKS != want {
+			t.Fatalf("%s: %+v %v", network, st["p"], err)
+		}
+	}
+	// The published SOCKS5 and HTTP ports listen on loopback only: the
+	// machine's other addresses must not answer on them.
+	addrs, _ := net.InterfaceAddrs()
+	for _, a := range addrs {
+		ipn, ok := a.(*net.IPNet)
+		if !ok || ipn.IP.IsLoopback() || ipn.IP.To4() == nil {
+			continue
+		}
+		for _, p := range []int{port, port + 1} {
+			if c, err := net.DialTimeout("tcp", net.JoinHostPort(ipn.IP.String(), itoa(p)), time.Second); err == nil {
+				_ = c.Close()
+				t.Fatalf("port %d answers on %s", p, ipn.IP)
+			}
+		}
+	}
+}
+
+// The REALITY ClientHello must look like the chosen browser: Chrome sends
+// GREASE values, Firefox does not; both offer h2 and http/1.1; the SNI is
+// the configured one; nothing names Xray or Ashgate.
+func TestClientHelloLooksLikeBrowser(t *testing.T) {
+	for _, fp := range []string{"chrome", "firefox"} {
+		t.Run(fp, func(t *testing.T) {
+			ln, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = ln.Close() })
+			hello := make(chan []byte, 1)
+			go func() {
+				c, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				defer c.Close()
+				_ = c.SetDeadline(time.Now().Add(10 * time.Second))
+				hdr := make([]byte, 5)
+				if _, err := io.ReadFull(c, hdr); err != nil {
+					return
+				}
+				body := make([]byte, int(hdr[3])<<8|int(hdr[4]))
+				if _, err := io.ReadFull(c, body); err != nil {
+					return
+				}
+				hello <- append(hdr, body...)
+			}()
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+			params := rawRealityParams("88888888-8888-4888-8888-888888888888", "xtls-rprx-vision", fp)
+			br, err := vless.Listen(ctx, ln.Addr().String(), params, vless.Inbound{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(br.Close)
+			go func() {
+				conn, err := socks5.Dial(ctx, config.Proxy{Type: "socks5", Address: br.Addr}, "1.1.1.1", 443)
+				if err == nil {
+					_, _ = conn.Write([]byte("x"))
+					<-ctx.Done()
+					_ = conn.Close()
+				}
+			}()
+			var rec []byte
+			select {
+			case rec = <-hello:
+			case <-time.After(15 * time.Second):
+				t.Fatal("no ClientHello")
+			}
+			ch := parseClientHello(t, rec)
+			if ch.sni != realitySNI {
+				t.Errorf("SNI %q", ch.sni)
+			}
+			if strings.Join(ch.alpn, ",") != "h2,http/1.1" {
+				t.Errorf("ALPN %v", ch.alpn)
+			}
+			grease := false
+			for _, c := range ch.ciphers {
+				grease = grease || (c&0x0f0f == 0x0a0a && c>>8 == c&0xff)
+			}
+			if grease != (fp == "chrome") {
+				t.Errorf("GREASE in ciphers = %v for %s", grease, fp)
+			}
+			low := strings.ToLower(string(rec))
+			if strings.Contains(low, "xray") || strings.Contains(low, "ashgate") {
+				t.Error("ClientHello names Xray or Ashgate")
+			}
+		})
+	}
+}
+
+type clientHello struct {
+	ciphers []uint16
+	sni     string
+	alpn    []string
+}
+
+// parseClientHello reads the fields TestClientHelloLooksLikeBrowser checks
+// from one TLS record holding a ClientHello.
+func parseClientHello(t *testing.T, rec []byte) clientHello {
+	t.Helper()
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("malformed ClientHello: %v", r)
+		}
+	}()
+	if rec[0] != 0x16 || rec[5] != 1 {
+		t.Fatalf("not a ClientHello: % x", rec[:6])
+	}
+	b := rec[5+4+2+32:] // record and handshake headers, version, random
+	b = b[1+int(b[0]):] // session id
+	var ch clientHello
+	n := int(b[0])<<8 | int(b[1])
+	for cs := b[2 : 2+n]; len(cs) >= 2; cs = cs[2:] {
+		ch.ciphers = append(ch.ciphers, uint16(cs[0])<<8|uint16(cs[1]))
+	}
+	b = b[2+n:]
+	b = b[1+int(b[0]):] // compression methods
+	ext := b[2 : 2+(int(b[0])<<8|int(b[1]))]
+	for len(ext) >= 4 {
+		typ := int(ext[0])<<8 | int(ext[1])
+		l := int(ext[2])<<8 | int(ext[3])
+		data := ext[4 : 4+l]
+		ext = ext[4+l:]
+		switch typ {
+		case 0: // server_name: list length, type, name length, name
+			ch.sni = string(data[5 : 5+(int(data[3])<<8|int(data[4]))])
+		case 16: // ALPN: list length, then length-prefixed names
+			for d := data[2:]; len(d) > 0; d = d[1+int(d[0]):] {
+				ch.alpn = append(ch.alpn, string(d[1:1+int(d[0])]))
+			}
+		}
+	}
+	return ch
 }

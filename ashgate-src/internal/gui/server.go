@@ -86,6 +86,9 @@ type controller struct {
 	// ksPending/ksRunning coalesce kill-switch syncs requested by saves.
 	ksPending bool
 	ksRunning bool
+	// ksSaved is the target list last written for the guard; see
+	// saveTargets. Guarded by ksMu.
+	ksSaved string
 
 	// updateURL is the download page from the last update check that found
 	// a newer version. /api/update/open opens only this link, never one the
@@ -431,8 +434,13 @@ func (c *controller) snapshot() stateView {
 // snapshotSince leaves Events out and sets EventsSame when the caller
 // already saw log generation since.
 func (c *controller) snapshotSince(since uint64) stateView {
+	hidden := c.hooks.visible != nil && !c.hooks.visible()
 	c.refreshAuto()
-	c.refreshAlive()
+	if !hidden {
+		// The running-app scan opens every process. In the tray nobody
+		// sees its result, and the page still polls every 3 seconds.
+		c.refreshAlive()
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	cfg := cloneCfg(c.cfg)
@@ -491,7 +499,7 @@ func (c *controller) snapshotSince(since uint64) stateView {
 		KillSwitch: c.ksSnapshot(killWanted(cfg)),
 		RuleStats:  c.ruleStatsLocked(time.Now()),
 		Alive:      c.alive,
-		Hidden:     c.hooks.visible != nil && !c.hooks.visible(),
+		Hidden:     hidden,
 		Events:     events,
 		EventsSame: same,
 		Generation: g,
@@ -846,7 +854,9 @@ func ruConfig(err error) string {
 	case strings.Contains(s, "duplicate"):
 		return "Имя прокси уже занято."
 	case strings.Contains(s, "invalid name"):
-		return "Имя прокси: буквы, цифры, точка, _ или -."
+		return "Имя прокси: буквы, цифры, пробел, точка, _ или -, до 64 символов; начинается с буквы или цифры."
+	case strings.HasPrefix(s, "proxies[") && strings.Contains(s, "] address:"):
+		return "Адрес прокси: укажите хост и порт, например 127.0.0.1:1080."
 	case strings.Contains(s, "type must be"):
 		return "Тип прокси: SOCKS5, HTTP или VLESS."
 	case strings.Contains(s, "Не удалось разобрать ссылку VLESS"):

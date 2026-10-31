@@ -3,6 +3,7 @@ package vless
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"time"
@@ -44,6 +45,18 @@ func RecentLog(since time.Time) string {
 		}
 	}
 	return b.String()
+}
+
+// TunnelError explains why a tunnel opened at start gave no answer. The
+// bridge's SOCKS inbound replies before Xray reaches the server, so the
+// cause is only in Xray's log. Unknown causes get a generic message rather
+// than the raw log.
+func TunnelError(start time.Time, err error) error {
+	in := fmt.Errorf("%v\n%s", err, RecentLog(start))
+	if got := Explain(in); got != in {
+		return got
+	}
+	return errors.New("VLESS: сервер не ответил. Проверьте адрес и порт сервера, UUID и ключи")
 }
 
 const certFailed = "VLESS: сервер не прошёл проверку подлинности. Для REALITY проверьте публичный ключ, short id и SNI, для TLS — сертификат сервера (pcs)"

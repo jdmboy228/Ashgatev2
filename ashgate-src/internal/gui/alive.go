@@ -26,6 +26,7 @@ func ruleKey(p string) string {
 // now. Only the process itself counts, not its children.
 func aliveRules(rs []config.Rule, procs []rules.Process) map[string]bool {
 	out := make(map[string]bool, len(rs))
+	flat := flatProcs(procs)
 	for _, r := range rs {
 		k := ruleKey(r.Process)
 		if k == "" || out[k] {
@@ -33,8 +34,8 @@ func aliveRules(rs []config.Rule, procs []rules.Process) map[string]bool {
 		}
 		one := rules.Compile([]config.Rule{{Process: r.Process, Action: "direct"}})
 		hit := false
-		for _, p := range procs {
-			if one.Match(rules.Process{Name: p.Name, Path: p.Path}).Action != "" {
+		for _, p := range flat {
+			if one.Match(p).Action != "" {
 				hit = true
 				break
 			}
@@ -63,4 +64,15 @@ func (c *controller) refreshAlive() {
 		c.alive, c.aliveAt, c.aliveBusy = m, time.Now(), false
 		c.mu.Unlock()
 	}()
+}
+
+// flatProcs drops ancestors and normalizes names and paths once. A rule is
+// matched against every process; normalized input makes each match
+// allocation-free instead of lower-casing every path again per rule.
+func flatProcs(procs []rules.Process) []rules.Process {
+	out := make([]rules.Process, len(procs))
+	for i, p := range procs {
+		out[i] = rules.Process{Name: rules.NormalizeName(p.Name), Path: rules.NormalizePath(p.Path)}
+	}
+	return out
 }

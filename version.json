@@ -1,5 +1,5 @@
 {
-  "version": "0.7.6",
+  "version": "0.7.7",
   "download_url": "https://github.com/jdmboy228/Ashgatev2/releases/latest",
-  "release_notes": "Встроенный Xray-core обновлён до v26.10.31: VLESS RAW (TCP) + REALITY + Vision работает с серверами Xray v26. TLS: allowInsecure заменён отпечатком сертификата (pcs)."
+  "release_notes": "Прокси с русским именем или пустым именем добавляются; ошибки видны у поля. «Проверить» для VLESS теперь действительно проверяет сервер. Исправления утечек и меньше фоновой нагрузки."
 }

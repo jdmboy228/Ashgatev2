@@ -424,7 +424,11 @@ func humanizeStart(err error) error {
 		return err
 	}
 	low := strings.ToLower(msg)
+	const unknownFP = `unknown "fingerprint": `
 	switch {
+	case strings.Contains(msg, unknownFP):
+		fp := strings.TrimSpace(msg[strings.Index(msg, unknownFP)+len(unknownFP):])
+		return fmt.Errorf("VLESS: Xray не знает отпечаток браузера fp=%s. Подойдут chrome, firefox, safari, edge, ios, android или random", fp)
 	case strings.Contains(low, "reality") && (strings.Contains(low, "public") || strings.Contains(low, "key") || strings.Contains(low, "short")):
 		return errors.New("REALITY: рукопожатие не удалось. Проверьте публичный ключ, short id и SNI")
 	case strings.Contains(low, "timeout") || strings.Contains(low, "deadline"):

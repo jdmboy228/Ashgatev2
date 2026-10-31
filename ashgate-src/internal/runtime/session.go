@@ -43,6 +43,15 @@ func (s *Session) Apply(cfg *config.Config) error {
 		_, syncErr = WireVLESS(ctx, s.bridges, cp)
 	}
 	applyErr := s.eng.Apply(cp)
+	if applyErr == nil {
+		// New or moved proxy servers must stay direct right away; the
+		// periodic refresh is slow on purpose (see bypassEvery).
+		ctx := s.bctx
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		go s.eng.RefreshBypass(ctx)
+	}
 	if syncErr != nil {
 		return syncErr
 	}

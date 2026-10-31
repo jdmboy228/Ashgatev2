@@ -551,7 +551,8 @@ function proxyDialog() {
   return `<div class="scrim"><form class="dialog${vless ? "" : " narrow"}" id="dlg">
     <h2>Прокси</h2><div class="dsub">${modal.index < 0 ? "Новый прокси" : "Изменение · " + esc(p.name || "")}</div>
     <div class="body">
-      <label class="lbl">Имя</label><div class="field"><input id="p-name" value="${esc(p.name || "")}" autofocus></div>
+      <label class="lbl">Имя</label><div class="field${modal.nameError ? " bad" : ""}"><input id="p-name" value="${esc(p.name || "")}" placeholder="Задаётся само, если оставить пустым" autofocus></div>
+      ${modal.nameError ? `<div class="field-err">${esc(modal.nameError)}</div>` : ""}
       <div style="height:14px"></div><label class="lbl">Тип</label>
       <div class="seg">${types.map(([v, n]) => `<button type="button" data-act="ptype" data-value="${v}" class="${type === v ? "on" : ""}">${n}</button>`).join("")}</div>
       ${vless ? vlessFields(p) : socksFields(p)}
@@ -562,8 +563,8 @@ function proxyDialog() {
   </form></div>`;
 }
 function socksFields(p) {
-  return `<div style="height:14px"></div><label class="lbl">Адрес</label><div class="field"><input class="mono" id="p-addr" value="${esc(p.address || "")}" placeholder="127.0.0.1:1080"></div>
-      <div class="help">хост:порт, например 127.0.0.1:1080</div>
+  return `<div style="height:14px"></div><label class="lbl">Адрес</label><div class="field${modal.addrError ? " bad" : ""}"><input class="mono" id="p-addr" value="${esc(p.address || "")}" placeholder="127.0.0.1:1080"></div>
+      ${modal.addrError ? `<div class="field-err">${esc(modal.addrError)}</div>` : `<div class="help">хост:порт, например 127.0.0.1:1080</div>`}
       <div class="grid" style="margin-top:14px">
         <div><label class="lbl">Логин</label><div class="field"><input id="p-user" value="${esc(p.username || "")}" placeholder="необязательно"></div></div>
         <div style="position:relative"><label class="lbl">Пароль</label><div class="field"><input id="p-pass" type="${modal.showPass ? "text" : "password"}" value="${esc(p.password || "")}"></div>
@@ -953,7 +954,7 @@ function readVLESSFields() {
 function applyParsed(draft, parsed) {
   draft.address = parsed.address || draft.address;
   draft.vless = parsed.vless || {};
-  if (!draft.name && parsed.name) draft.name = parsed.name;
+  if (!draft.name && parsed.name) draft.name = uniqueProxyName(parsed.name, modal ? modal.index : -1);
 }
 async function ensureVLESS(draft) {
   const link = (draft.link || "").trim();
@@ -1029,19 +1030,46 @@ function normalizeUUIDJS(s) {
   if (!/^[0-9a-f]{32}$/.test(hex)) throw new Error("Не удалось разобрать ссылку VLESS: неверный UUID");
   return hex.slice(0, 8) + "-" + hex.slice(8, 12) + "-" + hex.slice(12, 16) + "-" + hex.slice(16, 20) + "-" + hex.slice(20);
 }
+// suggestNameJS mirrors vless.SuggestName (demo mode only).
 function suggestNameJS(fragment) {
   let s = "";
   for (const ch of String(fragment || "").trim()) {
-    if (/[A-Za-z0-9]/.test(ch)) s += ch;
-    else if (ch === "_" || ch === "." || ch === "-") s += ch;
-    else if (ch === " " || ch === "+" || ch === "/") s += "-";
+    if (/[\p{L}\p{Nd}_.-]/u.test(ch)) s += ch;
+    else if (ch === " " || ch === "+") s += " ";
+    else if (ch === "/") s += "-";
   }
-  s = s.replace(/^[-_.]+|[-_.]+$/g, "").replace(/--+/g, "-");
-  if (s.length > 64) s = s.slice(0, 64).replace(/[-_.]+$/g, "");
-  return s;
+  s = s.split(/\s+/).filter(Boolean).join(" ").replace(/--+/g, "-");
+  return [...s].slice(0, 64).join("").replace(/^[-_. ]+|[-_. ]+$/g, "");
+}
+// validProxyName mirrors config.validName: letters and digits of any
+// script, space, '.', '_' and '-', up to 64 characters, starting with a
+// letter or digit, no trailing space.
+const NAME_RULE = "Имя прокси: буквы, цифры, пробел, точка, _ или -, до 64 символов; начинается с буквы или цифры.";
+function validProxyName(name) {
+  return [...name].length <= 64 && name === name.trim() && /^[\p{L}\p{Nd}][\p{L}\p{Nd} _.-]*$/u.test(name);
+}
+// uniqueProxyName returns base, or base with " 2", " 3"… when another
+// proxy (not the one at skip) already has that name.
+function uniqueProxyName(base, skip) {
+  const taken = new Set((cfg().proxies || []).filter((_, i) => i !== skip).map((x) => x.name));
+  if (!taken.has(base)) return base;
+  for (let n = 2; ; n++) {
+    const tail = " " + n;
+    const name = [...base].slice(0, 64 - tail.length).join("").trim() + tail;
+    if (!taken.has(name)) return name;
+  }
+}
+// defaultProxyName is used when the name field and the link's #fragment
+// give nothing: "VLESS 203.0.113.10", or just the type for an IPv6 host.
+function defaultProxyName(p) {
+  const label = proxyTypeLabel(p.type);
+  const host = String(p.address || "").replace(/:\d+$/, "");
+  return validProxyName(label + " " + host) ? label + " " + host : label;
 }
 async function commitProxy() {
   readProxyDraft();
+  modal.nameError = "";
+  modal.addrError = "";
   const p = modal.draft;
   if (p.type === "vless") {
     try { await ensureVLESS(p); } catch (e) { modal.parseError = linkFail(e.message); renderModal(); return; }
@@ -1063,18 +1091,33 @@ async function commitProxy() {
     delete p.localUser;
     delete p.localPass;
   }
-  if (!p.name || !p.address) { showToast("Укажите имя и адрес"); return; }
+  if (!p.address) {
+    if (p.type === "vless") showToast("Вставьте ссылку VLESS");
+    else { modal.addrError = "Укажите адрес: хост:порт, например 127.0.0.1:1080"; renderModal(); }
+    return;
+  }
+  if (!p.name) p.name = uniqueProxyName(defaultProxyName(p), modal.index);
+  if (!validProxyName(p.name)) { modal.nameError = NAME_RULE; renderModal(); return; }
+  if (uniqueProxyName(p.name, modal.index) !== p.name) { modal.nameError = "Прокси с таким именем уже есть."; renderModal(); return; }
+  // Work on the live config, but keep a copy: a rejected save must not
+  // leave the new proxy in the list (a retry would add it twice).
+  const before = JSON.parse(JSON.stringify(cfg()));
   const list = cfg().proxies;
-  if (modal.index < 0) list.push(p);
-  else list[modal.index] = p;
+  const oldName = modal.index >= 0 ? list[modal.index].name : "";
+  if (modal.index < 0) list.push(JSON.parse(JSON.stringify(p)));
+  else list[modal.index] = JSON.parse(JSON.stringify(p));
+  if (oldName && oldName !== p.name) renameProxyRefs(oldName, p.name);
   const done = modal;
   modal = null;
   built = "";
   render();
   saveConfig().then(() => { sel.proxy = done.index < 0 ? list.length - 1 : done.index; }).catch((e) => {
     const msg = e.message || "";
+    if (state) state.config = before;
     modal = done;
-    if (/порт/i.test(msg)) modal.portError = /занят|совпадает/i.test(msg) ? "Порт занят. " + msg : msg;
+    if (/^Имя прокси/i.test(msg)) modal.nameError = msg;
+    else if (/^Адрес прокси/i.test(msg) && done.draft.type !== "vless") modal.addrError = msg;
+    else if (/порт/i.test(msg)) modal.portError = /занят|совпадает/i.test(msg) ? "Порт занят. " + msg : msg;
     else if (/разобрать ссылку/i.test(msg)) modal.parseError = linkFail(msg);
     else showToast(msg);
     renderModal();
@@ -1084,6 +1127,14 @@ function linkFail(msg) {
   const rest = String(msg || "").replace(/^Не удалось разобрать ссылку VLESS:?\s*/i, "").trim();
   if (!rest || rest === String(msg || "").trim()) return "Ссылка не разобрана";
   return "Ссылка не разобрана. " + rest;
+}
+// renameProxyRefs points rules, groups and the system resolver at a
+// renamed proxy; otherwise the save fails with "unknown proxy".
+function renameProxyRefs(from, to) {
+  const c = cfg();
+  for (const r of c.rules || []) if (r.proxy === from) r.proxy = to;
+  for (const g of c.groups || []) if (g.proxy === from) g.proxy = to;
+  if (c.dns && c.dns.systemResolverProxy === from) c.dns.systemResolverProxy = to;
 }
 function proxyInUse(name) {
   return (cfg().rules || []).some((r) => r.proxy === name) || (cfg().groups || []).some((g) => g.proxy === name) ||

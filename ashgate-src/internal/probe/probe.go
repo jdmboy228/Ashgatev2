@@ -3,7 +3,9 @@ package probe
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
+	"net"
 	"time"
 
 	"ashgate/internal/config"
@@ -79,7 +81,11 @@ func CheckTarget(ctx context.Context, p config.Proxy, host string, port uint16) 
 		if err != nil {
 			return failed(vless.Explain(err))
 		}
+		err = confirmTunnel(ctx, conn, host)
 		_ = conn.Close()
+		if err != nil {
+			return failed(vless.TunnelError(start, err))
+		}
 		ms := millis(start)
 		rep := Report{OK: true, Millis: ms, Label: fmt.Sprintf("%d мс", ms), Detail: "TCP доступен"}
 		actx, acancel := context.WithTimeout(ctx, 3*time.Second)
@@ -96,6 +102,43 @@ func CheckTarget(ctx context.Context, p config.Proxy, host string, port uint16) 
 	default:
 		return Report{Label: "нет ответа", Detail: "неизвестный тип прокси"}
 	}
+}
+
+// confirmTunnel waits for the target's first bytes through a VLESS bridge.
+// Xray's SOCKS inbound answers CONNECT before it reaches the server, so a
+// successful CONNECT proves only that the local bridge runs. A TLS
+// ClientHello makes the target answer: 1.1.1.1:443 completes the handshake,
+// another service answers with an error or an echo. No bytes back means the
+// server was not reached or refused the client. Nothing secret is sent, so
+// the certificate is not checked.
+func confirmTunnel(ctx context.Context, conn net.Conn, host string) error {
+	if dl, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(dl)
+	}
+	cc := &countConn{Conn: conn}
+	cfg := &tls.Config{InsecureSkipVerify: true} //nolint:gosec // liveness check only
+	if net.ParseIP(host) == nil {
+		cfg.ServerName = host
+	}
+	err := tls.Client(cc, cfg).HandshakeContext(ctx)
+	if err == nil || cc.got {
+		return nil
+	}
+	return err
+}
+
+// countConn notes whether anything was read.
+type countConn struct {
+	net.Conn
+	got bool
+}
+
+func (c *countConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	if n > 0 {
+		c.got = true
+	}
+	return n, err
 }
 
 func failed(err error) Report {

@@ -51,6 +51,7 @@ func killTargets(cfg *config.Config) (paths, missing []string) {
 		}
 	}
 	var installed []process.Installed
+	var flat []rules.Process
 	for _, r := range eff {
 		if !r.IsEnabled() || r.Action != "proxy" || !r.RuleKillSwitch() {
 			continue
@@ -62,8 +63,11 @@ func killTargets(cfg *config.Config) (paths, missing []string) {
 		}
 		one := rules.Compile([]config.Rule{r})
 		found := false
-		for _, p := range running {
-			if one.Match(rules.Process{Name: p.Name, Path: p.Path}).Action != "" {
+		if flat == nil {
+			flat = flatProcs(running)
+		}
+		for _, p := range flat {
+			if one.Match(p).Action != "" {
 				found = true
 				break
 			}
@@ -120,7 +124,7 @@ func (c *controller) syncKill() {
 		var paths []string
 		paths, missing = killTargets(cfg)
 		// The guard blocks these if Ashgate dies while capturing.
-		err = killswitch.SaveTargets(c.ksState(), paths)
+		err = c.saveTargetsLocked(paths)
 		if c.guardStop == nil && err == nil {
 			c.guardStop, err = c.hooks.guard(c.ksState())
 		}
@@ -141,6 +145,24 @@ func (c *controller) syncKill() {
 	}
 	c.mu.Unlock()
 }
+
+// saveTargetsLocked writes the guard's target list when it changed. The
+// sync runs every 15 seconds while capturing; the list rarely changes.
+// Callers hold ksMu.
+func (c *controller) saveTargetsLocked(paths []string) error {
+	key := "targets:" + strings.Join(paths, "\n") // non-empty even for no paths
+	if key == c.ksSaved {
+		return nil
+	}
+	if err := saveTargets(c.ksState(), paths); err != nil {
+		return err
+	}
+	c.ksSaved = key
+	return nil
+}
+
+// saveTargets is killswitch.SaveTargets; tests count the writes.
+var saveTargets = killswitch.SaveTargets
 
 func (c *controller) stopGuardLocked() {
 	if c.guardStop != nil {

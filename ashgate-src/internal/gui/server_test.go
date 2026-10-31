@@ -343,3 +343,96 @@ func TestAliveRules(t *testing.T) {
 		}
 	}
 }
+
+// The running-app scan opens every process; it must not run while the
+// window is hidden in the tray.
+func TestHiddenWindowSkipsAppScan(t *testing.T) {
+	visible := false
+	c := newController(filepath.Join(t.TempDir(), "config.json"), config.Default(), nil, hooks{visible: func() bool { return visible }})
+	scheduled := func() bool {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return c.aliveBusy || !c.aliveAt.IsZero()
+	}
+	if st := c.snapshot(); !st.Hidden {
+		t.Fatal("state should say hidden")
+	}
+	if scheduled() {
+		t.Fatal("app scan started while hidden")
+	}
+	visible = true
+	c.snapshot()
+	if !scheduled() {
+		t.Fatal("no app scan once visible")
+	}
+}
+
+// While capturing, the kill-switch sync runs every 15 seconds; the guard's
+// target file is rewritten only when the list changes.
+func TestKillTargetsSavedOnlyOnChange(t *testing.T) {
+	var writes int
+	old := saveTargets
+	saveTargets = func(string, []string) error { writes++; return nil }
+	t.Cleanup(func() { saveTargets = old })
+	c := newController(filepath.Join(t.TempDir(), "config.json"), config.Default(), nil, hooks{})
+	for _, paths := range [][]string{nil, nil, {`C:\a.exe`}, {`C:\a.exe`}, {`C:\a.exe`, `C:\b.exe`}, nil} {
+		if err := c.saveTargetsLocked(paths); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if writes != 4 {
+		t.Fatalf("writes = %d, want 4", writes)
+	}
+}
+
+// The name rule shown in the proxy dialog must match the server's message.
+func TestProxyNameRuleMatchesUI(t *testing.T) {
+	rr := httptest.NewRecorder()
+	c := newController(filepath.Join(t.TempDir(), "config.json"), config.Default(), nil, hooks{})
+	c.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/app.js", nil))
+	msg := ruConfig(errors.New(`proxies[0]: invalid name "x"`))
+	if !strings.Contains(rr.Body.String(), `const NAME_RULE = "`+msg+`"`) {
+		t.Fatalf("app.js NAME_RULE differs from %q", msg)
+	}
+}
+
+// Proxy form errors come back in Russian with a prefix the dialog uses to
+// show them under the right field.
+func TestProxyFormErrors(t *testing.T) {
+	c := newController(filepath.Join(t.TempDir(), "config.json"), config.Default(), nil, hooks{})
+	for _, tc := range []struct {
+		proxies []config.Proxy
+		prefix  string
+	}{
+		{[]config.Proxy{{Name: "a/b", Type: "socks5", Address: "127.0.0.1:1080"}}, "Имя прокси:"},
+		{[]config.Proxy{{Name: "a", Type: "socks5", Address: "127.0.0.1:1"}, {Name: "a", Type: "socks5", Address: "127.0.0.1:2"}}, "Имя прокси уже занято"},
+		{[]config.Proxy{{Name: "a", Type: "socks5", Address: "127.0.0.1"}}, "Адрес прокси:"},
+	} {
+		cfg := config.Default()
+		cfg.Proxies = tc.proxies
+		err := c.replace(cfg)
+		if err == nil || !strings.HasPrefix(err.Error(), tc.prefix) {
+			t.Errorf("%v: got %v, want prefix %q", tc.proxies, err, tc.prefix)
+		}
+	}
+}
+
+// A Cyrillic name with a space saves, is referenced by a rule, and loads
+// back unchanged.
+func TestCyrillicProxyNameRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	c := newController(path, config.Default(), nil, hooks{})
+	cfg := config.Default()
+	cfg.Proxies = []config.Proxy{{Name: "Швеция 1", Type: "socks5", Address: "127.0.0.1:1080"}}
+	cfg.Rules = []config.Rule{{Process: "curl.exe", Action: "proxy", Proxy: "Швеция 1"}}
+	if err := c.replace(cfg); err != nil {
+		t.Fatal(err)
+	}
+	got, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Proxies[0].Name != "Швеция 1" || got.Rules[0].Proxy != "Швеция 1" {
+		t.Fatalf("%+v %+v", got.Proxies, got.Rules)
+	}
+}
