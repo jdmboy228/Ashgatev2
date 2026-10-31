@@ -10,12 +10,22 @@ import (
 	"sync"
 )
 
-// Status is the published localhost address of one bridge.
+// Status is one bridge as Ashgate and the window see it.
 type Status struct {
-	SOCKS string `json:"socks,omitempty"`
-	HTTP  string `json:"http,omitempty"`
-	Err   string `json:"error,omitempty"`
-	Up    bool   `json:"up"`
+	// SOCKS, User and Pass are the private inbound Ashgate dials. They
+	// change on every start and never leave the process.
+	SOCKS string `json:"-"`
+	User  string `json:"-"`
+	Pass  string `json:"-"`
+	// Published and HTTP are the fixed ports for other programs.
+	Published string `json:"published,omitempty"`
+	HTTP      string `json:"http,omitempty"`
+	// PubUser and PubPass are set only when they were generated for this
+	// start (no login in the config), so the window can show them.
+	PubUser string `json:"user,omitempty"`
+	PubPass string `json:"pass,omitempty"`
+	Err     string `json:"error,omitempty"`
+	Up      bool   `json:"up"`
 }
 
 // Endpoint is one VLESS proxy the manager should keep running.
@@ -24,6 +34,7 @@ type Endpoint struct {
 	Address string
 	Params  Params
 	Inbound Inbound
+	Routing Routing
 }
 
 // Manager keeps one local SOCKS bridge per VLESS proxy.
@@ -80,7 +91,7 @@ func (m *Manager) Sync(ctx context.Context, items []Endpoint) (map[string]Status
 			cur.bridge.Close()
 			delete(m.by, item.Name)
 		}
-		br, err := Listen(m.ctx, item.Address, item.Params, item.Inbound)
+		br, err := ListenWith(m.ctx, item.Address, item.Params, item.Inbound, item.Routing)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("прокси %s: %w", item.Name, err))
 			status[item.Name] = Status{Err: err.Error()}
@@ -122,7 +133,11 @@ func statusOf(b *Bridge) Status {
 	if b == nil || b.Addr == "" {
 		return Status{}
 	}
-	return Status{SOCKS: b.Addr, HTTP: b.HTTP, Up: true}
+	st := Status{SOCKS: b.Addr, User: b.User, Pass: b.Pass, Published: b.Published, HTTP: b.HTTP, Up: true}
+	if b.Generated {
+		st.PubUser, st.PubPass = b.PubUser, b.PubPass
+	}
+	return st
 }
 
 func fingerprint(item Endpoint) string {
@@ -130,7 +145,8 @@ func fingerprint(item Endpoint) string {
 		Address string  `json:"address"`
 		Params  Params  `json:"vless"`
 		Inbound Inbound `json:"in"`
-	}{item.Address, item.Params, item.Inbound})
+		Routing Routing `json:"routing"`
+	}{item.Address, item.Params, item.Inbound, item.Routing})
 	sum := sha256.Sum256(raw)
 	return hex.EncodeToString(sum[:])
 }

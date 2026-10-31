@@ -149,9 +149,17 @@ func WireVLESS(ctx context.Context, m *vless.Manager, cfg *config.Config) (map[s
 		return nil, errors.New("VLESS: локальный мост не запущен")
 	}
 	items := make([]vless.Endpoint, 0)
+	routing := RoutingFor(cfg)
+	empty := map[string]bool{}
 	for i := range cfg.Proxies {
 		p := &cfg.Proxies[i]
 		if p.Type != "vless" {
+			continue
+		}
+		if p.Sub != nil && p.VLESS == nil {
+			// A subscription with no usable server: no bridge, so its
+			// traffic is refused, never sent direct.
+			empty[p.Name] = true
 			continue
 		}
 		if err := p.Prepare(); err != nil {
@@ -160,21 +168,36 @@ func WireVLESS(ctx context.Context, m *vless.Manager, cfg *config.Config) (map[s
 		items = append(items, vless.Endpoint{
 			Name: p.Name, Address: p.Address, Params: *p.VLESS,
 			Inbound: vless.Inbound{Port: p.SOCKSPort, User: p.LocalUser, Pass: p.LocalPass},
+			Routing: routing,
 		})
 	}
 	status, err := m.Sync(ctx, items)
 	if status == nil {
 		status = map[string]vless.Status{}
 	}
+	for name := range empty {
+		status[name] = vless.Status{Err: "Подписка: нет рабочих серверов"}
+	}
 	for i := range cfg.Proxies {
-		st, ok := status[cfg.Proxies[i].Name]
+		p := &cfg.Proxies[i]
+		st, ok := status[p.Name]
 		if ok && st.SOCKS != "" {
-			cfg.Proxies[i].Local = st.SOCKS
-		} else if cfg.Proxies[i].Type == "vless" {
-			cfg.Proxies[i].Local = ""
+			p.Local, p.LocalAuthUser, p.LocalAuthPass = st.SOCKS, st.User, st.Pass
+		} else if p.Type == "vless" {
+			p.Local, p.LocalAuthUser, p.LocalAuthPass = "", "", ""
 		}
 	}
 	return status, err
+}
+
+// RoutingFor is what every bridge does besides proxying: the direct
+// domains, and Xray's DNS for port 53 when DNS goes through the proxy.
+func RoutingFor(cfg *config.Config) vless.Routing {
+	rt := vless.Routing{Direct: append([]string(nil), cfg.DirectDomains...)}
+	if cfg.DNS.Mode == "proxy" {
+		rt.DNS = vless.DNSServers(cfg.DNS.Servers)
+	}
+	return rt
 }
 
 // LogBridges writes one Russian line per bridge that is up or failed.
@@ -187,8 +210,8 @@ func LogBridges(logs *logbuf.Buffer, status map[string]vless.Status) {
 			logs.Add(logbuf.Event{Process: "ashgate", Proto: "TCP", Via: name, Status: "error", Error: st.Err})
 			continue
 		}
-		if st.SOCKS != "" {
-			logs.Add(logbuf.Event{Process: "ashgate", Proto: "TCP", Dest: st.SOCKS, Via: name, Status: "open"})
+		if st.Published != "" {
+			logs.Add(logbuf.Event{Process: "ashgate", Proto: "TCP", Dest: st.Published, Via: name, Status: "open"})
 		}
 	}
 }

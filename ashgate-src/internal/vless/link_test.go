@@ -168,7 +168,7 @@ func TestManualNormalizeKeepsEditedFields(t *testing.T) {
 	if err := p.Normalize(); err != nil {
 		t.Fatal(err)
 	}
-	if p.Network != "xhttp" || p.Security != "reality" || p.Fingerprint != "chrome" {
+	if p.Network != "xhttp" || p.Security != "reality" || p.Fingerprint != "firefox" {
 		t.Fatalf("%+v", p)
 	}
 	if p.DialFlow() != "" {
@@ -178,25 +178,40 @@ func TestManualNormalizeKeepsEditedFields(t *testing.T) {
 
 func TestClientJSONPublishesSOCKSAndHTTP(t *testing.T) {
 	p := Params{UUID: sampleUUID, Network: "tcp", Security: "none"}
-	b, err := ClientJSON("127.0.0.1", 10808, 10809, "203.0.113.10", 443, "dolphin", "secret", p)
+	b, err := ClientJSON(ClientConfig{
+		Server: "203.0.113.10", ServerPort: 443, Params: p,
+		Port: 20000, User: "u1", Pass: "p1",
+		Published: Inbound{Port: 10808, User: "dolphin", Pass: "secret"},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	s := string(b)
 	for _, want := range []string{
-		`"port":10808`, `"port":10809`, `"protocol":"socks"`, `"protocol":"http"`,
-		`"auth":"password"`, `"user":"dolphin"`, `"pass":"secret"`, `"udp":true`,
-		`"listen":"127.0.0.1"`,
+		`"port":20000`, `"port":10808`, `"port":10809`, `"protocol":"socks"`, `"protocol":"http"`,
+		`"user":"u1"`, `"pass":"p1"`, `"user":"dolphin"`, `"pass":"secret"`, `"udp":false`,
 	} {
 		if !strings.Contains(s, want) {
 			t.Fatalf("missing %s\n%s", want, s)
 		}
 	}
+	for _, bad := range []string{`"udp":true`, `"noauth"`, `0.0.0.0`} {
+		if strings.Contains(s, bad) {
+			t.Fatalf("found %s\n%s", bad, s)
+		}
+	}
+	if strings.Count(s, `"listen":"127.0.0.1"`) != 3 {
+		t.Fatalf("every inbound must listen on 127.0.0.1\n%s", s)
+	}
+	// A login is required on every inbound.
+	if _, err := ClientJSON(ClientConfig{Server: "203.0.113.10", ServerPort: 443, Params: p, Port: 20000}); err == nil {
+		t.Fatal("accepted a private inbound without a login")
+	}
 }
 
 func mustClient(t *testing.T, p Params, host string, port int) []byte {
 	t.Helper()
-	b, err := ClientJSON("127.0.0.1", 1080, 0, host, port, "", "", p)
+	b, err := ClientJSON(ClientConfig{Server: host, ServerPort: port, Params: p, Port: 1080, User: "u", Pass: "p"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -212,7 +227,7 @@ func outboundOf(t *testing.T, raw string) any {
 	}
 	host, port, _ := net.SplitHostPort(got.Address)
 	p, _ := strconv.Atoi(port)
-	body, err := ClientJSON("127.0.0.1", 1080, 0, host, p, "", "", got.Params)
+	body, err := ClientJSON(ClientConfig{Server: host, ServerPort: p, Params: got.Params, Port: 1080, User: "u", Pass: "p"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -243,7 +258,7 @@ func TestOutboundTCPRealityVision(t *testing.T) {
 		raw := "vless://" + sampleUUID + "@1.2.3.4:443?type=" + typ + "&encryption=none&security=reality&pbk=" + samplePBK +
 			"&fp=firefox&sni=example.com&sid=abcd&spx=%2F&flow=xtls-rprx-vision#name"
 		sameJSON(t, outboundOf(t, raw), `{
-			"protocol": "vless",
+			"tag": "proxy", "protocol": "vless",
 			"settings": {"vnext": [{"address": "1.2.3.4", "port": 443,
 				"users": [{"id": "`+sampleUUID+`", "encryption": "none", "flow": "xtls-rprx-vision"}]}]},
 			"streamSettings": {"network": "raw", "security": "reality",
@@ -258,7 +273,7 @@ func TestOutboundXHTTPReality(t *testing.T) {
 	raw := "vless://" + sampleUUID + "@1.2.3.4:443?type=xhttp&encryption=none&security=reality&pbk=" + samplePBK +
 		"&fp=chrome&sni=example.com&sid=abcd&spx=%2F&path=%2Fxhttp&host=example.com&mode=auto&flow=xtls-rprx-vision#name"
 	sameJSON(t, outboundOf(t, raw), `{
-		"protocol": "vless",
+		"tag": "proxy", "protocol": "vless",
 		"settings": {"vnext": [{"address": "1.2.3.4", "port": 443,
 			"users": [{"id": "`+sampleUUID+`", "encryption": "none"}]}]},
 		"streamSettings": {"network": "xhttp", "security": "reality",
@@ -312,7 +327,7 @@ func TestTLSPinnedCertReplacesAllowInsecure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := ClientJSON("127.0.0.1", 1080, 0, "1.2.3.4", 443, "", "", only.Params); err == nil || !strings.Contains(err.Error(), "allowInsecure") {
+	if _, err := ClientJSON(ClientConfig{Server: "1.2.3.4", ServerPort: 443, Params: only.Params, Port: 1080, User: "u", Pass: "p"}); err == nil || !strings.Contains(err.Error(), "allowInsecure") {
 		t.Fatalf("insecure=1 only: %v", err)
 	}
 	if _, err := ParseLink(base + "&pcs=1234"); err == nil || !strings.Contains(err.Error(), "pcs") {
@@ -326,5 +341,20 @@ func TestUnknownFingerprintIsExplained(t *testing.T) {
 	_, err := Listen(context.Background(), "127.0.0.1:9", p, Inbound{})
 	if err == nil || !strings.HasPrefix(err.Error(), "VLESS: Xray не знает отпечаток браузера fp=bogus.") {
 		t.Fatal(err)
+	}
+}
+
+// New entries default to Firefox; randomized fingerprints are replaced;
+// a chosen real browser is kept.
+func TestFingerprintDefaults(t *testing.T) {
+	base := "vless://" + sampleUUID + "@1.2.3.4:443?type=tcp&security=reality&pbk=" + samplePBK + "&sni=example.com&sid=ab"
+	for fp, want := range map[string]string{"": "firefox", "&fp=randomized": "firefox", "&fp=RandomizedNoALPN": "firefox", "&fp=chrome": "chrome", "&fp=Safari": "safari", "&fp=random": "random"} {
+		got, err := ParseLink(base + fp)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Params.Fingerprint != want {
+			t.Errorf("%q: fingerprint %q, want %q", fp, got.Params.Fingerprint, want)
+		}
 	}
 }

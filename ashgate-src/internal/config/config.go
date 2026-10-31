@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 	"unicode"
 	"unicode/utf8"
 
@@ -32,6 +33,10 @@ type Config struct {
 	Rules      []Rule  `json:"rules"`
 	// Groups bundle rules under one switch and one route; see Rule.Group.
 	Groups []Group `json:"groups,omitempty"`
+	// DirectDomains go direct even when an app's rule sends it through
+	// VLESS (Xray domain routing), and resolve with the system resolver.
+	// Missing in the file means the starter list; an empty list is kept.
+	DirectDomains []string `json:"directDomains"`
 	// Extra keeps JSON keys this version does not understand, such as the
 	// Dolphin block from 0.4.x. Saving the file must not drop them.
 	Extra map[string]json.RawMessage `json:"-"`
@@ -81,6 +86,35 @@ type Proxy struct {
 	LocalUser string        `json:"localUser,omitempty"`
 	LocalPass string        `json:"localPass,omitempty"`
 	Local     string        `json:"-"`
+	// LocalAuthUser and LocalAuthPass log in to the bridge's private
+	// inbound at Local. They are made up on every start and never saved.
+	LocalAuthUser string `json:"-"`
+	LocalAuthPass string `json:"-"`
+	// Sub, when set, makes this VLESS proxy a failover group fed by a
+	// 3x-ui subscription. VLESS and Address then come from the active
+	// entry at run time and are empty in the file.
+	Sub *Subscription `json:"subscription,omitempty"`
+}
+
+// Subscription is the stored state of a 3x-ui subscription. Its URL and
+// links are sealed (DPAPI on Windows); the rest is shown in the window.
+type Subscription struct {
+	Sealed    string    `json:"sealed"`
+	Count     int       `json:"count"`
+	Host      string    `json:"host,omitempty"` // URL host only, for display
+	UpdatedAt time.Time `json:"updatedAt,omitempty"`
+	CheckedAt time.Time `json:"checkedAt,omitempty"`
+	Error     string    `json:"error,omitempty"`
+}
+
+// DefaultDirectDomains is the starter list of domains that go direct:
+// Russian state services, major banks, Yandex, VK and MAX.
+var DefaultDirectDomains = []string{
+	"gosuslugi.ru", "nalog.gov.ru",
+	"sberbank.ru", "sber.ru", "vtb.ru", "tbank.ru", "tinkoff.ru", "alfabank.ru",
+	"gazprombank.ru", "raiffeisen.ru", "sovcombank.ru", "pochtabank.ru", "psbank.ru",
+	"rshb.ru", "open.ru", "mkb.ru",
+	"yandex.ru", "ya.ru", "vk.com", "max.ru",
 }
 
 // Rule maps one application to a proxy, a direct connection, or a drop.
@@ -188,6 +222,9 @@ func (c *Config) ApplyDefaults() {
 	if c.Rules == nil {
 		c.Rules = []Rule{}
 	}
+	if c.DirectDomains == nil {
+		c.DirectDomains = append([]string(nil), DefaultDirectDomains...)
+	}
 	for i := range c.Rules {
 		if c.Rules[i].Enabled == nil {
 			v := true
@@ -252,6 +289,15 @@ func (c *Config) Validate() error {
 		default:
 			return fmt.Errorf("proxies[%d]: type must be socks5, http or vless, got %q", i, c.Proxies[i].Type)
 		}
+		if p.Sub != nil {
+			if p.Type != "vless" || p.Sub.Sealed == "" {
+				return fmt.Errorf("proxies[%d]: subscription must be a vless proxy with stored links", i)
+			}
+			if p.VLESS == nil {
+				// The file form: servers come from the subscription.
+				continue
+			}
+		}
 		if c.Proxies[i].Type == "vless" {
 			if err := c.Proxies[i].Prepare(); err != nil {
 				return fmt.Errorf("proxies[%d]: %w", i, err)
@@ -266,6 +312,11 @@ func (c *Config) Validate() error {
 	}
 	if err := validateLocalPorts(c); err != nil {
 		return err
+	}
+	for i, d := range c.DirectDomains {
+		if !validDomain(d) {
+			return fmt.Errorf("directDomains[%d]: invalid domain %q", i, d)
+		}
 	}
 
 	if c.DNS.IncludeSystemResolver {
@@ -413,7 +464,7 @@ func (c *Config) ProxyByName(name string) (Proxy, bool) {
 var knownConfigKeys = map[string]bool{
 	"version": true, "relay": true, "dns": true, "bypassPrivate": true,
 	"udpUnsupported": true, "killSwitch": true, "log": true, "ui": true, "proxies": true, "rules": true,
-	"groups": true,
+	"groups": true, "directDomains": true,
 }
 
 // Load reads a config file, applies defaults, and validates it.
@@ -641,6 +692,25 @@ func splitAddr(addr string) (string, uint16, error) {
 		return "", 0, fmt.Errorf("port %d out of range", port)
 	}
 	return host, uint16(port), nil
+}
+
+// validDomain accepts a lower-case host name such as "gosuslugi.ru":
+// letters, digits, '-' and dots between labels, at least two labels.
+func validDomain(d string) bool {
+	if len(d) > 253 || !strings.Contains(d, ".") {
+		return false
+	}
+	for _, label := range strings.Split(d, ".") {
+		if label == "" || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, r := range label {
+			if !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-') {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // matchesEverything reports a process mask made only of wildcards, such as

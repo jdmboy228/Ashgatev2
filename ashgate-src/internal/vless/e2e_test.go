@@ -90,7 +90,7 @@ func TestTCPRealityEcho(t *testing.T) {
 	host, eport := splitHostPort(t, echoAddr)
 	conn, err := dialer.Net{}.DialTCP(ctx, config.Proxy{
 		Name: "aeza", Type: "vless", Address: net.JoinHostPort("127.0.0.1", itoa(port)),
-		Local: br.Addr, VLESS: &params,
+		Local: br.Addr, LocalAuthUser: br.User, LocalAuthPass: br.Pass, VLESS: &params,
 	}, host, eport)
 	if err != nil {
 		t.Fatalf("dial: %v\n%s", err, vless.RecentLog(time.Now().Add(-20*time.Second)))
@@ -109,7 +109,7 @@ func TestTCPRealityEcho(t *testing.T) {
 	}
 
 	udpAddr := udpEcho(t)
-	assoc, err := dialer.Net{}.DialUDP(ctx, config.Proxy{Type: "vless", Local: br.Addr, VLESS: &params})
+	assoc, err := dialer.Net{}.DialUDP(ctx, config.Proxy{Type: "vless", Local: br.Addr, LocalAuthUser: br.User, LocalAuthPass: br.Pass, VLESS: &params})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -188,7 +188,7 @@ func TestXHTTPRealityEcho(t *testing.T) {
 	}
 	t.Cleanup(br.Close)
 	host, eport := splitHostPort(t, echoAddr)
-	conn, err := socks5.Dial(ctx, config.Proxy{Type: "socks5", Address: br.Addr}, host, eport)
+	conn, err := socks5.Dial(ctx, config.Proxy{Type: "socks5", Address: br.Addr, Username: br.User, Password: br.Pass}, host, eport)
 	if err != nil {
 		t.Fatalf("xhttp dial: %v\n%s", err, vless.RecentLog(time.Now().Add(-20*time.Second)))
 	}
@@ -247,7 +247,7 @@ func TestTLSWSEcho(t *testing.T) {
 	}
 	t.Cleanup(br.Close)
 	host, eport := splitHostPort(t, echoAddr)
-	conn, err := socks5.Dial(ctx, config.Proxy{Type: "socks5", Address: br.Addr}, host, eport)
+	conn, err := socks5.Dial(ctx, config.Proxy{Type: "socks5", Address: br.Addr, Username: br.User, Password: br.Pass}, host, eport)
 	if err != nil {
 		t.Fatalf("tls dial: %v\n%s", err, vless.RecentLog(time.Now().Add(-20*time.Second)))
 	}
@@ -311,7 +311,7 @@ func TestBadRealityKeyIsRussian(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(br.Close)
-	conn, err := socks5.Dial(ctx, config.Proxy{Type: "socks5", Address: br.Addr}, "127.0.0.1", 9)
+	conn, err := socks5.Dial(ctx, config.Proxy{Type: "socks5", Address: br.Addr, Username: br.User, Password: br.Pass}, "127.0.0.1", 9)
 	if err != nil {
 		got := vless.Explain(err)
 		if !wrongKeyExplained(got) {
@@ -412,21 +412,45 @@ func TestFixedSOCKSCurl(t *testing.T) {
 	if err != nil {
 		t.Fatalf("bridge: %v\n%s", err, vless.RecentLog(time.Now().Add(-20*time.Second)))
 	}
-	if cfg.Proxies[0].Local != "127.0.0.1:10808" || !st["aeza"].Up || st["aeza"].HTTP != "127.0.0.1:10809" {
-		t.Fatalf("local %s status %+v", cfg.Proxies[0].Local, st["aeza"])
+	a := st["aeza"]
+	local := cfg.Proxies[0].Local
+	if !a.Up || a.Published != "127.0.0.1:10808" || a.HTTP != "127.0.0.1:10809" || local == a.Published || !strings.HasPrefix(local, "127.0.0.1:") {
+		t.Fatalf("local %s status %+v", local, a)
 	}
+	// No login in the config: the published port gets one for this start.
+	if a.PubUser == "" || a.PubPass == "" || cfg.Proxies[0].LocalAuthUser == "" || cfg.Proxies[0].LocalAuthUser == a.PubUser {
+		t.Fatalf("credentials: %+v private user %q", a, cfg.Proxies[0].LocalAuthUser)
+	}
+	login := a.PubUser + ":" + a.PubPass + "@"
 
-	body := curlOut(t, "http://"+origin+"/", "--socks5-hostname", "127.0.0.1:10808")
+	body := curlOut(t, "http://"+origin+"/", "--socks5-hostname", login+"127.0.0.1:10808")
 	if !strings.Contains(body, "ashgate-fixed") {
 		t.Fatalf("socks body %q", body)
 	}
-	httpBody := curlOut(t, "http://"+origin+"/", "-x", "http://127.0.0.1:10809")
+	httpBody := curlOut(t, "http://"+origin+"/", "-x", "http://"+login+"127.0.0.1:10809")
 	if !strings.Contains(httpBody, "ashgate-fixed") {
 		t.Fatalf("http body %q", httpBody)
 	}
+	for _, args := range [][]string{{"--socks5-hostname", "127.0.0.1:10808"}, {"--socks5-hostname", local}, {"-x", "http://127.0.0.1:10809"}} {
+		cmd := exec.Command("curl", append([]string{"-fsS", "--max-time", "8"}, append(args, "http://"+origin+"/")...)...)
+		if out, err := cmd.CombinedOutput(); err == nil {
+			t.Fatalf("no login accepted via %v: %s", args, out)
+		}
+	}
+	// UDP ASSOCIATE is off on every SOCKS5 inbound.
+	for _, addr := range []string{"127.0.0.1:10808", local} {
+		user, pass := a.PubUser, a.PubPass
+		if addr == local {
+			user, pass = cfg.Proxies[0].LocalAuthUser, cfg.Proxies[0].LocalAuthPass
+		}
+		if as, err := socks5.Associate(ctx, config.Proxy{Address: addr, Username: user, Password: pass}); err == nil {
+			_ = as.Close()
+			t.Fatalf("UDP ASSOCIATE accepted on %s", addr)
+		}
+	}
 
 	udpAddr := udpEcho(t)
-	assoc, err := dialer.Net{}.DialUDP(ctx, config.Proxy{Type: "vless", Local: "127.0.0.1:10808", VLESS: &params})
+	assoc, err := dialer.Net{}.DialUDP(ctx, config.Proxy{Type: "vless", Local: local, VLESS: &params})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -450,7 +474,7 @@ func TestFixedSOCKSCurl(t *testing.T) {
 
 	direct, derr := exec.Command("curl", "-fsS", "--max-time", "12", "https://example.com").CombinedOutput()
 	if derr == nil && strings.Contains(string(direct), "Example Domain") {
-		out := curlOut(t, "https://example.com", "--socks5-hostname", "127.0.0.1:10808")
+		out := curlOut(t, "https://example.com", "--socks5-hostname", login+"127.0.0.1:10808")
 		if !strings.Contains(out, "Example Domain") {
 			t.Fatalf("proxied example.com: %q", out)
 		}
@@ -466,7 +490,7 @@ func TestFixedSOCKSCurl(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !st["aeza"].Up || cfg.Proxies[0].Local != "127.0.0.1:10818" {
+	if !st["aeza"].Up || st["aeza"].Published != "127.0.0.1:10818" || st["aeza"].PubUser != "" {
 		t.Fatalf("%+v %s", st["aeza"], cfg.Proxies[0].Local)
 	}
 	authed := curlOut(t, "http://"+origin+"/", "--socks5-hostname", "dolphin:secret@127.0.0.1:10818")
@@ -715,7 +739,7 @@ func rawRealityParams(uuid, flow, fp string) vless.Params {
 func echoThrough(ctx context.Context, br *vless.Bridge, params vless.Params, echoAddr string) error {
 	host, portStr, _ := net.SplitHostPort(echoAddr)
 	port, _ := strconv.Atoi(portStr)
-	conn, err := dialer.Net{}.DialTCP(ctx, config.Proxy{Type: "vless", Local: br.Addr, VLESS: &params}, host, uint16(port))
+	conn, err := dialer.Net{}.DialTCP(ctx, config.Proxy{Type: "vless", Local: br.Addr, LocalAuthUser: br.User, LocalAuthPass: br.Pass, VLESS: &params}, host, uint16(port))
 	if err != nil {
 		return err
 	}
@@ -826,7 +850,7 @@ func TestManagerSwitchesTransportOnFixedPort(t *testing.T) {
 	for _, network := range []string{"tcp", "xhttp", "tcp"} {
 		ep.Params.Network = network
 		st, err := m.Sync(ctx, []vless.Endpoint{ep})
-		if err != nil || !st["p"].Up || st["p"].SOCKS != want {
+		if err != nil || !st["p"].Up || st["p"].Published != want {
 			t.Fatalf("%s: %+v %v", network, st["p"], err)
 		}
 	}
@@ -885,7 +909,7 @@ func TestClientHelloLooksLikeBrowser(t *testing.T) {
 			}
 			t.Cleanup(br.Close)
 			go func() {
-				conn, err := socks5.Dial(ctx, config.Proxy{Type: "socks5", Address: br.Addr}, "1.1.1.1", 443)
+				conn, err := socks5.Dial(ctx, config.Proxy{Type: "socks5", Address: br.Addr, Username: br.User, Password: br.Pass}, "1.1.1.1", 443)
 				if err == nil {
 					_, _ = conn.Write([]byte("x"))
 					<-ctx.Done()
@@ -963,4 +987,103 @@ func parseClientHello(t *testing.T, rec []byte) clientHello {
 		}
 	}
 	return ch
+}
+
+// deadServer is a VLESS server address where nothing listens: a bridge to
+// it never gets a working tunnel.
+func deadServer(t *testing.T) string {
+	return net.JoinHostPort("127.0.0.1", itoa(mustFree(t)))
+}
+
+// A name on the direct list leaves through Xray's direct outbound, so it
+// works with the tunnel down; any other name needs the tunnel.
+func TestDirectDomainsSkipTheTunnel(t *testing.T) {
+	origin := httpOrigin(t, "direct-ok")
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+	defer cancel()
+	params := vless.Params{UUID: "99999999-9999-4999-8999-999999999999", Network: "tcp", Security: "none"}
+	br, err := vless.ListenWith(ctx, deadServer(t), params, vless.Inbound{}, vless.Routing{Direct: []string{"direct.test"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(br.Close)
+	host, port := splitHostPort(t, origin)
+	get := func(hostHeader string) string {
+		conn, err := socks5.Dial(ctx, config.Proxy{Address: br.Addr, Username: br.User, Password: br.Pass}, host, port)
+		if err != nil {
+			return ""
+		}
+		defer conn.Close()
+		_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+		_, _ = fmt.Fprintf(conn, "GET / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", hostHeader)
+		body, _ := io.ReadAll(conn)
+		return string(body)
+	}
+	if body := get("www.direct.test"); !strings.Contains(body, "direct-ok") {
+		t.Fatalf("direct-list name did not go direct: %q", body)
+	}
+	if body := get("other.test"); strings.Contains(body, "direct-ok") {
+		t.Fatal("a name off the list went direct")
+	}
+}
+
+// Port 53 from Ashgate goes to Xray's DNS: a direct-list name is answered
+// by the system resolver; any other name only through the tunnel (DoH),
+// which is down here, so it gets no address.
+func TestDNSThroughXray(t *testing.T) {
+	if _, err := net.LookupHost("example.com"); err != nil {
+		t.Skip("no system DNS here:", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+	defer cancel()
+	params := vless.Params{UUID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", Network: "tcp", Security: "none"}
+	br, err := vless.ListenWith(ctx, deadServer(t), params, vless.Inbound{}, vless.Routing{
+		Direct: []string{"example.com"}, DNS: []string{"https://1.1.1.1/dns-query"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(br.Close)
+	ask := func(name string, id uint16) (answers int, replied bool) {
+		us, err := vless.DialUDP(br.Addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer us.Close()
+		if err := us.Send(ctx, &net.UDPAddr{IP: net.ParseIP("1.1.1.1"), Port: 53}, dnsQuery(id, name)); err != nil {
+			t.Fatal(err)
+		}
+		got := make(chan []byte, 1)
+		go func() {
+			_, b, err := us.Recv(ctx)
+			if err == nil {
+				got <- b
+			}
+		}()
+		select {
+		case b := <-got:
+			if len(b) < 12 || int(b[0])<<8|int(b[1]) != int(id) || b[2]&0x80 == 0 {
+				t.Fatalf("bad DNS reply % x", b)
+			}
+			return int(b[6])<<8 | int(b[7]), true
+		case <-time.After(8 * time.Second):
+			return 0, false
+		}
+	}
+	if n, ok := ask("example.com", 0x1234); !ok || n == 0 {
+		t.Fatalf("direct-list name: replied=%v answers=%d", ok, n)
+	}
+	if n, _ := ask("example.org", 0x4321); n != 0 {
+		t.Fatalf("a name off the list resolved without the tunnel (%d answers)", n)
+	}
+}
+
+// dnsQuery is a minimal recursive A query.
+func dnsQuery(id uint16, name string) []byte {
+	q := []byte{byte(id >> 8), byte(id), 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0}
+	for _, label := range strings.Split(name, ".") {
+		q = append(q, byte(len(label)))
+		q = append(q, label...)
+	}
+	return append(q, 0, 0, 1, 0, 1)
 }

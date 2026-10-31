@@ -3,6 +3,8 @@ package vless
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -36,21 +38,47 @@ func (logHook) Handle(msg xraylog.Message) {
 	pushLog(msg.String())
 }
 
-// Inbound is the localhost SOCKS5 (and optional HTTP) listener for one bridge.
-// Port 0 asks for a random port and does not publish HTTP.
+// Inbound is the published localhost SOCKS5 and HTTP listener of a bridge,
+// for other programs. Port 0 publishes nothing. A published port always
+// needs a login: an empty User gets random credentials on every start.
 type Inbound struct {
 	Port int    `json:"port,omitempty"`
 	User string `json:"user,omitempty"`
 	Pass string `json:"pass,omitempty"`
 }
 
-// Bridge is one local SOCKS5 inbound in front of a VLESS outbound.
+// Routing is what a bridge does with Ashgate's own traffic besides
+// proxying it.
+type Routing struct {
+	// Direct lists domains that leave through Xray's "direct" outbound,
+	// from Ashgate's own process, so capture does not take them again.
+	Direct []string `json:"direct,omitempty"`
+	// DNS, when set, answers port-53 queries with Xray's DNS: these
+	// servers (DoH) through the tunnel, Direct domains with the system
+	// resolver.
+	DNS []string `json:"dns,omitempty"`
+}
+
+// Bridge is one embedded Xray instance with a VLESS outbound. Ashgate uses
+// its private SOCKS5 inbound; a published one is optional.
 type Bridge struct {
-	Addr string
-	HTTP string
-	inst *core.Instance
-	stop chan struct{}
-	once sync.Once
+	// Addr is the private SOCKS5 inbound: 127.0.0.1, a random port and
+	// random credentials on every start, no UDP ASSOCIATE.
+	Addr       string
+	User, Pass string
+	// Published is the fixed SOCKS5 port for other programs ("" if none),
+	// HTTP the HTTP proxy next to it, PubUser/PubPass their login.
+	Published        string
+	HTTP             string
+	PubUser, PubPass string
+	// Generated reports that PubUser/PubPass were made up for this start.
+	Generated bool
+
+	routing Routing
+	server  string
+	inst    *core.Instance
+	stop    chan struct{}
+	once    sync.Once
 }
 
 // Close stops the embedded Xray instance. It is safe to call more than once.
@@ -60,17 +88,23 @@ func (b *Bridge) Close() {
 	}
 	b.once.Do(func() {
 		close(b.stop)
+		unregister(b)
 		if b.inst != nil {
 			_ = b.inst.Close()
 		}
 	})
 }
 
-// Listen starts a SOCKS5 inbound on 127.0.0.1 and a VLESS outbound to serverAddr.
-// A fixed Inbound.Port also publishes an HTTP proxy on the next port.
-// The bridge stops when ctx is cancelled or Close is called.
+// Listen starts a bridge to serverAddr with no routing exceptions.
 func Listen(ctx context.Context, serverAddr string, p Params, in Inbound) (*Bridge, error) {
-	b, err := listen(ctx, serverAddr, p, in)
+	return ListenWith(ctx, serverAddr, p, in, Routing{})
+}
+
+// ListenWith starts a bridge: a private SOCKS5 inbound on 127.0.0.1, an
+// optional published SOCKS5/HTTP pair on in.Port and in.Port+1, and a VLESS
+// outbound to serverAddr. It stops when ctx is cancelled or Close is called.
+func ListenWith(ctx context.Context, serverAddr string, p Params, in Inbound, rt Routing) (*Bridge, error) {
+	b, err := listen(ctx, serverAddr, p, in, rt)
 	if err != nil {
 		// The error reaches the window and ashgate.log.
 		return nil, maskSecrets(err, p)
@@ -78,7 +112,7 @@ func Listen(ctx context.Context, serverAddr string, p Params, in Inbound) (*Brid
 	return b, nil
 }
 
-func listen(ctx context.Context, serverAddr string, p Params, in Inbound) (*Bridge, error) {
+func listen(ctx context.Context, serverAddr string, p Params, in Inbound, rt Routing) (*Bridge, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -99,8 +133,19 @@ func listen(ctx context.Context, serverAddr string, p Params, in Inbound) (*Brid
 	if err != nil || serverPort < 1 || serverPort > 65535 {
 		return nil, errors.New("VLESS: неверный адрес сервера")
 	}
+	cc := ClientConfig{Server: host, ServerPort: serverPort, Params: p, Published: in, Routing: rt}
 	if in.Port != 0 {
-		return listenFixed(ctx, host, serverPort, p, in)
+		if in.User == "" {
+			cc.Published.User, cc.Published.Pass = randomToken(8), randomToken(16)
+		}
+		if err := portFree(in.Port, false); err != nil {
+			return nil, portBusy(in.Port)
+		}
+		if in.Port < 65535 {
+			if err := portFree(in.Port+1, false); err != nil {
+				return nil, fmt.Errorf("VLESS: HTTP-порт %d занят. Выберите другой локальный SOCKS5-порт", in.Port+1)
+			}
+		}
 	}
 	var last error
 	for attempt := 0; attempt < 5; attempt++ {
@@ -108,15 +153,19 @@ func listen(ctx context.Context, serverAddr string, p Params, in Inbound) (*Brid
 		if err != nil {
 			return nil, err
 		}
-		b, err := startBridge(ctx, host, serverPort, port, 0, Inbound{}, p)
-		if err != nil {
-			last = err
-			if bindConflict(err) {
-				continue
-			}
+		cc.Port, cc.User, cc.Pass = port, randomToken(8), randomToken(16)
+		b, err := startBridge(ctx, cc)
+		if err == nil {
+			b.Generated = in.Port != 0 && in.User == ""
+			return b, nil
+		}
+		last = err
+		if !bindConflict(err) {
 			return nil, humanizeStart(err)
 		}
-		return b, nil
+		if in.Port != 0 && (portFree(in.Port, false) != nil || (in.Port < 65535 && portFree(in.Port+1, false) != nil)) {
+			return nil, portBusy(in.Port)
+		}
 	}
 	if last == nil {
 		last = errors.New("VLESS: не удалось запустить локальный мост")
@@ -124,31 +173,8 @@ func listen(ctx context.Context, serverAddr string, p Params, in Inbound) (*Brid
 	return nil, humanizeStart(last)
 }
 
-func listenFixed(ctx context.Context, host string, serverPort int, p Params, in Inbound) (*Bridge, error) {
-	httpPort := 0
-	if in.Port < 65535 {
-		httpPort = in.Port + 1
-	}
-	if err := portFree(in.Port, true); err != nil {
-		return nil, portBusy(in.Port)
-	}
-	if httpPort != 0 {
-		if err := portFree(httpPort, false); err != nil {
-			return nil, fmt.Errorf("VLESS: HTTP-порт %d занят. Выберите другой локальный SOCKS5-порт", httpPort)
-		}
-	}
-	b, err := startBridge(ctx, host, serverPort, in.Port, httpPort, in, p)
-	if err != nil {
-		if bindConflict(err) {
-			return nil, portBusy(in.Port)
-		}
-		return nil, humanizeStart(err)
-	}
-	return b, nil
-}
-
-func startBridge(ctx context.Context, host string, serverPort, socksPort, httpPort int, in Inbound, p Params) (*Bridge, error) {
-	raw, err := ClientJSON("127.0.0.1", socksPort, httpPort, host, serverPort, in.User, in.Pass, p)
+func startBridge(ctx context.Context, cc ClientConfig) (*Bridge, error) {
+	raw, err := ClientJSON(cc)
 	if err != nil {
 		return nil, err
 	}
@@ -156,10 +182,19 @@ func startBridge(ctx context.Context, host string, serverPort, socksPort, httpPo
 	if err != nil {
 		return nil, err
 	}
-	b := &Bridge{Addr: fmt.Sprintf("127.0.0.1:%d", socksPort), inst: inst, stop: make(chan struct{})}
-	if httpPort != 0 {
-		b.HTTP = fmt.Sprintf("127.0.0.1:%d", httpPort)
+	b := &Bridge{
+		Addr: fmt.Sprintf("127.0.0.1:%d", cc.Port), User: cc.User, Pass: cc.Pass,
+		routing: cc.Routing, server: net.JoinHostPort(cc.Server, fmt.Sprint(cc.ServerPort)),
+		inst: inst, stop: make(chan struct{}),
 	}
+	if cc.Published.Port != 0 {
+		b.Published = fmt.Sprintf("127.0.0.1:%d", cc.Published.Port)
+		b.PubUser, b.PubPass = cc.Published.User, cc.Published.Pass
+		if cc.Published.Port < 65535 {
+			b.HTTP = fmt.Sprintf("127.0.0.1:%d", cc.Published.Port+1)
+		}
+	}
+	register(b)
 	go func() {
 		select {
 		case <-ctx.Done():
@@ -167,24 +202,49 @@ func startBridge(ctx context.Context, host string, serverPort, socksPort, httpPo
 		case <-b.stop:
 		}
 	}()
-	if err := waitPort(b.Addr, 2*time.Second); err != nil {
-		b.Close()
-		return nil, err
-	}
-	if b.HTTP != "" {
-		if err := waitPort(b.HTTP, 2*time.Second); err != nil {
+	for _, addr := range []string{b.Addr, b.Published, b.HTTP} {
+		if addr == "" {
+			continue
+		}
+		if err := waitPort(addr, 2*time.Second); err != nil {
 			b.Close()
-			return nil, fmt.Errorf("VLESS: HTTP-порт %d не открылся", httpPort)
+			return nil, fmt.Errorf("VLESS: локальный порт %s не открылся: %w", addr, err)
 		}
 	}
 	return b, nil
 }
 
-// ClientJSON is the Xray client document for one VLESS outbound.
-// httpPort 0 omits the HTTP inbound. socksPort is the SOCKS5 listen port.
-func ClientJSON(listen string, socksPort, httpPort int, serverHost string, serverPort int, user, pass string, p Params) ([]byte, error) {
+// Inbound tags. Routing exceptions apply to Ashgate's own inbound only:
+// programs using the published port get the plain tunnel.
+const (
+	tagAshgate = "ashgate"
+	tagProxy   = "proxy"
+	tagDirect  = "direct"
+	tagDNS     = "dns-out"
+)
+
+// ClientConfig describes one bridge's Xray document.
+type ClientConfig struct {
+	Server     string
+	ServerPort int
+	Params     Params
+	// Port, User and Pass are the private SOCKS5 inbound for Ashgate.
+	Port       int
+	User, Pass string
+	// Published is the optional SOCKS5 (Port) and HTTP (Port+1) pair for
+	// other programs. It always has User and Pass here.
+	Published Inbound
+	Routing   Routing
+}
+
+// ClientJSON is the Xray client document for one bridge.
+func ClientJSON(c ClientConfig) ([]byte, error) {
+	p := c.Params
 	if err := p.Normalize(); err != nil {
 		return nil, err
+	}
+	if c.User == "" || (c.Published.Port != 0 && c.Published.User == "") {
+		return nil, errors.New("VLESS: локальный прокси без логина")
 	}
 	vuser := map[string]any{
 		"id":         p.UUID,
@@ -278,36 +338,84 @@ func ClientJSON(listen string, socksPort, httpPort int, serverHost string, serve
 			}
 		}
 	}
-	inbounds := []any{map[string]any{
-		"listen":   listen,
-		"port":     socksPort,
+	private := map[string]any{
+		"tag":      tagAshgate,
+		"listen":   "127.0.0.1",
+		"port":     c.Port,
 		"protocol": "socks",
-		"settings": socksSettings(user, pass),
-	}}
-	if httpPort != 0 {
-		inbounds = append(inbounds, map[string]any{
-			"listen":   listen,
-			"port":     httpPort,
-			"protocol": "http",
-			"settings": httpSettings(user, pass),
-		})
+		"settings": socksSettings(c.User, c.Pass),
 	}
+	if len(c.Routing.Direct) > 0 {
+		// Route by the name the program asked for (TLS SNI, HTTP Host,
+		// QUIC); the connection still goes to the IP it chose.
+		private["sniffing"] = map[string]any{"enabled": true, "destOverride": []string{"http", "tls", "quic"}, "routeOnly": true}
+	}
+	inbounds := []any{private}
+	if pub := c.Published; pub.Port != 0 {
+		inbounds = append(inbounds, map[string]any{
+			"tag": "published", "listen": "127.0.0.1", "port": pub.Port,
+			"protocol": "socks", "settings": socksSettings(pub.User, pub.Pass),
+		})
+		if pub.Port < 65535 {
+			inbounds = append(inbounds, map[string]any{
+				"tag": "published-http", "listen": "127.0.0.1", "port": pub.Port + 1,
+				"protocol": "http", "settings": httpSettings(pub.User, pub.Pass),
+			})
+		}
+	}
+	outbounds := []any{map[string]any{
+		"tag":      tagProxy,
+		"protocol": "vless",
+		"settings": map[string]any{
+			"vnext": []any{map[string]any{
+				"address": c.Server,
+				"port":    c.ServerPort,
+				"users":   []any{vuser},
+			}},
+		},
+		"streamSettings": stream,
+	}}
+	var rules []any
 	doc := map[string]any{
 		"log":      map[string]any{"loglevel": "info"},
 		"inbounds": inbounds,
-		"outbounds": []any{map[string]any{
-			"protocol": "vless",
-			"settings": map[string]any{
-				"vnext": []any{map[string]any{
-					"address": serverHost,
-					"port":    serverPort,
-					"users":   []any{vuser},
-				}},
-			},
-			"streamSettings": stream,
-		}},
+	}
+	if len(c.Routing.DNS) > 0 {
+		outbounds = append(outbounds, map[string]any{
+			"tag": tagDNS, "protocol": "dns",
+			// Other query types (HTTPS, SVCB) would otherwise go to the
+			// original server outside Xray's DNS.
+			"settings": map[string]any{"nonIPQuery": "reject"},
+		})
+		rules = append(rules, map[string]any{"type": "field", "inboundTag": []string{tagAshgate}, "port": "53", "outboundTag": tagDNS})
+		servers := []any{}
+		if len(c.Routing.Direct) > 0 {
+			servers = append(servers, map[string]any{"address": "localhost", "domains": domainRules(c.Routing.Direct), "skipFallback": true})
+		}
+		for _, s := range c.Routing.DNS {
+			servers = append(servers, s)
+		}
+		doc["dns"] = map[string]any{"servers": servers, "queryStrategy": "UseIP"}
+	}
+	if len(c.Routing.Direct) > 0 {
+		outbounds = append(outbounds, map[string]any{"tag": tagDirect, "protocol": "freedom"})
+		rules = append(rules, map[string]any{"type": "field", "inboundTag": []string{tagAshgate}, "domain": domainRules(c.Routing.Direct), "outboundTag": tagDirect})
+	}
+	doc["outbounds"] = outbounds
+	if len(rules) > 0 {
+		doc["routing"] = map[string]any{"domainStrategy": "AsIs", "rules": rules}
 	}
 	return json.Marshal(doc)
+}
+
+// domainRules turns plain domains into Xray rules that also match
+// subdomains: "gosuslugi.ru" covers "www.gosuslugi.ru".
+func domainRules(domains []string) []string {
+	out := make([]string, 0, len(domains))
+	for _, d := range domains {
+		out = append(out, "domain:"+d)
+	}
+	return out
 }
 
 func loadAndStart(raw []byte) (*core.Instance, error) {
@@ -326,24 +434,30 @@ func loadAndStart(raw []byte) (*core.Instance, error) {
 	return inst, nil
 }
 
+// socksSettings always asks for a login and never offers UDP ASSOCIATE:
+// its UDP relay would take datagrams from any local program. Ashgate sends
+// its own UDP through DialUDP instead.
 func socksSettings(user, pass string) map[string]any {
-	if user == "" {
-		return map[string]any{"auth": "noauth", "udp": true}
-	}
 	return map[string]any{
 		"auth":     "password",
-		"udp":      true,
+		"udp":      false,
 		"accounts": []any{map[string]string{"user": user, "pass": pass}},
 	}
 }
 
 func httpSettings(user, pass string) map[string]any {
-	if user == "" {
-		return map[string]any{}
-	}
 	return map[string]any{
 		"accounts": []any{map[string]string{"user": user, "pass": pass}},
 	}
+}
+
+// randomToken is n random bytes in hex.
+func randomToken(n int) string {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		panic(err)
+	}
+	return hex.EncodeToString(b)
 }
 
 func portFree(port int, udp bool) error {

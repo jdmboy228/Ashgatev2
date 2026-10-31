@@ -76,7 +76,7 @@ func CheckTarget(ctx context.Context, p config.Proxy, host string, port uint16) 
 			return failed(vless.Explain(err))
 		}
 		defer br.Close()
-		via := config.Proxy{Type: "socks5", Address: br.Addr}
+		via := config.Proxy{Type: "socks5", Address: br.Addr, Username: br.User, Password: br.Pass}
 		conn, err := socks5.Dial(ctx, via, host, port)
 		if err != nil {
 			return failed(vless.Explain(err))
@@ -88,15 +88,12 @@ func CheckTarget(ctx context.Context, p config.Proxy, host string, port uint16) 
 		}
 		ms := millis(start)
 		rep := Report{OK: true, Millis: ms, Label: fmt.Sprintf("%d мс", ms), Detail: "TCP доступен"}
-		actx, acancel := context.WithTimeout(ctx, 3*time.Second)
-		assoc, err := socks5.Associate(actx, via)
-		acancel()
-		if err == nil {
+		// VLESS carries UDP inside the tunnel (XUDP); Ashgate opens it in
+		// process, not through SOCKS5 UDP ASSOCIATE.
+		if us, err := vless.DialUDP(br.Addr); err == nil {
 			rep.UDP = true
 			rep.Detail = "TCP и UDP"
-			_ = assoc.Close()
-		} else {
-			rep.Detail = "TCP доступен, UDP ASSOCIATE не удался"
+			_ = us.Close()
 		}
 		return rep
 	default:

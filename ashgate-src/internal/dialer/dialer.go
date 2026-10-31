@@ -54,19 +54,19 @@ func (Net) DialTCP(ctx context.Context, p config.Proxy, host string, port uint16
 }
 
 // DialUDP opens a SOCKS5 UDP association. HTTP proxies do not support general UDP.
-// VLESS uses the same association on its local bridge.
+// VLESS sends UDP into its bridge inside this process.
 func (Net) DialUDP(ctx context.Context, p config.Proxy) (Session, error) {
 	switch p.Type {
 	case "socks5":
 		return socks5.Associate(ctx, p)
 	case "vless":
-		via, err := vlessSocks(p)
+		if p.Local == "" {
+			return nil, errors.New("VLESS: локальный мост не запущен")
+		}
+		// In-process: the bridge's SOCKS5 inbound has no UDP ASSOCIATE.
+		s, err := vless.DialUDP(p.Local)
 		if err != nil {
 			return nil, err
-		}
-		s, err := socks5.Associate(ctx, via)
-		if err != nil {
-			return nil, vless.Explain(err)
 		}
 		return s, nil
 	default:
@@ -78,8 +78,10 @@ func vlessSocks(p config.Proxy) (config.Proxy, error) {
 	if p.Local == "" {
 		return config.Proxy{}, errors.New("VLESS: локальный мост не запущен")
 	}
+	// The private inbound's login is made up on every start; see
+	// runtime.WireVLESS.
 	return config.Proxy{
 		Name: p.Name, Type: "socks5", Address: p.Local,
-		Username: p.LocalUser, Password: p.LocalPass,
+		Username: p.LocalAuthUser, Password: p.LocalAuthPass,
 	}, nil
 }

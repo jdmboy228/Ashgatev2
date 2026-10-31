@@ -95,6 +95,16 @@ type controller struct {
 	// page sends.
 	updateURL string
 
+	// Subscriptions at run time (see subs.go). saveMu serialises
+	// read-modify-write of the config file between the window and
+	// background updates. done stops subsLoop.
+	subs         map[string]*subGroup
+	subFetching  bool
+	subFetchName string
+	saveMu       sync.Mutex
+	done         chan struct{}
+	doneOnce     sync.Once
+
 	// Per-rule speed sampling; see ruleStatsLocked.
 	statPrev  map[string]engine.RuleStat
 	statAt    time.Time
@@ -120,9 +130,11 @@ func newController(path string, cfg *config.Config, logs *logbuf.Buffer, h hooks
 	c := &controller{
 		path: path, cfg: cfg, logs: logs, checks: map[string]probe.Report{},
 		bridges: vless.NewManager(), bridgeSt: map[string]vless.Status{}, hooks: h,
-		token: newToken(),
+		token: newToken(), done: make(chan struct{}),
 	}
-	_ = c.syncBridges(cfg)
+	c.syncSubsLocked(cfg, time.Now())
+	_ = c.syncBridges(c.runtimeCfg())
+	go c.subsLoop()
 	if h.firewall != nil {
 		if c.hooks.guard == nil {
 			c.hooks.guard = func(string) (func(), error) { return nil, killswitch.ErrUnsupported }
@@ -146,6 +158,7 @@ func (c *controller) shutdown() {
 	if c == nil || c.bridges == nil {
 		return
 	}
+	c.doneOnce.Do(func() { close(c.done) })
 	c.bridges.Close()
 }
 
@@ -250,9 +263,7 @@ func (c *controller) api(w http.ResponseWriter, r *http.Request) {
 		})
 	case "/api/probe-all":
 		c.post(w, r, func() (any, error) {
-			c.mu.Lock()
-			list := append([]config.Proxy(nil), c.cfg.Proxies...)
-			c.mu.Unlock()
+			list := c.runtimeCfg().Proxies
 			var wg sync.WaitGroup
 			for _, p := range list {
 				wg.Add(1)
@@ -326,6 +337,27 @@ func (c *controller) api(w http.ResponseWriter, r *http.Request) {
 				return nil, errors.New("сначала проверьте обновления")
 			}
 			return nil, openInBrowser(link)
+		})
+	case "/api/subscription":
+		c.post(w, r, func() (any, error) {
+			var body struct {
+				Name string `json:"name"`
+				URL  string `json:"url"`
+			}
+			if err := readJSON(r, &body); err != nil {
+				return nil, err
+			}
+			return nil, c.addSub(body.Name, body.URL)
+		})
+	case "/api/subscription/refresh":
+		c.post(w, r, func() (any, error) {
+			var body struct {
+				Name string `json:"name"`
+			}
+			if err := readJSON(r, &body); err != nil {
+				return nil, err
+			}
+			return nil, c.refreshSub(body.Name)
 		})
 	case "/api/reveal":
 		c.post(w, r, func() (any, error) {
@@ -404,6 +436,7 @@ type stateView struct {
 	Bridges    map[string]vless.Status `json:"bridges"`
 	KillSwitch ksView                  `json:"killSwitch"`
 	RuleStats  map[string]ruleStatView `json:"ruleStats"`
+	Subs       map[string]subView      `json:"subs"`
 	// Alive: rule key -> its app is running. Absent until the first scan.
 	Alive map[string]bool `json:"alive,omitempty"`
 	// Hidden tells the page it is in the tray, so it polls slowly.
@@ -498,6 +531,7 @@ func (c *controller) snapshotSince(since uint64) stateView {
 		Bridges:    bridges,
 		KillSwitch: c.ksSnapshot(killWanted(cfg)),
 		RuleStats:  c.ruleStatsLocked(time.Now()),
+		Subs:       c.subViewsLocked(),
 		Alive:      c.alive,
 		Hidden:     hidden,
 		Events:     events,
@@ -561,7 +595,7 @@ func (c *controller) start() error {
 		c.mu.Unlock()
 		return nil
 	}
-	cfg := cloneCfg(c.cfg)
+	cfg := c.materializeLocked(cloneCfg(c.cfg))
 	logs := c.logs
 	c.mu.Unlock()
 	startSession := c.startSession
@@ -625,12 +659,15 @@ func (c *controller) stop() error {
 }
 
 func (c *controller) replace(next *config.Config) error {
+	c.saveMu.Lock()
+	defer c.saveMu.Unlock()
 	c.mu.Lock()
 	old := c.cfg
 	c.mu.Unlock()
 	if next != nil && next.Extra == nil && old != nil {
 		next.Extra = old.Extra
 	}
+	keepSubs(next, old)
 	cp := cloneCfg(next)
 	cp.ApplyDefaults()
 	if err := cp.Validate(); err != nil {
@@ -644,6 +681,8 @@ func (c *controller) replace(next *config.Config) error {
 	}
 	c.mu.Lock()
 	c.cfg = cp
+	c.syncSubsLocked(cp, time.Now())
+	rcfg := c.materializeLocked(cloneCfg(cp))
 	sess := c.sess
 	running := sess != nil && sess.Running()
 	c.mu.Unlock()
@@ -653,10 +692,10 @@ func (c *controller) replace(next *config.Config) error {
 		// would also clear the engine's per-connection caches.
 		return nil
 	}
-	syncErr := c.syncBridges(cp)
+	syncErr := c.syncBridges(rcfg)
 	c.kickKill()
 	if running {
-		if err := sess.Apply(cp); err != nil && syncErr == nil {
+		if err := sess.Apply(rcfg); err != nil && syncErr == nil {
 			syncErr = err
 		}
 	}
@@ -693,8 +732,8 @@ func (c *controller) syncBridges(cfg *config.Config) error {
 			}
 			continue
 		}
-		if s.Up && s.SOCKS != "" && s.SOCKS != prev.SOCKS && logs != nil {
-			logs.Add(logbuf.Event{Process: "ashgate", Proto: "TCP", Dest: s.SOCKS, Via: name, Status: "open"})
+		if s.Up && s.Published != "" && s.Published != prev.Published && logs != nil {
+			logs.Add(logbuf.Event{Process: "ashgate", Proto: "TCP", Dest: s.Published, Via: name, Status: "open"})
 		}
 	}
 	return err
@@ -726,11 +765,13 @@ func (c *controller) proxyForProbe(name string, p *config.Proxy) (config.Proxy, 
 		}
 		return *p, nil
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	got, ok := c.cfg.ProxyByName(name)
+	// A subscription is checked on its active server.
+	got, ok := c.runtimeCfg().ProxyByName(name)
 	if !ok {
 		return config.Proxy{}, errors.New("прокси не найден")
+	}
+	if got.Sub != nil && got.VLESS == nil {
+		return config.Proxy{}, errors.New("Подписка: нет рабочих серверов")
 	}
 	return got, nil
 }
@@ -869,6 +910,12 @@ func ruConfig(err error) string {
 		return "Укажите процесс: имя файла или полный путь."
 	case strings.Contains(s, "dns.servers is required"):
 		return "Укажите хотя бы один DNS-сервер, например 1.1.1.1:53."
+	case strings.HasPrefix(s, "directDomains["):
+		bad := s
+		if i := strings.Index(s, "invalid domain "); i >= 0 {
+			bad = strings.Trim(s[i+len("invalid domain "):], `"`)
+		}
+		return "Исключения: «" + bad + "» — не домен. Пишите по одному домену в строке, например gosuslugi.ru."
 	case strings.HasPrefix(s, "dns server "):
 		return "DNS-сервер указан неверно: нужен IP и порт, например 1.1.1.1:53."
 	default:

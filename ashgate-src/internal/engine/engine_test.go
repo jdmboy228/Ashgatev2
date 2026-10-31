@@ -431,6 +431,14 @@ func TestPrivateBypass(t *testing.T) {
 	if e.HandlePacket(pkt, Meta{}, true).Action != ActionPass {
 		t.Fatal("private dest should bypass")
 	}
+	// DNS to the router is still the app's DNS: it goes through the proxy.
+	dns, err := packet.BuildUDP(packet.V4(10, 0, 0, 5, 1001), packet.V4(192, 168, 0, 1, 53), []byte{0, 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := e.HandlePacket(dns, Meta{}, true).Action; got != ActionUDP {
+		t.Fatalf("DNS to a private resolver: action %v, want it proxied", got)
+	}
 }
 
 func TestBlockDropsTCPAndUDP(t *testing.T) {

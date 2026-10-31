@@ -469,7 +469,9 @@ func (e *Engine) decide(pkt []byte, h *packet.Header, meta Meta, proc rules.Proc
 	if h.Frag && h.PayloadOff == 0 {
 		return Result{Action: ActionPass}
 	}
-	if e.destinationBypass(h.Dst, snap.bypassPrivate) {
+	// DNS is never exempt as a private destination: a proxied app asking
+	// the router (192.168.1.1:53) would leak its names outside the tunnel.
+	if e.destinationBypass(h.Dst, snap.bypassPrivate && h.Dst.Port != 53) {
 		e.rememberDirect(h)
 		return Result{Action: ActionPass}
 	}

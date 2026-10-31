@@ -245,6 +245,9 @@ function settingsHTML() {
     row("swap", "UDP, который прокси не умеет", "Для HTTP-прокси: QUIC и игры. «Блокировать» не даёт обойти прокси", segCtrl("udp", ["Блокировать", "Напрямую"], ["block", "direct"], udp)),
     row("link", "Не проксировать частные сети", "10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, fc00::/7 — напрямую", toggle("bypass", !!c.bypassPrivate)),
   ])}
+  ${group("Исключения", [
+    row("link", "Напрямую, без VLESS", "По одному домену в строке, поддомены тоже. Эти сайты открываются напрямую, даже если правило приложения ведёт через VLESS, и их имена разрешает системный DNS", `<div class="field" style="width:240px"><textarea class="mono" id="direct-domains" rows="6" spellcheck="false">${esc((c.directDomains || []).join("\n"))}</textarea></div>`),
+  ])}
   ${group("Запуск и журнал", [
     row("rocket", "Запускать с Windows", "При входе в систему открывается окно и включается перехват", toggle("auto", !!state.autostart)),
     row("doc", "Подробный журнал", "Уровень debug вместо info в ashgate.log", toggle("verbose", c.log && c.log.level === "debug")),
@@ -377,7 +380,7 @@ function fillProxies() {
   if (!host) return;
   const list = cfg().proxies || [];
   if (!list.length) {
-    setHTML(host, `<div class="empty-card"><h3>Прокси ещё нет</h3><p>Добавьте SOCKS5, HTTP или вставьте ссылку vless://.</p><button class="btn pri" type="button" data-act="proxy-add">${icon("plus")}Добавить прокси</button></div>`);
+    setHTML(host, `<div class="empty-card"><h3>Прокси ещё нет</h3><p>Добавьте SOCKS5, HTTP, ссылку vless:// или подписку 3x-ui.</p><button class="btn pri" type="button" data-act="proxy-add">${icon("plus")}Добавить прокси</button></div>`);
     return;
   }
   // One card per proxy. The selected card shows edit and delete; the
@@ -390,8 +393,8 @@ function fillProxies() {
       ? `<button class="iconbtn" data-act="proxy-edit" data-i="${i}" type="button" aria-label="Изменить" title="Изменить">${icon("edit")}</button><button class="iconbtn danger" data-act="proxy-del" data-i="${i}" type="button" aria-label="Удалить" title="Удалить">${icon("trash")}</button>`
       : "";
     return `<div class="prow${selected ? " sel" : ""}" data-act="sel-proxy" data-i="${i}">
-      <span class="ptype k-${esc(p.type || "socks5")}" title="${esc(proxyTypeLabel(p.type))}">${icon(typeIconName(p.type), 16)}</span>
-      <div class="stack"><span class="main">${esc(p.name)}</span><span class="sub">${esc(proxyTypeLabel(p.type) + " · " + proxySub(p))}</span></div>
+      <span class="ptype k-${esc(p.type || "socks5")}" title="${esc(p.subscription ? "Подписка" : proxyTypeLabel(p.type))}">${icon(p.subscription ? "link" : typeIconName(p.type), 16)}</span>
+      <div class="stack"><span class="main">${esc(p.name)}</span><span class="sub">${esc((p.subscription ? "Подписка" : proxyTypeLabel(p.type)) + " · " + proxySub(p))}</span></div>
       <div class="paddr mono">${proxyAddrCell(p)}</div>
       <div class="checkcell">${badge(view.label, view.kind, true, view.detail || view.label)}${why}</div>
       <div class="row-actions">${acts}<button class="iconbtn" data-act="menu-proxy" data-i="${i}" type="button" aria-label="Ещё" title="Ещё">${icon("more")}</button></div>
@@ -545,9 +548,11 @@ function proxyTypeLabel(t) {
 }
 function proxyDialog() {
   const p = modal.draft;
-  const type = p.type || "socks5";
-  const types = [["socks5", "SOCKS5"], ["http", "HTTP"], ["vless", "VLESS"]];
+  const type = p.subscription ? "sub" : p.type || "socks5";
+  // A saved subscription stays one; the type of other proxies can change.
+  const types = p.subscription ? [["sub", "Подписка"]] : [["socks5", "SOCKS5"], ["http", "HTTP"], ["vless", "VLESS"], ["sub", "Подписка"]];
   const vless = type === "vless";
+  const sub = type === "sub";
   return `<div class="scrim"><form class="dialog${vless ? "" : " narrow"}" id="dlg">
     <h2>Прокси</h2><div class="dsub">${modal.index < 0 ? "Новый прокси" : "Изменение · " + esc(p.name || "")}</div>
     <div class="body">
@@ -555,12 +560,45 @@ function proxyDialog() {
       ${modal.nameError ? `<div class="field-err">${esc(modal.nameError)}</div>` : ""}
       <div style="height:14px"></div><label class="lbl">Тип</label>
       <div class="seg">${types.map(([v, n]) => `<button type="button" data-act="ptype" data-value="${v}" class="${type === v ? "on" : ""}">${n}</button>`).join("")}</div>
-      ${vless ? vlessFields(p) : socksFields(p)}
-      <div class="checkline"><button class="btn sm" type="button" data-act="probe-draft">${icon("refresh")}Проверить</button><span id="probe-out">${modal.checking ? badge("проверка…", "neu", true) : (modal.report ? probeBadge(modal.report, type) : "")}</span></div>
+      ${sub ? subFields(p) : vless ? vlessFields(p) : socksFields(p)}
+      ${sub ? "" : `<div class="checkline"><button class="btn sm" type="button" data-act="probe-draft">${icon("refresh")}Проверить</button><span id="probe-out">${modal.checking ? badge("проверка…", "neu", true) : (modal.report ? probeBadge(modal.report, type) : "")}</span></div>`}
       ${modal.realityError ? `<div class="field-err">${esc(modal.realityError)}</div>` : ""}
     </div>
-    <div class="footer"><button class="btn pri" type="submit">${modal.index < 0 ? "Добавить" : "Сохранить"}</button><button class="btn" type="button" data-act="cancel">Отмена</button></div>
+    <div class="footer"><button class="btn pri" type="submit"${modal.busy ? " disabled" : ""}>${modal.busy ? "Загружаю подписку…" : modal.index < 0 ? "Добавить" : "Сохранить"}</button><button class="btn" type="button" data-act="cancel">Отмена</button></div>
   </form></div>`;
+}
+// subFields is the subscription part of the proxy dialog. A saved one shows
+// only its host: the full URL carries a token and stays on the server.
+function subFields(p) {
+  if (p.subscription) {
+    const s = p.subscription;
+    return `<div style="height:14px"></div><label class="lbl">Подписка</label>
+      <div class="help">${esc(s.host || "")} · ${esc(serverWord(s.count || 0))} · ${esc(subUpdated(s))}</div>
+      <div class="help">Адрес хранится зашифрованным. Чтобы сменить его, удалите подписку и добавьте заново.</div>`;
+  }
+  return `<div style="height:14px"></div><label class="lbl">Ссылка подписки</label>
+      <div class="field${modal.subError ? " bad" : ""}"><input class="mono" id="p-suburl" value="${esc(p.subUrl || "")}" placeholder="https://…/sub/…"></div>
+      ${modal.subError ? `<div class="field-err">${esc(modal.subError)}</div>` : ""}
+      <div class="help">Подписка 3x-ui. Все серверы из неё — одна группа: XHTTP основной, RAW запасной, переключение само. Обновляется раз в сутки; адрес хранится зашифрованным.</div>`;
+}
+function serverWord(n) {
+  const m10 = n % 10;
+  const m100 = n % 100;
+  if (m10 === 1 && m100 !== 11) return n + " сервер";
+  if (m10 >= 2 && m10 <= 4 && (m100 < 12 || m100 > 14)) return n + " сервера";
+  return n + " серверов";
+}
+function subUpdated(s) {
+  if (!s.updatedAt) return "ещё не обновлялась";
+  const d = new Date(s.updatedAt);
+  return "обновлена " + d.toLocaleString("ru-RU", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" });
+}
+function refreshSub(name) {
+  if (DEMO || !name) return;
+  if (state.subs && state.subs[name]) state.subs[name].fetching = true;
+  fillProxies();
+  post("/api/subscription/refresh", { name }).then(() => { showToast("Подписка обновлена"); return refresh(); })
+    .catch((err) => { showToast(err.message); return refresh(); });
 }
 function socksFields(p) {
   return `<div style="height:14px"></div><label class="lbl">Адрес</label><div class="field${modal.addrError ? " bad" : ""}"><input class="mono" id="p-addr" value="${esc(p.address || "")}" placeholder="127.0.0.1:1080"></div>
@@ -601,7 +639,7 @@ function vlessLocal(p) {
       <label class="lbl">Локальный SOCKS5-порт</label>
       <div class="field${modal.portError ? " bad" : ""}"><input class="mono" id="p-socks" inputmode="numeric" placeholder="10808" value="${esc(port)}"></div>
       ${modal.portError ? `<div class="field-err">${esc(modal.portError)}</div>` : ""}
-      <div class="help">Пусто — случайный порт только для правил Ashgate. Число, например 10808 — обычный SOCKS5 на 127.0.0.1 для Dolphin и других программ. Слушает, пока открыто окно или работает служба, без «Старт». Следующий порт — HTTP. Только 127.0.0.1, в локальную сеть не открывается.</div>
+      <div class="help">Пусто — только для правил Ashgate: случайный порт и случайный логин при каждом запуске. Число, например 10808 — SOCKS5 на 127.0.0.1 для Dolphin и других программ, всегда с логином: если поля пусты, Ashgate придумает его при сохранении. Следующий порт — HTTP с тем же логином. Только 127.0.0.1, в локальную сеть не открывается; UDP через SOCKS5 выключен.</div>
       <div class="grid" style="margin-top:10px">
         <div><label class="lbl">Логин SOCKS5</label><div class="field"><input id="p-luser" value="${esc(p.localUser || "")}" placeholder="необязательно"></div></div>
         <div><label class="lbl">Пароль</label><div class="field"><input id="p-lpass" type="password" value="${esc(p.localPass || "")}" placeholder="необязательно"></div></div>
@@ -617,25 +655,46 @@ function socksPreviewHTML(p) {
   const live = (state && state.bridges && state.bridges[p.name]) || {};
   let mark = "wait";
   let text = "откроется после сохранения";
-  if (live.up && live.socks === socks) { mark = "ok"; text = "слушает"; }
+  if (live.up && live.published === socks) { mark = "ok"; text = "слушает"; }
   else if (live.error) { mark = "bad"; text = live.error; }
+  const user = p.localUser || live.user || "";
+  const pass = p.localUser ? p.localPass || "" : live.pass || "";
+  const loginRow = user ? `<div class="row"><span class="addr">${esc(user)} / ${esc(pass)}</span><button class="btn sm" type="button" data-act="copy-text" data-text="${esc(user + ":" + pass + "@" + socks)}">Копировать</button><span class="sub">логин / пароль</span></div>` : "";
   const httpRow = http ? `<div class="row"><span class="addr">${esc(http)}</span><button class="btn sm" type="button" data-act="copy-text" data-text="${esc(http)}">Копировать</button><span class="sub">HTTP</span></div>` : "";
   return `<div id="socks-preview" class="socks-pub">
       <div class="row"><span class="addr">${esc(socks)}</span><button class="btn sm" type="button" data-act="copy-text" data-text="${esc(socks)}">Копировать</button><span class="sockline"><i class="${mark}"></i><span class="sub">${esc(text)}</span></span></div>
       ${httpRow}
+      ${loginRow}
     </div>`;
 }
 function proxyAddrText(p) {
+  if (p.subscription) {
+    const v = (state && state.subs && state.subs[p.name]) || {};
+    return v.active || "нет серверов";
+  }
   if (p.type === "vless" && p.socksPort) return "127.0.0.1:" + p.socksPort;
   return p.address || "";
 }
+// subAddrCell shows a subscription: the active server and why it was
+// chosen, the last update or its error, and the «Обновить» button.
+function subAddrCell(p) {
+  const s = p.subscription || {};
+  const v = (state && state.subs && state.subs[p.name]) || {};
+  const err = v.error || s.error || "";
+  const status = v.fetching ? "обновляется…" : err ? "Ошибка обновления: " + err : subUpdated(s);
+  const why = v.reason ? `<div class="sub" title="${esc(v.reason)}">${esc(v.reason)}</div>` : "";
+  return `<div class="sockline" title="${esc(status)}"><i class="${err ? "bad" : v.active ? "ok" : "wait"}"></i><span>${esc(v.active || "нет серверов")}</span>
+      <button class="btn sm" type="button" data-act="sub-refresh" data-name="${esc(p.name)}"${v.fetching ? " disabled" : ""}>${icon("refresh", 14)}Обновить</button></div>
+    ${why}<div class="sub${err ? " warn" : ""}">${esc(status)}</div>`;
+}
 function proxyAddrCell(p) {
+  if (p.subscription) return subAddrCell(p);
   if (p.type === "vless" && p.socksPort) {
     const socks = "127.0.0.1:" + p.socksPort;
     const live = (state && state.bridges && state.bridges[p.name]) || {};
     let mark = "wait";
     let text = "не запущен";
-    if (live.up && live.socks === socks) { mark = "ok"; text = "слушает"; }
+    if (live.up && live.published === socks) { mark = "ok"; text = "слушает"; }
     else if (live.error) { mark = "bad"; text = live.error; }
     return `<div class="sockline" title="${esc(text)}"><i class="${mark}"></i><span>${esc(socks)}</span><button class="iconbtn" type="button" data-act="copy-text" data-text="${esc(socks)}" title="Копировать" aria-label="Копировать">${icon("copy", 14)}</button><span class="sub">${esc(text)}</span></div>`;
   }
@@ -657,7 +716,8 @@ function ruleWord(n) {
 function proxySub(p) {
   const n = (cfg().rules || []).filter((r) => r.proxy === p.name).length;
   const parts = [];
-  if (p.type === "vless" && p.vless) {
+  if (p.subscription) parts.push(serverWord(p.subscription.count || 0));
+  else if (p.type === "vless" && p.vless) {
     if (p.vless.network) parts.push(String(p.vless.network).toUpperCase());
     if (p.vless.security) parts.push(String(p.vless.security).toUpperCase());
   } else if (p.username) parts.push(p.username);
@@ -914,6 +974,8 @@ function readProxyDraft() {
   if (addr) modal.draft.address = addr.value.trim();
   const link = document.getElementById("p-link");
   if (link) modal.draft.link = link.value.trim();
+  const subUrl = document.getElementById("p-suburl");
+  if (subUrl) modal.draft.subUrl = subUrl.value.trim();
   const user = document.getElementById("p-user");
   if (user) modal.draft.username = user.value;
   const pass = document.getElementById("p-pass");
@@ -929,7 +991,7 @@ function readProxyDraft() {
   if (luser) modal.draft.localUser = luser.value.trim();
   const lpass = document.getElementById("p-lpass");
   if (lpass) modal.draft.localPass = lpass.value;
-  if (modal.draft.type === "vless") readVLESSFields();
+  if (modal.draft.type === "vless" && !modal.draft.subscription) readVLESSFields();
 }
 function readVLESSFields() {
   const v = modal.draft.vless || {};
@@ -997,7 +1059,8 @@ function parseVLESSJS(raw) {
     mode: (q.get("mode") || "").trim(), authority: (q.get("authority") || "").trim(),
     alpn: (q.get("alpn") || "").trim(), headerType: (q.get("headerType") || "").trim(),
   };
-  if (!vless.fp && (security === "reality" || security === "tls")) vless.fp = "chrome";
+  if (/^randomized/i.test(vless.fp)) vless.fp = "";
+  if (!vless.fp && (security === "reality" || security === "tls")) vless.fp = "firefox";
   if (security === "reality" && !vless.spx) vless.spx = "/";
   if (q.get("allowInsecure") === "1" || q.get("insecure") === "1") vless.allowInsecure = true;
   const extra = q.get("extra");
@@ -1070,13 +1133,20 @@ async function commitProxy() {
   readProxyDraft();
   modal.nameError = "";
   modal.addrError = "";
+  modal.subError = "";
   const p = modal.draft;
-  if (p.type === "vless") {
+  if (p.type === "sub" && !p.subscription) return commitSub(p);
+  if (p.subscription) {
+    // Only the name of a saved subscription changes here.
+  } else if (p.type === "vless") {
     try { await ensureVLESS(p); } catch (e) { modal.parseError = linkFail(e.message); renderModal(); return; }
     if (p.socksPort < 0 || p.socksPort > 65535) { showToast("Локальный SOCKS5-порт: число от 1 до 65535 или пусто"); return; }
     delete p.username;
     delete p.password;
     if (!p.socksPort) delete p.socksPort;
+    // A published port always has a login: make one up when the fields
+    // are empty, so it stays the same after a restart.
+    if (p.socksPort && !p.localUser) { p.localUser = "ashgate-" + randomHex(3); p.localPass = randomHex(12); }
     if (!p.localUser) delete p.localUser;
     if (!p.localPass) delete p.localPass;
     if (DEMO) {
@@ -1091,7 +1161,7 @@ async function commitProxy() {
     delete p.localUser;
     delete p.localPass;
   }
-  if (!p.address) {
+  if (!p.address && !p.subscription) {
     if (p.type === "vless") showToast("Вставьте ссылку VLESS");
     else { modal.addrError = "Укажите адрес: хост:порт, например 127.0.0.1:1080"; renderModal(); }
     return;
@@ -1123,6 +1193,39 @@ async function commitProxy() {
     renderModal();
   });
 }
+// commitSub adds a subscription: the server downloads it first (up to
+// 15 s) and adds nothing when that fails.
+async function commitSub(p) {
+  if (!p.subUrl) { modal.subError = "Вставьте ссылку подписки"; renderModal(); return; }
+  if (!/^https?:\/\//i.test(p.subUrl)) { modal.subError = "Ссылка должна начинаться с https:// или http://"; renderModal(); return; }
+  if (!p.name) p.name = uniqueProxyName("Подписка", -1);
+  if (!validProxyName(p.name)) { modal.nameError = NAME_RULE; renderModal(); return; }
+  if (uniqueProxyName(p.name, -1) !== p.name) { modal.nameError = "Прокси с таким именем уже есть."; renderModal(); return; }
+  if (DEMO) { showToast("Демонстрация: подписки не загружаются"); return; }
+  modal.busy = true;
+  renderModal();
+  const done = modal;
+  try {
+    await post("/api/subscription", { name: p.name, url: p.subUrl });
+    if (modal === done) modal = null;
+    built = "";
+    await refresh();
+    sel.proxy = (cfg().proxies || []).findIndex((x) => x.name === p.name);
+    showToast("Подписка добавлена");
+  } catch (e) {
+    if (modal !== done) return;
+    modal.busy = false;
+    const msg = e.message || "";
+    if (/^Имя прокси/i.test(msg)) modal.nameError = msg;
+    else modal.subError = msg;
+    renderModal();
+  }
+}
+function randomHex(bytes) {
+  const b = new Uint8Array(bytes);
+  crypto.getRandomValues(b);
+  return Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+}
 function linkFail(msg) {
   const rest = String(msg || "").replace(/^Не удалось разобрать ссылку VLESS:?\s*/i, "").trim();
   if (!rest || rest === String(msg || "").trim()) return "Ссылка не разобрана";
@@ -1147,6 +1250,17 @@ function dnsServer(s) {
   if (/^[0-9a-f]*:[0-9a-f:]*:[0-9a-f]*$/i.test(s) && !s.startsWith("[")) return "[" + s + "]:53";
   return s;
 }
+// cleanDomains turns pasted text into bare domains: "https://www.vk.com/feed"
+// and "*.vk.com" become "www.vk.com" and "vk.com"; duplicates go.
+function cleanDomains(text) {
+  const out = [];
+  for (let d of String(text || "").split(/[\s,;]+/)) {
+    d = d.trim().toLowerCase().replace(/^[a-z]+:\/\//, "").replace(/[\/?#].*$/, "").replace(/:\d+$/, "");
+    d = d.replace(/^\*?\.+/, "").replace(/\.+$/, "");
+    if (d && !out.includes(d)) out.push(d);
+  }
+  return out;
+}
 function readSettings() {
   const c = cfg();
   c.dns = c.dns || {};
@@ -1160,6 +1274,11 @@ function readSettings() {
   const udp = document.querySelector('[data-key="udp"].on');
   c.udpUnsupported = udp ? udp.dataset.value : "block";
   c.bypassPrivate = document.querySelector('[data-key="bypass"]').classList.contains("on");
+  const dd = document.getElementById("direct-domains");
+  if (dd) {
+    c.directDomains = cleanDomains(dd.value);
+    dd.value = c.directDomains.join("\n");
+  }
   c.killSwitch = document.querySelector('[data-key="kill"]').classList.contains("on");
   c.log = c.log || {};
   c.log.level = document.querySelector('[data-key="verbose"]').classList.contains("on") ? "debug" : "info";
@@ -1222,15 +1341,18 @@ function onClick(e) {
     return;
   }
   if (id === "proxy-add") return openProxy(-1);
+  if (id === "sub-refresh") return refreshSub(act.dataset.name || "");
   if (id === "proxy-edit") return openProxy(i);
   if (id === "proxy-del") return deleteProxy(i);
   if (id === "menu-proxy") {
     const name = cfg().proxies[i].name;
-    openMenu(e.clientX, e.clientY, [
+    const items = [
       { id: "edit", label: "Изменить", run: () => openProxy(i) },
       { id: "probe", label: "Проверить", run: () => probeNamed(name) },
       { id: "del", label: "Удалить", danger: true, run: () => deleteProxy(i) },
-    ]);
+    ];
+    if (cfg().proxies[i].subscription) items.splice(1, 0, { id: "sub-refresh", label: "Обновить подписку", run: () => refreshSub(name) });
+    openMenu(e.clientX, e.clientY, items);
     return;
   }
   if (id === "probe-all") {
@@ -1464,7 +1586,7 @@ function onSubmit(e) {
   const form = e.target.closest("#dlg");
   if (!form) return;
   e.preventDefault();
-  if (modal && modal.kind === "proxy") commitProxy();
+  if (modal && modal.kind === "proxy" && !modal.busy) commitProxy();
   else if (modal && AP_MODALS[modal.kind]) appsSubmit();
   else if (modal && modal.kind === "confirm") {
     const run = modal.run;
@@ -1525,7 +1647,7 @@ function bootChrome() {
   // Text and select settings save when the user finishes editing, not on
   // every keystroke: a half-typed DNS address used to pop an error.
   document.body.addEventListener("change", (e) => {
-    if (page === "settings" && e.target.closest(".page") && (e.target.id === "dns-servers" || e.target.id === "sys-proxy")) queueSettings();
+    if (page === "settings" && e.target.closest(".page") && (e.target.id === "dns-servers" || e.target.id === "sys-proxy" || e.target.id === "direct-domains")) queueSettings();
   });
   document.body.addEventListener("mouseover", (e) => {
     const n = e.target.closest("[data-err]");

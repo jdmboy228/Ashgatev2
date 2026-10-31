@@ -117,7 +117,7 @@ function apRouteText(action, proxy) {
   if (action === "direct") return { kind: "Напрямую", name: "" };
   if (action === "block") return { kind: "Блокировать", name: "" };
   const p = (cfg().proxies || []).find((x) => x.name === proxy);
-  return { kind: p ? proxyTypeLabel(p.type) : "Прокси", name: proxy || "не выбран" };
+  return { kind: p ? (p.subscription ? "Подписка" : proxyTypeLabel(p.type)) : "Прокси", name: proxy || "не выбран" };
 }
 // apRouteBadge is the route dropdown: type icon, proxy name (or «Напрямую»,
 // «Блокировать»), chevron. Type and endpoint are in the tooltip.
@@ -140,7 +140,7 @@ function apRoutePopover(target, action, proxy) {
     }
     const t = apRouteText(r.action, r.proxy);
     const name = r.p ? r.proxy : t.kind;
-    const sub = r.p ? `${proxyTypeLabel(r.p.type)} · ${proxyAddrText(r.p)}` : r.action === "direct" ? "без прокси" : "трафик отбрасывается";
+    const sub = r.p ? `${(r.p.subscription ? "Подписка" : proxyTypeLabel(r.p.type))} · ${proxyAddrText(r.p)}` : r.action === "direct" ? "без прокси" : "трафик отбрасывается";
     return `<button type="button" class="${on ? "on" : ""}" data-act="ap-route-set" data-target="${esc(target)}" data-action="${r.action}" data-proxy="${esc(r.proxy)}"><span class="ri k-${apRouteKind(r.action, r.p)}">${apRouteIcon(r.action, r.p)}</span><span class="txt"><span class="nm">${esc(name)}</span><span class="sub">${esc(sub)}</span></span><span class="end">${side}${on ? icon("check", 14) : ""}</span></button>`;
   }).join("");
   const title = target.startsWith("g:") ? "Назначить прокси группе" : "Назначить прокси";
@@ -598,7 +598,7 @@ function apDefaultRoute() {
 function apRouteSelect(id, action, proxy) {
   const opts = apRoutes().map((r) => {
     const v = r.action + ":" + r.proxy;
-    const label = r.p ? `${r.proxy} · ${proxyTypeLabel(r.p.type)} · ${proxyAddrText(r.p)}` : apRouteText(r.action, "").kind;
+    const label = r.p ? `${r.proxy} · ${(r.p.subscription ? "Подписка" : proxyTypeLabel(r.p.type))} · ${proxyAddrText(r.p)}` : apRouteText(r.action, "").kind;
     const on = r.action === action && (r.action !== "proxy" || r.proxy === proxy);
     return `<option value="${esc(v)}"${on ? " selected" : ""}>${esc(label)}</option>`;
   }).join("");

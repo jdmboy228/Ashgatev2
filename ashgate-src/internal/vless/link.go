@@ -192,8 +192,15 @@ func (p *Params) Normalize() error {
 		p.Flow = ""
 	}
 	if p.Security == "reality" || p.Security == "tls" {
-		if p.Fingerprint == "" {
-			p.Fingerprint = "chrome"
+		// Firefox by default. "randomized" builds a ClientHello no real
+		// browser sends, which stands out; Ashgate uses Firefox instead.
+		// "random" stays: Xray picks one real browser per run, so the
+		// fingerprint changes only between sessions.
+		switch fp := strings.ToLower(strings.TrimSpace(p.Fingerprint)); fp {
+		case "", "randomized", "randomizednoalpn":
+			p.Fingerprint = "firefox"
+		default:
+			p.Fingerprint = fp
 		}
 	}
 	if p.Security == "reality" {
