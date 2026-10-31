@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 	"unsafe"
@@ -201,13 +202,14 @@ type Window struct {
 	Rect    [4]int32
 }
 
-// Windows lists the top-level windows of pid (all pids when pid is 0).
-func Windows(pid uint32) []Window {
-	var out []Window
-	cb := syscall.NewCallback(func(h windows.HWND, _ uintptr) uintptr {
+var (
+	enumMu   sync.Mutex
+	enumPID  uint32
+	enumOut  []Window
+	enumProc = syscall.NewCallback(func(h windows.HWND, _ uintptr) uintptr {
 		var p uint32
 		_, _ = windows.GetWindowThreadProcessId(h, &p)
-		if pid != 0 && p != pid {
+		if enumPID != 0 && p != enumPID {
 			return 1
 		}
 		w := Window{HWND: h, PID: p, Visible: windows.IsWindowVisible(h)}
@@ -221,10 +223,21 @@ func Windows(pid uint32) []Window {
 		r, _, _ := pIsIconic.Call(uintptr(h))
 		w.Iconic = r != 0
 		pGetWindowRect.Call(uintptr(h), uintptr(unsafe.Pointer(&w.Rect)))
-		out = append(out, w)
+		enumOut = append(enumOut, w)
 		return 1
 	})
-	_ = windows.EnumWindows(cb, nil)
+)
+
+// Windows lists the top-level windows of pid (all pids when pid is 0).
+// One callback serves every call: Go allows only a limited number of
+// syscall.NewCallback per process.
+func Windows(pid uint32) []Window {
+	enumMu.Lock()
+	defer enumMu.Unlock()
+	enumPID, enumOut = pid, nil
+	_ = windows.EnumWindows(enumProc, nil)
+	out := enumOut
+	enumOut = nil
 	return out
 }
 

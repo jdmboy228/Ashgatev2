@@ -82,7 +82,7 @@ jobs:
           go build -o "$env:E2E_BIN\test2json.exe" cmd/test2json
           if ($LASTEXITCODE) { exit 1 }
           $env:GOBIN = $env:E2E_BIN
-          go install gotest.tools/gotestsum@v1.12.0
+          go install gotest.tools/gotestsum@v1.13.0
           if ($LASTEXITCODE) { exit 1 }
       - uses: actions/upload-artifact@v4
         with:
@@ -124,7 +124,8 @@ jobs:
         env:
           CGO_ENABLED: "1"
         run: |
-          go install gotest.tools/gotestsum@v1.12.0
+          go install gotest.tools/gotestsum@v1.13.0
+          if ($LASTEXITCODE) { exit 1 }
           $gts = Join-Path (go env GOPATH) 'bin\gotestsum.exe'
           New-Item -ItemType Directory -Force "$env:E2E_OUT\unit" | Out-Null
           & $gts --junitfile "$env:E2E_OUT\unit\junit-race.xml" --format testname -- -race -count=1 ./...
