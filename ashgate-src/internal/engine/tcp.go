@@ -15,9 +15,12 @@ import (
 )
 
 type tcpFlow struct {
-	ver      int
-	app      packet.Addr
-	orig     packet.Addr
+	ver  int
+	app  packet.Addr
+	orig packet.Addr
+	// dial, when set, is where the proxy connects instead of orig (DNS
+	// over TCP goes to the configured servers).
+	dial     packet.Addr
 	alloc    uint16
 	release  func()
 	proxy    config.Proxy
@@ -68,8 +71,12 @@ func (e *Engine) serveFlow(conn net.Conn, flow *tcpFlow) {
 	defer conn.Close()
 	defer e.finishTCP(flow)
 
+	target := flow.orig
+	if !flow.dial.IsZero() {
+		target = flow.dial
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	upstream, err := e.dial.DialTCP(ctx, flow.proxy, flow.orig.NetIP().String(), flow.orig.Port)
+	upstream, err := e.dial.DialTCP(ctx, flow.proxy, target.NetIP().String(), target.Port)
 	cancel()
 	if err != nil {
 		flow.stat.fail(err.Error(), e.now())

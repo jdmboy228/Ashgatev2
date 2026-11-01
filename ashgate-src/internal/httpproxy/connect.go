@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"ashgate/internal/bootstrap"
 	"ashgate/internal/config"
 )
 
@@ -145,9 +146,13 @@ func readStatus(r io.Reader) (int, string, error) {
 	return code, text, nil
 }
 
+// dialProxy connects to the proxy. A proxy given by host name is looked up
+// with DoH, not the Windows DNS client: Ashgate sends that client's lookups
+// through the tunnel, possibly through this very proxy.
 func dialProxy(ctx context.Context, address string) (net.Conn, error) {
-	d := net.Dialer{Timeout: 15 * time.Second}
-	return d.DialContext(ctx, "tcp", address)
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	return bootstrap.Dial(ctx, "tcp", address)
 }
 
 func deadline(ctx context.Context, fallback time.Duration) time.Time {

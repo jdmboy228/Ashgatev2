@@ -17,6 +17,7 @@ import (
 	"unsafe"
 
 	"ashgate/internal/autostart"
+	"ashgate/internal/bootstrap"
 	"ashgate/internal/config"
 	"ashgate/internal/killswitch"
 	"ashgate/internal/logbuf"
@@ -75,6 +76,7 @@ func Run(configPath string, startCapture bool) error {
 		alert(err.Error())
 		return err
 	}
+	bootstrap.Default.SetFile(bootstrap.CacheFile(configPath))
 	// After an update (ashgate quit) capture comes back as it was. Read
 	// after LoadOrInit, which locks down the shared folder first.
 	if consumeResume(configPath) {

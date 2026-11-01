@@ -9,7 +9,6 @@ import (
 
 	"ashgate/internal/config"
 	"ashgate/internal/dialer"
-	"ashgate/internal/httpproxy"
 	"ashgate/internal/logbuf"
 	"ashgate/internal/packet"
 	"ashgate/internal/rules"
@@ -31,7 +30,10 @@ type udpFlow struct {
 	closed bool
 	parent string
 	stat   *ruleStat
-	sess   dialer.Session
+	// sys marks system DNS (see dns.go): split by name per packet, and
+	// DNS over TCP through SOCKS5.
+	sys  bool
+	sess dialer.Session
 	// failedAt is the last failed DialUDP. While the proxy is down, packets
 	// within udpRetry of it are dropped instead of each starting a new
 	// association and logging another error.
@@ -60,36 +62,19 @@ func (e *Engine) ForwardUDP(ctx context.Context, d UDPDatagram) error {
 		return nil
 	}
 	flow.touch(e.now())
-	if flow.proxy.Type == "http" {
+	if flow.proxy.Type == "http" || (flow.sys && flow.proxy.Type == "socks5") {
 		select {
 		case e.dnsSem <- struct{}{}:
 			go func() {
 				defer func() { <-e.dnsSem }()
-				_ = e.forwardHTTPDns(ctx, flow, d.Payload)
+				_ = e.forwardDNSTCP(ctx, flow, d.Payload)
 			}()
 			return nil
 		default:
-			return e.forwardHTTPDns(ctx, flow, d.Payload)
+			return e.forwardDNSTCP(ctx, flow, d.Payload)
 		}
 	}
 	return e.forwardSOCKS(ctx, flow, d)
-}
-
-func (e *Engine) forwardHTTPDns(ctx context.Context, flow *udpFlow, payload []byte) error {
-	server := flow.relay.String()
-	resp, err := httpproxy.DNSQuery(ctx, flow.proxy, server, payload)
-	if err != nil {
-		flow.stat.fail(err.Error(), e.now())
-		e.log(logbuf.Event{Process: display(flow.proc), PID: flow.proc.PID, Proto: "UDP", Dest: flow.orig.String(), Via: flow.proxy.Name, Status: "error", Error: err.Error()})
-		return err
-	}
-	n := int64(len(resp))
-	flow.down.Add(n)
-	e.bytesDown.Add(n)
-	if flow.stat != nil {
-		flow.stat.down.Add(n)
-	}
-	return e.injectUDP(flow, resp)
 }
 
 func (e *Engine) forwardSOCKS(ctx context.Context, flow *udpFlow, d UDPDatagram) error {
@@ -100,6 +85,7 @@ func (e *Engine) forwardSOCKS(ctx context.Context, flow *udpFlow, d UDPDatagram)
 	}
 	if flow.sess == nil {
 		if !flow.failedAt.IsZero() && e.now().Sub(flow.failedAt) < udpRetry {
+			e.failDNS(flow, d.Payload)
 			return nil
 		}
 		sess, err := e.dial.DialUDP(ctx, flow.proxy)
@@ -107,6 +93,7 @@ func (e *Engine) forwardSOCKS(ctx context.Context, flow *udpFlow, d UDPDatagram)
 			flow.stat.fail(err.Error(), e.now())
 			flow.failedAt = e.now()
 			e.log(logbuf.Event{Process: display(flow.proc), PID: flow.proc.PID, Proto: "UDP", Dest: flow.orig.String(), Via: flow.proxy.Name, Status: "error", Error: err.Error()})
+			e.failDNS(flow, d.Payload)
 			return err
 		}
 		flow.sess = sess
@@ -115,6 +102,7 @@ func (e *Engine) forwardSOCKS(ctx context.Context, flow *udpFlow, d UDPDatagram)
 	dst := &net.UDPAddr{IP: flow.relay.NetIP(), Port: int(flow.relay.Port)}
 	if err := flow.sess.Send(ctx, dst, d.Payload); err != nil {
 		e.log(logbuf.Event{Process: display(flow.proc), PID: flow.proc.PID, Proto: "UDP", Dest: flow.orig.String(), Via: flow.proxy.Name, Status: "error", Error: err.Error()})
+		e.failDNS(flow, d.Payload)
 		return err
 	}
 	return nil

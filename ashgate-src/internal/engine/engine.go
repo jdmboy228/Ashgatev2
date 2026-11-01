@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"ashgate/internal/bootstrap"
 	"ashgate/internal/config"
 	"ashgate/internal/dialer"
 	"ashgate/internal/logbuf"
@@ -175,6 +176,12 @@ type snapshot struct {
 	relay6         packet.Addr
 	// ruleKeys maps a rule index to its RuleKey.
 	ruleKeys []string
+	// dnsServers is where proxied queries go (dns.servers or defaults).
+	dnsServers []string
+	// sysProxy carries system DNS (see dns.go); nil leaves it alone.
+	sysProxy *config.Proxy
+	// bypassNames resolve with the provider's DNS even in system DNS.
+	bypassNames nameSet
 }
 
 // New compiles cfg and returns an engine. The relay addresses come from cfg.
@@ -291,8 +298,11 @@ func (e *Engine) Traffic() (up, down int64) {
 	return e.bytesUp.Load(), e.bytesDown.Load()
 }
 
-// lookupIP resolves proxy host names; tests count the calls.
-var lookupIP = net.DefaultResolver.LookupIP
+// lookupIP resolves proxy host names with DoH (see internal/bootstrap), so
+// the provider's DNS never sees them; tests count the calls.
+var lookupIP = func(ctx context.Context, _, host string) ([]net.IP, error) {
+	return bootstrap.Default.LookupIP(ctx, host)
+}
 
 // RefreshBypass resolves proxy hostnames so traffic to the proxy itself stays direct.
 func (e *Engine) RefreshBypass(ctx context.Context) {
@@ -340,7 +350,7 @@ func compile(cfg *config.Config) (*snapshot, error) {
 	for _, p := range cfg.Proxies {
 		proxies[p.Name] = p
 	}
-	return &snapshot{
+	snap := &snapshot{
 		rules:          rules.Compile(cfg.EffectiveRules()),
 		proxies:        proxies,
 		dns:            cfg.DNS,
@@ -349,7 +359,13 @@ func compile(cfg *config.Config) (*snapshot, error) {
 		relay4:         r4,
 		relay6:         r6,
 		ruleKeys:       keys,
-	}, nil
+		dnsServers:     cfg.DNS.ProxyDNSServers(),
+		bypassNames:    newNameSet(cfg.BypassDomains()),
+	}
+	if p, ok := systemProxy(cfg, proxies); ok {
+		snap.sysProxy = &p
+	}
+	return snap, nil
 }
 
 func parseRelay(addr string, ver int) (packet.Addr, error) {
@@ -454,6 +470,12 @@ func (e *Engine) fastPath(pkt []byte, h *packet.Header) (Result, bool) {
 				e.dropFragment(h)
 				return Result{Action: ActionDrop}, true
 			}
+			if flow.sys {
+				// One socket of the DNS client may ask for a bypass name next.
+				if name, _, _, ok := question(payloadOf(pkt, h)); ok && snap.bypassNames.bypass(name) {
+					return Result{Action: ActionPass}, true
+				}
+			}
 			flow.touch(e.now())
 			n := int64(h.PayloadLen)
 			flow.up.Add(n)
@@ -479,15 +501,23 @@ func (e *Engine) decide(pkt []byte, h *packet.Header, meta Meta, proc rules.Proc
 	if h.Frag && h.PayloadOff == 0 {
 		return Result{Action: ActionPass}
 	}
-	// DNS is never exempt as a private destination: a proxied app asking
-	// the router (192.168.1.1:53) would leak its names outside the tunnel.
-	if e.destinationBypass(h.Dst, snap.bypassPrivate && h.Dst.Port != 53) {
-		e.rememberDirect(h)
+	// DNS is never exempt as a private or link-local destination: a
+	// proxied app asking the router (192.168.1.1:53, fe80::1:53) would leak
+	// its names outside the tunnel. Direct UDP DNS is not cached either: a
+	// port another program used a moment ago must not pass a routed
+	// program's query.
+	dns := h.Dst.Port == 53
+	if e.destinationBypass(h.Dst, snap.bypassPrivate && !dns, dns) {
+		e.rememberDirectExceptDNS(h)
 		return Result{Action: ActionPass}
 	}
 	if !found {
 		if !final && (h.Proto == packet.ProtoUDP || h.Proto == packet.ProtoTCP) {
 			return Result{Action: ActionUnknown}
+		}
+		if dns {
+			// Any program may have sent it, a routed one included.
+			return e.systemDNS(pkt, h, meta, rules.Process{}, snap)
 		}
 		if h.Proto == packet.ProtoTCP && !(h.SYN && !h.ACK) {
 			// A mid-connection packet with no process behind it: the app
@@ -502,7 +532,7 @@ func (e *Engine) decide(pkt []byte, h *packet.Header, meta Meta, proc rules.Proc
 		return Result{Action: ActionPass}
 	}
 	if e.selfPID != 0 && proc.PID == e.selfPID {
-		e.rememberDirect(h)
+		e.rememberDirectExceptDNS(h)
 		return Result{Action: ActionPass}
 	}
 
@@ -514,13 +544,12 @@ func (e *Engine) decide(pkt []byte, h *packet.Header, meta Meta, proc rules.Proc
 	}
 	proxyName := dec.Proxy
 	action := dec.Action
-	if action == "" && h.Dst.Port == 53 && snap.dns.IncludeSystemResolver && rules.IsSystemDNS(proc.Name) {
-		action = "proxy"
-		proxyName = snap.dns.SystemResolverProxy
+	if action == "" && dns && rules.IsSystemDNS(proc.Name) {
+		return e.systemDNS(pkt, h, meta, proc, snap)
 	}
 	switch action {
 	case "direct":
-		e.rememberDirect(h)
+		e.rememberDirectExceptDNS(h)
 		e.log(logbuf.Event{
 			Process: display(proc),
 			PID:     proc.PID,
@@ -558,7 +587,7 @@ func (e *Engine) decide(pkt []byte, h *packet.Header, meta Meta, proc rules.Proc
 				e.rememberDirect(h)
 				return Result{Action: ActionPass}
 			}
-			return e.startTCP(pkt, h, meta, proc, p, snap, parent, stat)
+			return e.startTCP(pkt, h, meta, proc, p, snap, parent, stat, false)
 		}
 		if dec.TCPOnly && h.Dst.Port != 53 {
 			// "Only TCP": drop UDP so QUIC and the like fall back to TCP,
@@ -568,14 +597,15 @@ func (e *Engine) decide(pkt []byte, h *packet.Header, meta Meta, proc rules.Proc
 			e.log(logbuf.Event{Process: display(proc), PID: proc.PID, Proto: "UDP", Dest: h.Dst.String(), Via: p.Name, Status: "blocked", Error: "только TCP: UDP отброшен", Parent: parent})
 			return Result{Action: ActionDrop}
 		}
-		return e.startUDP(pkt, h, meta, proc, p, snap, parent, stat, dec.KillSwitch)
+		return e.startUDP(pkt, h, meta, proc, p, snap, parent, stat, dec.KillSwitch, false)
 	default:
-		e.rememberDirect(h)
+		e.rememberDirectExceptDNS(h)
 		return Result{Action: ActionPass}
 	}
 }
 
-func (e *Engine) startTCP(pkt []byte, h *packet.Header, meta Meta, proc rules.Process, p config.Proxy, snap *snapshot, parent string, stat *ruleStat) Result {
+// startTCP maps a new connection to the relay. sys marks system DNS.
+func (e *Engine) startTCP(pkt []byte, h *packet.Header, meta Meta, proc rules.Process, p config.Proxy, snap *snapshot, parent string, stat *ruleStat, sys bool) Result {
 	if h.Frag {
 		e.dropFragment(h)
 		e.log(logbuf.Event{Process: display(proc), PID: proc.PID, Proto: "TCP", Dest: h.Dst.String(), Via: p.Name, Status: "blocked", Error: "fragmented tcp dropped"})
@@ -600,6 +630,13 @@ func (e *Engine) startTCP(pkt []byte, h *packet.Header, meta Meta, proc rules.Pr
 		live:     true,
 		parent:   parent,
 		stat:     stat,
+	}
+	if h.Dst.Port == 53 && (snap.dns.Mode == "proxy" || sys) {
+		// DNS over TCP goes to the configured servers like UDP does, not
+		// to the resolver the program chose (the provider's).
+		if alt, ok := e.pickDNS(snap); ok {
+			flow.dial = alt
+		}
 	}
 	if stat != nil {
 		stat.flows.Add(1)
@@ -626,7 +663,8 @@ func (e *Engine) resetExisting(h *packet.Header, meta Meta, proc rules.Process, 
 	return Result{Action: ActionDrop}
 }
 
-func (e *Engine) startUDP(pkt []byte, h *packet.Header, meta Meta, proc rules.Process, p config.Proxy, snap *snapshot, parent string, stat *ruleStat, killSwitch bool) Result {
+// startUDP opens a proxied UDP flow. sys marks system DNS (see dns.go).
+func (e *Engine) startUDP(pkt []byte, h *packet.Header, meta Meta, proc rules.Process, p config.Proxy, snap *snapshot, parent string, stat *ruleStat, killSwitch, sys bool) Result {
 	key := udpKey{Src: h.Src, Dst: h.Dst}
 	if h.Frag {
 		e.blockUDP.add(key)
@@ -645,7 +683,7 @@ func (e *Engine) startUDP(pkt []byte, h *packet.Header, meta Meta, proc rules.Pr
 		return Result{Action: ActionDrop}
 	}
 	relay := h.Dst
-	if h.Dst.Port == 53 && snap.dns.Mode == "proxy" {
+	if h.Dst.Port == 53 && (snap.dns.Mode == "proxy" || sys) {
 		if alt, ok := e.pickDNS(snap); ok {
 			relay = alt
 		}
@@ -662,6 +700,7 @@ func (e *Engine) startUDP(pkt []byte, h *packet.Header, meta Meta, proc rules.Pr
 		live:   true,
 		parent: parent,
 		stat:   stat,
+		sys:    sys,
 	}
 	if stat != nil {
 		stat.flows.Add(1)
@@ -678,24 +717,7 @@ func (e *Engine) startUDP(pkt []byte, h *packet.Header, meta Meta, proc rules.Pr
 }
 
 func (e *Engine) pickDNS(snap *snapshot) (packet.Addr, bool) {
-	if len(snap.dns.Servers) == 0 {
-		return packet.Addr{}, false
-	}
-	n := e.dnsRR.Add(1)
-	s := snap.dns.Servers[int(n)%len(snap.dns.Servers)]
-	host, portStr, err := net.SplitHostPort(s)
-	if err != nil {
-		return packet.Addr{}, false
-	}
-	port, err := net.LookupPort("udp", portStr)
-	if err != nil {
-		return packet.Addr{}, false
-	}
-	ip := net.ParseIP(host)
-	if ip == nil {
-		return packet.Addr{}, false
-	}
-	return packet.FromIP(ip, uint16(port)), true
+	return dnsRelay(snap.dnsServers, e.dnsRR.Add(1))
 }
 
 func datagram(pkt []byte, h *packet.Header, f *udpFlow) *UDPDatagram {
@@ -765,6 +787,15 @@ func (e *Engine) rememberDirect(h *packet.Header) {
 	e.directUDP.add(udpKey{Src: h.Src, Dst: h.Dst})
 }
 
+// rememberDirectExceptDNS is rememberDirect for anything but UDP to port
+// 53. A DNS socket's port is soon another program's, and the cache is keyed
+// by address. TCP is safe: a new connection's SYN clears the entry.
+func (e *Engine) rememberDirectExceptDNS(h *packet.Header) {
+	if h.Proto != packet.ProtoUDP || h.Dst.Port != 53 {
+		e.rememberDirect(h)
+	}
+}
+
 func (e *Engine) rememberBlock(h *packet.Header) {
 	if h.Proto == packet.ProtoTCP {
 		e.blockTCP.add(h.Src)
@@ -773,8 +804,11 @@ func (e *Engine) rememberBlock(h *packet.Header) {
 	e.blockUDP.add(udpKey{Src: h.Src, Dst: h.Dst})
 }
 
-func (e *Engine) destinationBypass(dst packet.Addr, private bool) bool {
-	if packet.Loopback(dst) || packet.MulticastOrBroadcast(dst) || packet.LinkLocal(dst) {
+func (e *Engine) destinationBypass(dst packet.Addr, private, dns bool) bool {
+	if packet.Loopback(dst) || packet.MulticastOrBroadcast(dst) {
+		return true
+	}
+	if packet.LinkLocal(dst) && !dns {
 		return true
 	}
 	if private && packet.Private(dst) {
@@ -793,7 +827,7 @@ func (e *Engine) log(ev logbuf.Event) {
 	if e.logs == nil {
 		return
 	}
-	if !e.verbose && ev.Proto == "UDP" && (ev.Status == "open" || ev.Status == "closed") && strings.HasSuffix(ev.Dest, ":53") {
+	if !e.verbose && ev.Proto == "UDP" && (ev.Status == "open" || ev.Status == "closed" || ev.Status == "direct") && strings.HasSuffix(ev.Dest, ":53") {
 		return
 	}
 	if ev.Time.IsZero() {

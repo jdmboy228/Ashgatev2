@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"ashgate/internal/bootstrap"
 	"ashgate/internal/config"
 	"ashgate/internal/failover"
 	"ashgate/internal/logbuf"
@@ -288,8 +289,10 @@ func (c *controller) fetchSub(name string) error {
 	return c.subApply(name, url, entries, now)
 }
 
+// directClient is the one direct try. The host is looked up with DoH, not
+// the provider's DNS (the TLS name still shows it; the tunnel hides both).
 func directClient() *http.Client {
-	return &http.Client{Transport: &http.Transport{Proxy: nil, ForceAttemptHTTP2: true}}
+	return &http.Client{Transport: &http.Transport{Proxy: nil, ForceAttemptHTTP2: true, DialContext: bootstrap.Dial}}
 }
 
 // tunnelClient sends requests through a bridge's private inbound. Host
