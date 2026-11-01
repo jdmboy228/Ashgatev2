@@ -145,25 +145,24 @@ func TestLeaks(t *testing.T) {
 		tun := "g" + harness.RandHex(5) + ".e2e-tunnel.example.com"
 		dir := "x" + harness.RandHex(5) + ".e2e-direct.example.com"
 		ru := "e2e-" + harness.RandHex(6) + ".ru"
-		local := "l" + harness.RandHex(5) + ".test"
 		ctl := "c" + harness.RandHex(5) + ".e2e-tunnel.example.com"
 		since := time.Now()
-		var rTun, rDir, rRU, rLocal, rCtl harness.ClientResult
-		var localTook time.Duration
+		var rTun, rDir, rRU, rLoop, rCtl harness.ClientResult
+		var loopTook time.Duration
 		pkts, _ := phase(t, "getaddrinfo", func() {
 			rTun = harness.RunClient(s.Client, "lookup", "-name", tun, "-timeout", "15s")
 			rDir = harness.RunClient(s.Client, "lookup", "-name", dir, "-timeout", "15s")
 			rRU = harness.RunClient(s.Client, "lookup", "-name", ru, "-timeout", "15s")
-			// Xray gives .test (like dotless and .lan names) to the system
-			// resolver: it must come back, not loop svchost → Xray → svchost.
+			// The app's own query for a bypass name: Xray asks Windows, and
+			// Windows' query must go to the provider, not loop back to Xray.
 			start := time.Now()
-			rLocal = harness.RunClient(s.Client, "dns", "-server", "1.1.1.1:53", "-name", local, "-timeout", "8s")
-			localTook = time.Since(start)
+			rLoop = harness.RunClient(s.Client, "dns", "-server", "1.1.1.1:53", "-name", "ya.ru", "-timeout", "8s")
+			loopTook = time.Since(start)
 			// An app without a rule keeps its own DNS.
 			rCtl = harness.RunClient(s.Direct, "dns", "-server", "1.1.1.1:53", "-name", ctl, "-timeout", "4s")
 			time.Sleep(time.Second)
 		})
-		t.Logf("getaddrinfo: tunnel %s / direct %s / ru %s; .test %s in %s; control %s", rTun, rDir, rRU, rLocal, localTook.Round(time.Millisecond), rCtl)
+		t.Logf("getaddrinfo: tunnel %s / direct %s / ru %s; ya.ru via Xray %s in %s; control %s", rTun, rDir, rRU, rLoop, loopTook.Round(time.Millisecond), rCtl)
 		if leak := harness.Filter(pkts, harness.DNSFor(tun)); len(leak) > 0 {
 			t.Errorf("getaddrinfo of a routed app left the machine in plain text (Windows DNS client):%s", harness.Brief(leak, 5))
 		}
@@ -173,8 +172,8 @@ func TestLeaks(t *testing.T) {
 		if len(harness.Filter(pkts, harness.DNSFor(ru))) == 0 {
 			t.Errorf("%s (.ru) did not go to the provider's DNS", ru)
 		}
-		if !rLocal.OK {
-			t.Errorf("%s got no answer in %s: %s", local, localTook.Round(time.Millisecond), rLocal)
+		if !rLoop.OK || !strings.Contains(rLoop.Answer, "rcode=0") || strings.Contains(rLoop.Answer, "answers=0") {
+			t.Errorf("ya.ru through Xray's DNS got no address in %s: %s (svchost → Ashgate → Xray → svchost loop?)", loopTook.Round(time.Millisecond), rLoop)
 		}
 		if len(harness.Filter(pkts, harness.DNSFor(ctl))) == 0 {
 			t.Errorf("an app without a rule: its own DNS query did not go direct")

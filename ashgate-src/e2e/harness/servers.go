@@ -320,8 +320,10 @@ func StartFixture(env *Env) (*Fixture, error) {
 				map[string]any{"type": "field", "domain": []string{"full:www.gstatic.com"}, "outboundTag": "health"},
 				map[string]any{"type": "field", "ip": []string{TestNet4.String(), "2001:db8::/32"}, "outboundTag": "target"},
 				map[string]any{"type": "field", "ip": []string{"127.0.0.0/8", "::1/128"}, "outboundTag": "local"},
-				// 443: DoH; 53: other query types, which Ashgate sends as they are.
-				map[string]any{"type": "field", "ip": DoHIPs, "port": "53,443", "outboundTag": "internet"},
+				// DoH only. Port 53 (other query types, sent as they are) stays
+				// closed: from this machine such a query would show on the card
+				// in plain text, while a real VPS sends it from far away.
+				map[string]any{"type": "field", "ip": DoHIPs, "port": "443", "outboundTag": "internet"},
 			},
 		},
 	}
