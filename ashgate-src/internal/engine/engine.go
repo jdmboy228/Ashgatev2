@@ -486,8 +486,17 @@ func (e *Engine) decide(pkt []byte, h *packet.Header, meta Meta, proc rules.Proc
 		return Result{Action: ActionPass}
 	}
 	if !found {
-		if !final && (h.Proto == packet.ProtoUDP || (h.SYN && !h.ACK)) {
+		if !final && (h.Proto == packet.ProtoUDP || h.Proto == packet.ProtoTCP) {
 			return Result{Action: ActionUnknown}
+		}
+		if h.Proto == packet.ProtoTCP && !(h.SYN && !h.ACK) {
+			// A mid-connection packet with no process behind it: the app
+			// exited and Windows still closes its socket (keepalives, the
+			// last FIN/ACK). If that connection was proxied before a restart
+			// of capture, passing it would put the app's own address on the
+			// wire. A dead socket loses nothing by being dropped.
+			e.rememberBlock(h)
+			return Result{Action: ActionDrop}
 		}
 		e.rememberDirect(h)
 		return Result{Action: ActionPass}

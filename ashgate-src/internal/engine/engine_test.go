@@ -301,6 +301,30 @@ func TestUnknownThenPass(t *testing.T) {
 	}
 }
 
+// After capture restarts (a crash), a socket whose app has exited may still
+// send keepalives or its last FIN/ACK. Its owner is gone, the new engine
+// does not know the flow was proxied: the packet must not leave directly.
+func TestOwnerlessMidConnectionPacketIsDropped(t *testing.T) {
+	e, _ := newEngine(t, testConfig(), fixedRes{}, &fakeDial{}, nil)
+	src, dst := packet.V4(10, 0, 0, 9, 2300), packet.V4(198, 51, 100, 10, 443)
+	ack, _ := packet.BuildTCP(src, dst, 0x10)
+	if r := e.HandlePacket(append([]byte(nil), ack...), Meta{}, false); r.Action != ActionUnknown {
+		t.Fatalf("first try went %v, want a hold for the owner lookup", r.Action)
+	}
+	if r := e.HandlePacket(ack, Meta{}, true); r.Action != ActionDrop {
+		t.Fatalf("ownerless ACK went %v", r.Action)
+	}
+	again, _ := packet.BuildTCP(src, dst, 0x11)
+	if r := e.HandlePacket(again, Meta{}, true); r.Action != ActionDrop {
+		t.Fatalf("next packet of that socket went %v", r.Action)
+	}
+	// A new connection from the same port is decided afresh.
+	syn, _ := packet.BuildTCP(src, dst, 0x02)
+	if r := e.HandlePacket(syn, Meta{}, true); r.Action != ActionPass {
+		t.Fatalf("new SYN went %v", r.Action)
+	}
+}
+
 func TestLoopbackNotProxied(t *testing.T) {
 	e, _ := newEngine(t, testConfig(), fixedRes{p: rules.Process{PID: 1, Name: "curl.exe"}, ok: true}, &fakeDial{}, nil)
 	pkt, err := packet.BuildTCP(packet.V4(10, 0, 0, 1, 50), packet.V4(127, 0, 0, 1, 80), 0x02)
