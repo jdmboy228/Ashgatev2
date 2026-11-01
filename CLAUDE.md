@@ -22,6 +22,10 @@ The app is in `ashgate-src/` (Go module `ashgate`). The installer is `installer.
 - Green on version 0.9.1: push run 41315227236, and the long workflow_dispatch run 41316470292
   (failover back to XHTTP after 1204 s, 10-minute stability and growth). All 8 jobs pass.
 - App bugs found and fixed are in `ashgate-src/CHANGELOG.md` under 0.9.1.
+- 0.9.2 (branch `dns-leaks`, PR #1): DNS never reaches the provider for routed apps (Windows DNS
+  client through the tunnel except .ru/.рф/.su and bypass names, DoH for Ashgate's own lookups).
+  Push run 41347818766 green; the long workflow_dispatch run is not done yet. Locally, build with
+  `-overlay` stubs for `internal/vless/xray.go` and `inproc.go`: a full Xray build does not fit the disk.
 - go-webview2 is a patched copy in `ashgate-src/third_party/go-webview2`, pulled in by `replace` in
   go.mod. See its PATCHES.md, and keep the patch when updating the module.
 - Flagged, not changed:
