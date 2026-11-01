@@ -221,6 +221,7 @@ func (e *Engine) sweep(now time.Time) {
 		e.directUDP.rotate()
 		e.blockTCP.rotate()
 		e.blockUDP.rotate()
+		e.closedTCP.rotate()
 		e.fragDrop.rotate()
 	}
 	var staleTCP []*tcpFlow

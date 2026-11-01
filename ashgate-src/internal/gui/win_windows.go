@@ -26,6 +26,7 @@ var (
 	pSetTimer        = user32.NewProc("SetTimer")
 	pMessageBox      = user32.NewProc("MessageBoxW")
 	pFindWindow      = user32.NewProc("FindWindowW")
+	pPeekMessage     = user32.NewProc("PeekMessageW")
 	pDestroyWindow   = user32.NewProc("DestroyWindow")
 	pGetDpiWindow    = user32.NewProc("GetDpiForWindow")
 	pGetDpiSystem    = user32.NewProc("GetDpiForSystem")

@@ -116,6 +116,7 @@ func (e *Engine) dropFlowLocked(flow *tcpFlow) {
 	}
 	if cur, ok := e.byClient[flow.app]; ok && cur == flow {
 		delete(e.byClient, flow.app)
+		e.closedTCP.add(flow.app)
 	}
 	if cur, ok := e.byAlloc[allocKey{ver: flow.ver, port: flow.alloc}]; ok && cur == flow {
 		delete(e.byAlloc, allocKey{ver: flow.ver, port: flow.alloc})

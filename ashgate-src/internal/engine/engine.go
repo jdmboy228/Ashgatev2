@@ -118,6 +118,12 @@ type Engine struct {
 	directUDP ageSet[udpKey]
 	blockTCP  ageSet[packet.Addr]
 	blockUDP  ageSet[udpKey]
+	// closedTCP holds the app side of proxied TCP flows that ended. Their
+	// last packets (FIN, ACK, keepalives, retransmits) often come after the
+	// relay closed and after the app exited, when the owner can no longer
+	// be found; passing them would send the app's own address to the
+	// server directly. Apply keeps it; a new SYN from the address clears it.
+	closedTCP ageSet[packet.Addr]
 	// fragDrop remembers datagrams whose first fragment was dropped, so
 	// their later fragments (which carry no ports) are dropped too instead
 	// of reaching the destination directly.
@@ -192,6 +198,7 @@ func New(cfg *config.Config, opt Options) (*Engine, error) {
 		directUDP: newAgeSet[udpKey](),
 		blockTCP:  newAgeSet[packet.Addr](),
 		blockUDP:  newAgeSet[udpKey](),
+		closedTCP: newAgeSet[packet.Addr](),
 		fragDrop:  newAgeSet[fragKey](),
 		udp:       map[udpKey]*udpFlow{},
 		dnsSem:    make(chan struct{}, httpDNSParallel),
@@ -427,8 +434,11 @@ func (e *Engine) fastPath(pkt []byte, h *packet.Header) (Result, bool) {
 			}
 			e.directTCP.del(h.Src)
 			e.blockTCP.del(h.Src)
+			e.closedTCP.del(h.Src)
 		} else if flow := e.byClient[h.Src]; flow != nil {
 			return e.rewriteForward(pkt, h, flow, snap), true
+		} else if e.closedTCP.has(h.Src) {
+			return Result{Action: ActionDrop}, true
 		} else if e.directTCP.has(h.Src) {
 			return Result{Action: ActionPass}, true
 		} else if e.blockTCP.has(h.Src) {

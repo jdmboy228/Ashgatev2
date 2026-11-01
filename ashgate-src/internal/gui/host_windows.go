@@ -153,10 +153,17 @@ func Run(configPath string, startCapture bool) error {
 	})
 	if w == nil {
 		dismissBlankWebView()
+		// Destroying the blank window posted WM_QUIT (go-webview2 quits on
+		// WM_DESTROY); a message box opened with it queued closes at once,
+		// and the user never sees why Ashgate did not start.
+		dropQuitMessage()
 		alert(webviewMissing)
 		return errors.New(webviewMissing)
 	}
 	h.w = w
+	if err := disableAutofill(w); err != nil && h.logs != nil {
+		h.logs.Add(logbuf.Event{Process: "ashgate", Status: "error", Error: "WebView2: не удалось выключить автозаполнение: " + err.Error()})
+	}
 	h.hwnd = uintptr(w.Window())
 	pShowWindow.Call(h.hwnd, swHide)
 	// Subclass before the first resize so WM_NCCALCSIZE drops the caption
@@ -748,6 +755,18 @@ func alert(text string) {
 	pMessageBox.Call(0, uintptr(unsafe.Pointer(body)), uintptr(unsafe.Pointer(title)), 0x10)
 	runtime.KeepAlive(body)
 	runtime.KeepAlive(title)
+}
+
+// dropQuitMessage removes a pending WM_QUIT from this thread's queue.
+func dropQuitMessage() {
+	const wmQuit, pmRemove = 0x0012, 0x0001
+	var msg [48]byte // MSG
+	for i := 0; i < 4; i++ {
+		r, _, _ := pPeekMessage.Call(uintptr(unsafe.Pointer(&msg[0])), 0, wmQuit, wmQuit, pmRemove)
+		if r == 0 {
+			return
+		}
+	}
 }
 
 func dismissBlankWebView() {

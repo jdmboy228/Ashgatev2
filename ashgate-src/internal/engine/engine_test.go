@@ -689,3 +689,60 @@ func TestRefreshBypassSkipsDNSForIPLiterals(t *testing.T) {
 		}
 	}
 }
+
+// switchRes finds the process until the test says it exited.
+type switchRes struct {
+	mu sync.Mutex
+	p  rules.Process
+	ok bool
+}
+
+func (s *switchRes) Lookup(uint8, packet.Addr) (rules.Process, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.p, s.ok
+}
+
+func (s *switchRes) set(ok bool) { s.mu.Lock(); s.ok = ok; s.mu.Unlock() }
+
+// A proxied connection's last packets (FIN, keepalive, retransmits) come
+// after the relay closed, often after the app exited. They must not go out
+// directly with the app's address, also not after Apply.
+func TestLatePacketsOfClosedFlowAreDropped(t *testing.T) {
+	res := &switchRes{p: rules.Process{PID: 5, Name: "curl.exe"}, ok: true}
+	e, _ := newEngine(t, testConfig(), res, &fakeDial{}, nil)
+	app, dst := packet.V4(10, 0, 0, 2, 3200), packet.V4(1, 2, 3, 4, 443)
+	syn, _ := packet.BuildTCP(app, dst, 0x02)
+	if r := e.HandlePacket(syn, Meta{}, true); r.Action != ActionModified {
+		t.Fatalf("SYN went %v", r.Action)
+	}
+	e.mu.Lock()
+	flow := e.byClient[app]
+	e.mu.Unlock()
+	if flow == nil {
+		t.Fatal("no flow")
+	}
+	e.finishTCP(flow)
+	res.set(false)                                         // the app has exited
+	for _, flags := range []byte{0x11, 0x10, 0x18, 0x04} { // FIN+ACK, ACK, PSH+ACK, RST
+		pkt, _ := packet.BuildTCP(app, dst, flags)
+		if r := e.HandlePacket(pkt, Meta{}, true); r.Action != ActionDrop {
+			t.Fatalf("late packet %#x of a closed proxied flow went %v", flags, r.Action)
+		}
+	}
+	again := testConfig()
+	again.ApplyDefaults()
+	if err := e.Apply(again); err != nil {
+		t.Fatal(err)
+	}
+	ack, _ := packet.BuildTCP(app, dst, 0x10)
+	if r := e.HandlePacket(ack, Meta{}, true); r.Action != ActionDrop {
+		t.Fatalf("after Apply a late packet went %v", r.Action)
+	}
+	// A new connection from the same port is decided afresh.
+	res.set(true)
+	syn2, _ := packet.BuildTCP(app, dst, 0x02)
+	if r := e.HandlePacket(syn2, Meta{}, true); r.Action != ActionModified {
+		t.Fatalf("new SYN on a reused port went %v", r.Action)
+	}
+}

@@ -53,12 +53,24 @@ func sharedPath() string {
 	return filepath.Join(programData, "Ashgate", "config.json")
 }
 
-// sharedDirSDDL gives SYSTEM and Administrators full control and other users
-// read access, inherited by every file. ProgramData itself lets any user
-// create files in a subfolder; the elevated window reads config.json,
-// resume-capture and the kill-switch state from here, and writes through
-// config.json.tmp, so a standard user must not be able to plant those.
-const sharedDirSDDL = "O:BAD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)"
+// sharedDirSDDL gives SYSTEM and Administrators full control, inherited by
+// every file. ProgramData itself lets any user create files in a subfolder;
+// the elevated window reads config.json, resume-capture and the kill-switch
+// state from here, and writes through config.json.tmp, so a standard user
+// must not be able to plant those. Nobody else may read them either:
+// config.json keeps proxy passwords and VLESS keys in plain text. secureDir
+// adds read access for the user who runs Ashgate, so Explorer still opens
+// the folder for them ("Открыть папку").
+const sharedDirSDDL = "O:BAD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"
+
+// ownerReadACE is the extra entry for the user running the elevated window.
+func ownerReadACE() string {
+	u, err := windows.GetCurrentProcessToken().GetTokenUser()
+	if err != nil {
+		return ""
+	}
+	return "(A;OICI;0x1200a9;;;" + u.User.Sid.String() + ")"
+}
 
 var secureOnce sync.Once
 
@@ -74,7 +86,7 @@ func secureDir(dir string) {
 		if !windows.GetCurrentProcessToken().IsElevated() {
 			return
 		}
-		sd, err := windows.SecurityDescriptorFromString(sharedDirSDDL)
+		sd, err := windows.SecurityDescriptorFromString(sharedDirSDDL + ownerReadACE())
 		if err != nil {
 			return
 		}
