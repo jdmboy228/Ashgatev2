@@ -43,6 +43,11 @@ type udpFlow struct {
 
 const (
 	udpRetry = 3 * time.Second
+	// udpIdle retires a UDP flow; dnsIdle a DNS one sooner. A DNS flow is
+	// one query and its answer (Xray's DNS gives up within ~10 s), and with
+	// every Windows lookup going through the tunnel there are many.
+	udpIdle = 30 * time.Second
+	dnsIdle = 15 * time.Second
 	// httpDNSParallel bounds concurrent DNS-over-CONNECT queries. Each one
 	// is a full TCP round trip, so running them inline would let four slow
 	// lookups stall every proxied UDP flow.
@@ -229,7 +234,11 @@ func (e *Engine) sweep(now time.Time) {
 	var staleUDP []*udpFlow
 	for _, f := range e.udp {
 		last := time.Unix(0, f.last.Load())
-		if now.Sub(last) > 30*time.Second {
+		idle := udpIdle
+		if f.orig.Port == 53 {
+			idle = dnsIdle
+		}
+		if now.Sub(last) > idle {
 			staleUDP = append(staleUDP, f)
 		}
 	}

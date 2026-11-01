@@ -236,6 +236,25 @@ func TestDNSIgnoresClosedSocketOwner(t *testing.T) {
 	}
 }
 
+// A DNS flow is one query and its answer: it goes sooner than other UDP.
+func TestIdleDNSFlowsRetireSooner(t *testing.T) {
+	e, _ := newEngine(t, testConfig(), fixedRes{p: rules.Process{PID: 5, Name: "curl.exe"}, ok: true}, &fakeDial{}, nil)
+	dns := e.HandlePacket(udpDNS(t, packet.V4(10, 0, 0, 5, 50100), packet.V4(1, 1, 1, 1, 53), "a.example.com"), Meta{}, true)
+	other, _ := packet.BuildUDP(packet.V4(10, 0, 0, 5, 50101), packet.V4(198, 51, 100, 1, 5000), []byte{1})
+	game := e.HandlePacket(other, Meta{}, true)
+	if dns.Action != ActionUDP || game.Action != ActionUDP {
+		t.Fatalf("flows not opened: %v %v", dns.Action, game.Action)
+	}
+	e.sweep(time.Now().Add(dnsIdle + time.Second))
+	e.mu.Lock()
+	_, dnsLeft := e.udp[dns.UDP.Key]
+	_, gameLeft := e.udp[game.UDP.Key]
+	e.mu.Unlock()
+	if dnsLeft || !gameLeft {
+		t.Fatalf("after %s idle: dns flow kept %v, other flow kept %v", dnsIdle+time.Second, dnsLeft, gameLeft)
+	}
+}
+
 func TestSystemProxyChoice(t *testing.T) {
 	proxies := map[string]config.Proxy{
 		"socks": {Name: "socks", Type: "socks5"},
