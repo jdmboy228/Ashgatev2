@@ -101,7 +101,7 @@ func TestLeaks(t *testing.T) {
 		tun := "t" + harness.RandHex(5) + ".e2e-tunnel.example.com"
 		tun2 := "u" + harness.RandHex(5) + ".e2e-tunnel.example.com"
 		dir := "d" + harness.RandHex(5) + ".e2e-direct.example.com"
-		since := time.Now()
+		doh := s.Fx.DoHBytes()
 		var r1, r2, r3 harness.ClientResult
 		pkts, socks := phase(t, "dns", func() {
 			r1 = harness.RunClient(s.Client, "dns", "-server", "1.1.1.1:53", "-name", tun)
@@ -124,12 +124,8 @@ func TestLeaks(t *testing.T) {
 		if len(harness.Filter(pkts, harness.DNSFor(dir))) == 0 {
 			t.Errorf("%s (a direct domain) was not resolved directly by the system DNS", dir)
 		}
-		var doh int
-		for _, ip := range harness.DoHIPs {
-			doh += len(s.Fx.AccessSince(since, ip+":443"))
-		}
-		if doh == 0 {
-			t.Errorf("no DoH connection reached the test server through the tunnel")
+		if s.Fx.DoHBytes() == doh {
+			t.Errorf("no DoH went through the tunnel to the test server")
 		}
 		if d := ownDirect(socks); len(d) > 0 {
 			t.Errorf("ashgate.exe connected directly to %v during DNS (DoH must go through the tunnel)", d)
@@ -146,7 +142,7 @@ func TestLeaks(t *testing.T) {
 		dir := "x" + harness.RandHex(5) + ".e2e-direct.example.com"
 		ru := "e2e-" + harness.RandHex(6) + ".ru"
 		ctl := "c" + harness.RandHex(5) + ".e2e-tunnel.example.com"
-		since := time.Now()
+		doh := s.Fx.DoHBytes()
 		var rTun, rDir, rRU, rLoop, rCtl harness.ClientResult
 		var loopTook time.Duration
 		pkts, _ := phase(t, "getaddrinfo", func() {
@@ -178,11 +174,7 @@ func TestLeaks(t *testing.T) {
 		if len(harness.Filter(pkts, harness.DNSFor(ctl))) == 0 {
 			t.Errorf("an app without a rule: its own DNS query did not go direct")
 		}
-		var doh int
-		for _, ip := range harness.DoHIPs {
-			doh += len(s.Fx.AccessSince(since, ip+":443"))
-		}
-		if doh == 0 {
+		if s.Fx.DoHBytes() == doh {
 			t.Errorf("no DoH through the tunnel during getaddrinfo")
 		}
 	})
@@ -195,7 +187,8 @@ func TestLeaks(t *testing.T) {
 			env.Note("skipped", "browser DNS leak test: Microsoft Edge is not on the runner")
 			t.Skip("no msedge.exe")
 		}
-		load := func(name string) (string, []harness.Packet, time.Time) {
+		direct := readConfig(t).DirectDomains
+		load := func(name string) (string, []harness.Packet) {
 			marker := "b" + harness.RandHex(6)
 			names := make([]string, 30)
 			for i := range names {
@@ -210,7 +203,7 @@ func TestLeaks(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer os.RemoveAll(profile)
-			since := time.Now()
+			ports := harness.WatchUDPPorts()
 			pkts, _ := phase(t, name, func() {
 				// Long enough for its own lookups to time out and fall back
 				// to Windows, as Opera did.
@@ -218,28 +211,45 @@ func TestLeaks(t *testing.T) {
 				defer cancel()
 				err := exec.CommandContext(ctx, edge, "--headless=new", "--disable-gpu", "--no-first-run",
 					"--no-default-browser-check", "--user-data-dir="+profile, "file:///"+filepath.ToSlash(page)).Run()
-				t.Logf("%s: msedge ended: %v", name, err)
+				t.Logf("%s: msedge stopped after 40 s (killed, as planned): %v", name, err)
 				_, _ = harness.Run("taskkill", "/F", "/T", "/IM", "msedge.exe")
 				time.Sleep(2 * time.Second)
 			})
-			return marker, pkts, since
+			ports.Stop()
+			// Any other plain DNS on the card: whose was it? Routed Edge and
+			// the Windows DNS client may send only bypass names.
+			for _, p := range pkts {
+				if p.Proto != "udp" || p.DstPort != 53 || len(p.DNS) == 0 || harness.BypassAll(p.DNS, direct) {
+					continue
+				}
+				owner := ports.Owner(p.SrcPort)
+				low := strings.ToLower(owner)
+				switch {
+				case strings.Contains(low, strings.ToLower(edge)), strings.Contains(low, `\svchost.exe`):
+					t.Errorf("%s: plain DNS from %s: %s", name, owner, p)
+				default:
+					t.Logf("%s: plain DNS from a program without a rule (%q): %s", name, owner, p)
+				}
+			}
+			return marker, pkts
 		}
-		marker, pkts, since := load("browser")
+		doh := s.Fx.DoHBytes()
+		marker, pkts := load("browser")
 		if leak := harness.Filter(pkts, harness.DNSFor(marker)); len(leak) > 0 {
 			t.Errorf("Edge's lookups left the machine in plain text:%s", harness.Brief(leak, 5))
 		}
-		var doh int
-		for _, ip := range harness.DoHIPs {
-			doh += len(s.Fx.AccessSince(since, ip+":443"))
-		}
-		if doh == 0 {
+		if s.Fx.DoHBytes() == doh {
 			t.Errorf("no DoH through the tunnel while Edge loaded the page")
 		}
 		s.Fx.SetDoH(false)
 		defer s.Fx.SetDoH(true)
-		marker, pkts, _ = load("browser-doh-down")
+		doh = s.Fx.DoHBytes()
+		marker, pkts = load("browser-doh-down")
 		if leak := harness.Filter(pkts, harness.DNSFor(marker)); len(leak) > 0 {
 			t.Errorf("with DoH failing, Edge's lookups left the machine in plain text (fallback to Windows):%s", harness.Brief(leak, 5))
+		}
+		if got := s.Fx.DoHBytes() - doh; got > 0 {
+			t.Errorf("DoH carried %d bytes while it was cut off: the fallback was not tested", got)
 		}
 	})
 

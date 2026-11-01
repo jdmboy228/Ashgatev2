@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"golang.org/x/net/dns/dnsmessage"
 )
@@ -119,6 +120,93 @@ func SetupLinkLocalDNS(nic NIC) (undo func(), err error) {
 // LinkLocalDNS6Addr is the IPv6 server with the card's zone, for a dial.
 func LinkLocalDNS6Addr(nic NIC) string {
 	return net.JoinHostPort(LinkLocalDNS6+"%"+strconv.Itoa(nic.Index), "53")
+}
+
+// PortWatch records which process owns each local UDP port while it runs,
+// so a DNS packet on the card can be traced to its sender.
+type PortWatch struct {
+	stop, done chan struct{}
+	mu         sync.Mutex
+	owner      map[int]string // port -> image paths seen, "|"-joined
+}
+
+// WatchUDPPorts polls the UDP table every 50 ms until Stop.
+func WatchUDPPorts() *PortWatch {
+	w := &PortWatch{stop: make(chan struct{}), done: make(chan struct{}), owner: map[int]string{}}
+	images := map[uint32]string{}
+	go func() {
+		defer close(w.done)
+		t := time.NewTicker(50 * time.Millisecond)
+		defer t.Stop()
+		for {
+			for _, s := range Sockets() {
+				if s.Proto != "udp" || s.PID == 0 {
+					continue
+				}
+				img, ok := images[s.PID]
+				if !ok {
+					img = ImagePath(s.PID)
+					if img == "" {
+						img = fmt.Sprintf("pid %d", s.PID)
+					}
+					images[s.PID] = img
+				}
+				w.mu.Lock()
+				if cur := w.owner[s.LPort]; !strings.Contains("|"+cur+"|", "|"+img+"|") {
+					if cur != "" {
+						cur += "|"
+					}
+					w.owner[s.LPort] = cur + img
+				}
+				w.mu.Unlock()
+			}
+			select {
+			case <-w.stop:
+				return
+			case <-t.C:
+			}
+		}
+	}()
+	return w
+}
+
+// Stop ends the watch.
+func (w *PortWatch) Stop() {
+	close(w.stop)
+	<-w.done
+}
+
+// Owner is every image seen on port ("" if none was).
+func (w *PortWatch) Owner(port int) string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.owner[port]
+}
+
+// BypassName reports names Ashgate lets go to the provider's DNS: the
+// Russian zones, the direct list, LAN names and private reverse lookups
+// (the engine's own list, internal/engine/dns.go).
+func BypassName(name string, direct []string) bool {
+	name = strings.TrimSuffix(strings.ToLower(name), ".")
+	if !strings.Contains(name, ".") || strings.HasSuffix(name, ".arpa") {
+		return true
+	}
+	for _, d := range append([]string{"ru", "xn--p1ai", "su", "local", "localdomain", "localhost", "lan", "home.arpa", "example", "invalid", "test"}, direct...) {
+		if name == d || strings.HasSuffix(name, "."+d) {
+			return true
+		}
+	}
+	return false
+}
+
+// BypassAll reports that every name is a bypass name.
+func BypassAll(names, direct []string) bool {
+	for _, n := range names {
+		if !BypassName(n, direct) {
+			return false
+		}
+	}
+	return true
 }
 
 // EdgeExe is Microsoft Edge on the runner, or "" when it is missing.

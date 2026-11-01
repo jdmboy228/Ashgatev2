@@ -204,10 +204,13 @@ type Fixture struct {
 	Sub       *SubServer
 	SOCKS     *testkit.SOCKS
 	HTTP      *testkit.HTTP
-	// doh carries the server's DoH (and raw DNS) to the internet;
-	// SetDoH(false) cuts it off like a resolver that never answers.
+	// doh carries the server's DoH to the internet; SetDoH(false) cuts it
+	// off like a resolver that never answers.
 	doh       *testkit.SOCKS
 	dohDown   atomic.Bool
+	dohBytes  atomic.Int64
+	dohMu     sync.Mutex
+	dohConns  map[net.Conn]struct{}
 	ProxyUser string
 	ProxyPass string
 	// Plain is a VLESS link to the XHTTP server with its own user, for a
@@ -255,11 +258,20 @@ func StartFixture(env *Env) (*Fixture, error) {
 		f.Close()
 		return nil, err
 	}
+	f.dohConns = map[net.Conn]struct{}{}
 	f.doh.Dial = func(network, addr string) (net.Conn, error) {
 		if f.dohDown.Load() {
 			return nil, fmt.Errorf("e2e: DoH is down")
 		}
-		return net.Dial(network, addr)
+		c, err := net.Dial(network, addr)
+		if err != nil {
+			return nil, err
+		}
+		cc := &countedConn{Conn: c, f: f}
+		f.dohMu.Lock()
+		f.dohConns[cc] = struct{}{}
+		f.dohMu.Unlock()
+		return cc, nil
 	}
 	_, dohPort, _ := net.SplitHostPort(f.doh.Addr)
 
@@ -433,10 +445,52 @@ func (f *Fixture) Close() {
 	}
 }
 
-// SetDoH lets the server's DoH through (true) or cuts it off (false):
-// Ashgate's lookups through the tunnel then get no answer, and browsers
-// fall back to the Windows resolver.
-func (f *Fixture) SetDoH(up bool) { f.dohDown.Store(!up) }
+// SetDoH lets the server's DoH through (true) or cuts it off (false), open
+// connections included: Ashgate's lookups through the tunnel then get no
+// answer, and browsers fall back to the Windows resolver.
+func (f *Fixture) SetDoH(up bool) {
+	f.dohDown.Store(!up)
+	if up {
+		return
+	}
+	f.dohMu.Lock()
+	defer f.dohMu.Unlock()
+	for c := range f.dohConns {
+		_ = c.Close()
+	}
+}
+
+// DoHBytes counts the bytes the server's DoH carried so far. Xray keeps
+// one DoH connection and reuses it, so new connections say little.
+func (f *Fixture) DoHBytes() int64 { return f.dohBytes.Load() }
+
+// countedConn is one DoH connection of the server.
+type countedConn struct {
+	net.Conn
+	f    *Fixture
+	once sync.Once
+}
+
+func (c *countedConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	c.f.dohBytes.Add(int64(n))
+	return n, err
+}
+
+func (c *countedConn) Write(p []byte) (int, error) {
+	n, err := c.Conn.Write(p)
+	c.f.dohBytes.Add(int64(n))
+	return n, err
+}
+
+func (c *countedConn) Close() error {
+	c.once.Do(func() {
+		c.f.dohMu.Lock()
+		delete(c.f.dohConns, c)
+		c.f.dohMu.Unlock()
+	})
+	return c.Conn.Close()
+}
 
 // Access is one line of the Xray server's access log.
 type Access struct {
