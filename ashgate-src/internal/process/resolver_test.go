@@ -15,6 +15,9 @@ func testResolver(now time.Time) (*Resolver, *time.Time) {
 	r.SetImage(func(pid uint32) rules.Process {
 		return rules.Process{PID: pid, Name: "app.exe", Path: `C:\apps\app.exe`}
 	})
+	// On Windows New() installs the real exit check, which reports the
+	// made-up PIDs of these tests as gone.
+	r.SetExited(func(uint32) bool { return false })
 	return r, &clock
 }
 

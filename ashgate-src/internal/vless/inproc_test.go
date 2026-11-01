@@ -53,9 +53,15 @@ func TestHandshakeGate(t *testing.T) {
 	if n := gateInUse(server); n != 2 {
 		t.Fatalf("slots in use = %d, want 2", n)
 	}
-	// The server answers the first connection: its slot frees.
-	srv := <-far
-	go func() { _, _ = srv.Write([]byte{0x16}) }()
+	// The server answers. Which pipe end belongs to first is not known (the
+	// two dials can arrive on far and dialed in different orders), so both
+	// ends write; only first reads, so only its slot frees. second.Close
+	// below releases the other writer.
+	for i := 0; i < 2; i++ {
+		srv := <-far
+		go func() { _, _ = srv.Write([]byte{0x16}) }()
+	}
+	_ = first.SetReadDeadline(time.Now().Add(5 * time.Second))
 	if _, err := first.Read(make([]byte, 1)); err != nil {
 		t.Fatal(err)
 	}

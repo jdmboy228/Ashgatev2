@@ -223,7 +223,7 @@ jobs:
           if (Test-Path setup-prev\Setup.exe) { $env:E2E_SETUP_PREV = (Resolve-Path setup-prev\Setup.exe).Path }
           New-Item -ItemType Directory -Force $env:E2E_OUT | Out-Null
           & "$env:E2E_BIN\gotestsum.exe" --junitfile "$env:E2E_OUT\junit.xml" --format standard-verbose --raw-command -- `
-            "$env:E2E_BIN\test2json.exe" -t -p e2e "$env:E2E_BIN\e2e.test.exe" -test.v=test2json -test.run '^TestInstall$' -test.timeout 40m
+            "$env:E2E_BIN\test2json.exe" -t -p e2e "$env:E2E_BIN\e2e.test.exe" '-test.v=test2json' '-test.run=^TestInstall$' '-test.timeout=40m'
           if ($LASTEXITCODE) { exit 1 }
       - name: Remove CI-only settings, mask secrets
         if: always()
@@ -263,7 +263,7 @@ jobs:
       - name: Run ${{ matrix.run }}
         run: |
           & "$env:E2E_BIN\gotestsum.exe" --junitfile "$env:E2E_OUT\junit.xml" --format standard-verbose --raw-command -- `
-            "$env:E2E_BIN\test2json.exe" -t -p e2e "$env:E2E_BIN\e2e.test.exe" -test.v=test2json -test.run '^${{ matrix.run }}$' -test.timeout ${{ matrix.timeout }}m
+            "$env:E2E_BIN\test2json.exe" -t -p e2e "$env:E2E_BIN\e2e.test.exe" '-test.v=test2json' '-test.run=^${{ matrix.run }}$' '-test.timeout=${{ matrix.timeout }}m'
           if ($LASTEXITCODE) { exit 1 }
       - name: Remove CI-only settings, mask secrets
         if: always()

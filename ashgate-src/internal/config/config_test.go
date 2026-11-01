@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -49,7 +50,9 @@ func TestLoadSaveRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if st.Mode().Perm() != 0o600 {
+	// Windows reports only the read-only bit (0666 or 0444); there the
+	// folder ACL protects the file (path_windows.go).
+	if runtime.GOOS != "windows" && st.Mode().Perm() != 0o600 {
 		t.Fatalf("mode = %o", st.Mode().Perm())
 	}
 }

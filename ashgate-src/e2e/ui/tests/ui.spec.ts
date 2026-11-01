@@ -152,6 +152,12 @@ test.describe.serial("Ashgate window", () => {
     await page.waitForFunction(() => !!document.querySelector("#page")?.children.length);
   });
 
+  // A dialog left open by a failed step must not block every later test.
+  test.afterEach(async () => {
+    if (page && (await dlg().count())) await closeDialog().catch(() => {});
+    if (page && (await page.locator("#menu:visible").count())) await page.keyboard.press("Escape").catch(() => {});
+  });
+
   test.afterAll(async () => {
     fs.mkdirSync(path.join(OUT, "ui"), { recursive: true });
     fs.writeFileSync(path.join(OUT, "ui", "findings.json"), JSON.stringify({ findings, problems: app?.problems || [] }, null, 2));
@@ -234,7 +240,9 @@ test.describe.serial("Ashgate window", () => {
     await ctx.grantPermissions(["clipboard-read", "clipboard-write"]).catch(() => {});
     await page.evaluate((l) => navigator.clipboard.writeText(l).catch(() => {}), fx.rawLink);
     await page.locator('[data-act="paste-vless"]').click();
-    if (await dlg().count()) {
+    // The dialog opens only after the clipboard read resolves.
+    const opened = await dlg().waitFor({ state: "visible", timeout: 5000 }).then(() => true, () => false);
+    if (opened) {
       await screens("dialog-paste-vless");
       const link = await dlg().locator("#p-link").inputValue().catch(() => "");
       if (!link.startsWith("vless://")) findings.push({ kind: "clipboard", text: "«Вставить vless://» opened the dialog without the link from the clipboard" });

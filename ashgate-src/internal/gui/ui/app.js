@@ -553,7 +553,9 @@ function proxyDialog() {
   const types = p.subscription ? [["sub", "Подписка"]] : [["socks5", "SOCKS5"], ["http", "HTTP"], ["vless", "VLESS"], ["sub", "Подписка"]];
   const vless = type === "vless";
   const sub = type === "sub";
-  return `<div class="scrim"><form class="dialog${vless ? "" : " narrow"}" id="dlg">
+  // autocomplete="off": WebView2 must not keep typed links, UUIDs, keys,
+  // logins or subscription URLs in its form history on disk.
+  return `<div class="scrim"><form class="dialog${vless ? "" : " narrow"}" id="dlg" autocomplete="off">
     <h2>Прокси</h2><div class="dsub">${modal.index < 0 ? "Новый прокси" : "Изменение · " + esc(p.name || "")}</div>
     <div class="body">
       <label class="lbl">Имя</label><div class="field${modal.nameError ? " bad" : ""}"><input id="p-name" value="${esc(p.name || "")}" placeholder="Задаётся само, если оставить пустым" autofocus></div>
