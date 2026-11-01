@@ -204,6 +204,10 @@ type Fixture struct {
 	Sub       *SubServer
 	SOCKS     *testkit.SOCKS
 	HTTP      *testkit.HTTP
+	// doh carries the server's DoH (and raw DNS) to the internet;
+	// SetDoH(false) cuts it off like a resolver that never answers.
+	doh       *testkit.SOCKS
+	dohDown   atomic.Bool
 	ProxyUser string
 	ProxyPass string
 	// Plain is a VLESS link to the XHTTP server with its own user, for a
@@ -247,6 +251,17 @@ func StartFixture(env *Env) (*Fixture, error) {
 		f.Close()
 		return nil, err
 	}
+	if f.doh, err = testkit.ListenSOCKS("", ""); err != nil {
+		f.Close()
+		return nil, err
+	}
+	f.doh.Dial = func(network, addr string) (net.Conn, error) {
+		if f.dohDown.Load() {
+			return nil, fmt.Errorf("e2e: DoH is down")
+		}
+		return net.Dial(network, addr)
+	}
+	_, dohPort, _ := net.SplitHostPort(f.doh.Addr)
 
 	innerX, innerR := freePort(), freePort()
 	f.accessLog = filepath.Join(f.Dir, "xray-access.log")
@@ -294,8 +309,10 @@ func StartFixture(env *Env) (*Fixture, error) {
 				"settings": map[string]any{"redirect": f.Health.Addr, "finalRules": allow}},
 			map[string]any{"tag": "local", "protocol": "freedom",
 				"settings": map[string]any{"finalRules": allow}},
-			// DoH through the tunnel really resolves, like a VPS would.
-			map[string]any{"tag": "internet", "protocol": "freedom"},
+			// DoH through the tunnel really resolves, like a VPS would,
+			// through a switch that can cut it off (SetDoH).
+			map[string]any{"tag": "internet", "protocol": "socks",
+				"settings": map[string]any{"address": "127.0.0.1", "port": json.Number(dohPort)}},
 		},
 		"routing": map[string]any{
 			"domainStrategy": "AsIs",
@@ -303,7 +320,8 @@ func StartFixture(env *Env) (*Fixture, error) {
 				map[string]any{"type": "field", "domain": []string{"full:www.gstatic.com"}, "outboundTag": "health"},
 				map[string]any{"type": "field", "ip": []string{TestNet4.String(), "2001:db8::/32"}, "outboundTag": "target"},
 				map[string]any{"type": "field", "ip": []string{"127.0.0.0/8", "::1/128"}, "outboundTag": "local"},
-				map[string]any{"type": "field", "ip": DoHIPs, "port": "443", "outboundTag": "internet"},
+				// 443: DoH; 53: other query types, which Ashgate sends as they are.
+				map[string]any{"type": "field", "ip": DoHIPs, "port": "53,443", "outboundTag": "internet"},
 			},
 		},
 	}
@@ -402,6 +420,9 @@ func (f *Fixture) Close() {
 	if f.SOCKS != nil {
 		_ = f.SOCKS.Close()
 	}
+	if f.doh != nil {
+		_ = f.doh.Close()
+	}
 	if f.HTTP != nil {
 		_ = f.HTTP.Close()
 	}
@@ -409,6 +430,11 @@ func (f *Fixture) Close() {
 		_ = f.dest.Close()
 	}
 }
+
+// SetDoH lets the server's DoH through (true) or cuts it off (false):
+// Ashgate's lookups through the tunnel then get no answer, and browsers
+// fall back to the Windows resolver.
+func (f *Fixture) SetDoH(up bool) { f.dohDown.Store(!up) }
 
 // Access is one line of the Xray server's access log.
 type Access struct {
