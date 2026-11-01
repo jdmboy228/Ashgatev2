@@ -431,14 +431,19 @@ test.describe.serial("Ashgate window", () => {
   });
 
   test("close hides to the tray; a second launch brings it back", async () => {
+    // WebView2 keeps document.visibilityState "visible" when its host window
+    // is hidden, so ask the app: /api/state says hidden while in the tray.
+    const hidden = () => page.evaluate(async () => {
+      const r = await fetch("/api/state", { headers: { "X-Ashgate-Token": (window as any).__ashgateToken } });
+      return !!(await r.json()).hidden;
+    });
     await page.locator("#win-close").click();
-    await page.waitForTimeout(1500);
+    await expect.poll(hidden, { timeout: 10_000, message: "the window did not hide to the tray" }).toBe(true);
     desktop("desktop-tray");
-    const hidden = await page.evaluate(() => document.visibilityState);
-    expect(hidden, "the window did not hide").toBe("hidden");
     const { execFileSync } = await import("node:child_process");
     try { execFileSync(path.join(process.env.ProgramFiles || "C:\\Program Files", "Ashgate", "ashgate.exe"), [], { timeout: 20_000 }); } catch { /* the second copy exits */ }
-    await expect.poll(() => page.evaluate(() => document.visibilityState), { timeout: 15_000 }).toBe("visible");
+    await expect.poll(hidden, { timeout: 15_000, message: "a second launch did not bring the window back" }).toBe(false);
+    desktop("desktop-restored");
   });
 
   test("everything persists after a restart", async () => {
