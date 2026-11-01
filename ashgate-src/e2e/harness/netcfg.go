@@ -39,15 +39,19 @@ func SetupFakeIPv6(nic NIC) (undo func(), err error) {
 	return undo, nil
 }
 
-// AddSecondaryIPv4 adds a second address to the card (a network change
-// that keeps the runner online). Undo removes it.
-func AddSecondaryIPv4(nic NIC, ip string) (undo func(), err error) {
+// AddTestRoute adds a route for TEST-NET-3 (203.0.113.0/24) through the
+// default gateway: a routing-table change that keeps the runner online.
+// (A second static IPv4 address would switch the card from DHCP to static
+// and cut the runner off.) Undo removes it.
+func AddTestRoute(nic NIC) (undo func(), err error) {
 	idx := strconv.Itoa(nic.Index)
-	if out, err := PS(fmt.Sprintf(`New-NetIPAddress -InterfaceIndex %s -IPAddress %s -PrefixLength 32 -SkipAsSource $true | Out-Null`, idx, ip)); err != nil {
-		return func() {}, fmt.Errorf("secondary IPv4: %v: %s", err, out)
+	out, err := PS(fmt.Sprintf(`$g = (Get-NetRoute -DestinationPrefix '0.0.0.0/0' -InterfaceIndex %[1]s | Select-Object -First 1).NextHop;`+
+		`New-NetRoute -InterfaceIndex %[1]s -DestinationPrefix 203.0.113.0/24 -NextHop $g -PolicyStore ActiveStore | Out-Null`, idx))
+	if err != nil {
+		return func() {}, fmt.Errorf("test route: %v: %s", err, out)
 	}
 	return func() {
-		_, _ = PS(fmt.Sprintf(`Remove-NetIPAddress -InterfaceIndex %s -IPAddress %s -Confirm:$false -ErrorAction SilentlyContinue`, idx, ip))
+		_, _ = PS(fmt.Sprintf(`Remove-NetRoute -InterfaceIndex %s -DestinationPrefix 203.0.113.0/24 -Confirm:$false -ErrorAction SilentlyContinue`, idx))
 	}, nil
 }
 

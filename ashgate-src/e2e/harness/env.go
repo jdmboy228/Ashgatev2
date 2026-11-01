@@ -7,6 +7,7 @@ package harness
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -133,13 +134,23 @@ func (e *Env) WriteJSON(name string, v any) {
 	_ = os.WriteFile(e.Path(name), b, 0o644)
 }
 
-// Eventually polls fn until it returns nil or the timeout passes.
+// Stop wraps an error that ends Eventually at once (no point waiting).
+type Stop struct{ Err error }
+
+func (s Stop) Error() string { return s.Err.Error() }
+
+// Eventually polls fn until it returns nil or the timeout passes. A Stop
+// error ends it early.
 func Eventually(timeout, every time.Duration, fn func() error) error {
 	deadline := time.Now().Add(timeout)
 	var err error
 	for {
 		if err = fn(); err == nil {
 			return nil
+		}
+		var stop Stop
+		if errors.As(err, &stop) {
+			return stop.Err
 		}
 		if time.Now().After(deadline) {
 			return err

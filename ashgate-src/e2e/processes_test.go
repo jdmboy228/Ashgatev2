@@ -24,47 +24,54 @@ func TestProcesses(t *testing.T) {
 	testStart := time.Now()
 
 	t.Run("NoRemoteDebuggingByDefault", func(t *testing.T) {
-		if harness.DebugPolicySet() {
-			t.Fatalf("the WebView2 debugging policy is set outside a test")
-		}
-		a := harness.Launch(t, env, env.Exe, harness.LaunchOpts{NoDebug: true})
-		defer a.Quit()
-		var wv []harness.Proc
-		err := harness.Eventually(45*time.Second, 500*time.Millisecond, func() error {
-			if _, ok := harness.MainWindow(uint32(a.PID)); !ok {
-				return errors.New("window not visible yet")
-			}
-			wv = webviews(uint32(a.PID))
-			if len(wv) == 0 {
-				return errors.New("no WebView2 processes yet")
-			}
-			return nil
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		time.Sleep(3 * time.Second)
-		wv = webviews(uint32(a.PID))
-		var pids []uint32
-		for _, p := range wv {
-			pids = append(pids, p.PID)
-		}
-		for _, s := range harness.SocketsOf(pids...) {
-			if s.Proto == "tcp" && s.State == harness.TCPListen {
-				t.Errorf("WebView2 process %d listens on %s:%d in a normal launch", s.PID, s.Local, s.LPort)
-			}
-		}
-		lines, _ := harness.PS(`Get-CimInstance Win32_Process -Filter "Name='msedgewebview2.exe'" | ForEach-Object { $_.CommandLine }`)
-		if strings.Contains(lines, "remote-debugging") {
-			t.Errorf("a WebView2 process has remote debugging on its command line in a normal launch")
-		}
-		c := http.Client{Timeout: 2 * time.Second}
-		if resp, err := c.Get(fmt.Sprintf("http://127.0.0.1:%d/json/version", harness.DebugPort)); err == nil {
-			resp.Body.Close()
-			t.Errorf("remote debugging answers on port %d in a normal launch", harness.DebugPort)
-		}
+		harness.WithoutDebugPolicy(func() { noRemoteDebugging(t, env) })
 	})
+	testProcessesSession(t, env, testStart)
+}
 
+func noRemoteDebugging(t *testing.T, env *harness.Env) {
+	if harness.DebugPolicySet() {
+		t.Fatalf("the WebView2 debugging policy is set during a normal launch")
+	}
+	a := harness.Launch(t, env, env.Exe, harness.LaunchOpts{NoDebug: true})
+	defer a.Quit()
+	var wv []harness.Proc
+	err := harness.Eventually(45*time.Second, 500*time.Millisecond, func() error {
+		if _, ok := harness.MainWindow(uint32(a.PID)); !ok {
+			return errors.New("window not visible yet")
+		}
+		wv = webviews(uint32(a.PID))
+		if len(wv) == 0 {
+			return errors.New("no WebView2 processes yet")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(3 * time.Second)
+	wv = webviews(uint32(a.PID))
+	var pids []uint32
+	for _, p := range wv {
+		pids = append(pids, p.PID)
+	}
+	for _, s := range harness.SocketsOf(pids...) {
+		if s.Proto == "tcp" && s.State == harness.TCPListen {
+			t.Errorf("WebView2 process %d listens on %s:%d in a normal launch", s.PID, s.Local, s.LPort)
+		}
+	}
+	lines, _ := harness.PS(`Get-CimInstance Win32_Process -Filter "Name='msedgewebview2.exe'" | ForEach-Object { $_.CommandLine }`)
+	if strings.Contains(lines, "remote-debugging") {
+		t.Errorf("a WebView2 process has remote debugging on its command line in a normal launch")
+	}
+	c := http.Client{Timeout: 2 * time.Second}
+	if resp, err := c.Get(fmt.Sprintf("http://127.0.0.1:%d/json/version", harness.DebugPort)); err == nil {
+		resp.Body.Close()
+		t.Errorf("remote debugging answers on port %d in a normal launch", harness.DebugPort)
+	}
+}
+
+func testProcessesSession(t *testing.T, env *harness.Env, testStart time.Time) {
 	s := harness.NewSession(t, harness.SessionOpts{NoCapture: true})
 	a := s.App
 	pid := uint32(a.PID)
@@ -278,7 +285,7 @@ func TestProcesses(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		undo, err := harness.AddSecondaryIPv4(nic, "10.254.254.254")
+		undo, err := harness.AddTestRoute(nic)
 		if err != nil {
 			t.Log(err)
 		}

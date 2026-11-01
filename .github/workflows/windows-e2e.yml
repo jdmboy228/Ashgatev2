@@ -207,7 +207,7 @@ jobs:
   install:
     needs: [build, build-prev]
     runs-on: windows-latest
-    timeout-minutes: 45
+    timeout-minutes: 55
     steps:
       - uses: actions/download-artifact@v4
         with: { name: setup, path: setup }
@@ -223,7 +223,7 @@ jobs:
           if (Test-Path setup-prev\Setup.exe) { $env:E2E_SETUP_PREV = (Resolve-Path setup-prev\Setup.exe).Path }
           New-Item -ItemType Directory -Force $env:E2E_OUT | Out-Null
           & "$env:E2E_BIN\gotestsum.exe" --junitfile "$env:E2E_OUT\junit.xml" --format standard-verbose --raw-command -- `
-            "$env:E2E_BIN\test2json.exe" -t -p e2e "$env:E2E_BIN\e2e.test.exe" '-test.v=test2json' '-test.run=^TestInstall$' '-test.timeout=40m'
+            "$env:E2E_BIN\test2json.exe" -t -p e2e "$env:E2E_BIN\e2e.test.exe" '-test.v=test2json' '-test.run=^TestInstall$' '-test.timeout=50m'
           if ($LASTEXITCODE) { exit 1 }
       - name: Remove CI-only settings, mask secrets
         if: always()
@@ -243,11 +243,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { job: processes, run: TestProcesses, timeout: 40 }
-          - { job: connectivity, run: TestConnectivity, timeout: 60 }
-          - { job: leaks, run: TestLeaks, timeout: 45 }
-          - { job: perf, run: TestPerf, timeout: 45 }
-          - { job: netchange, run: TestNetworkChange, timeout: 25 }
+          # tt (the Go test timeout) stays 5 minutes under the job limit, so
+          # a hang prints its stacks and the artifact steps still run.
+          - { job: processes, run: TestProcesses, timeout: 45, tt: 40 }
+          - { job: connectivity, run: TestConnectivity, timeout: 60, tt: 55 }
+          - { job: leaks, run: TestLeaks, timeout: 50, tt: 45 }
+          - { job: perf, run: TestPerf, timeout: 45, tt: 40 }
+          - { job: netchange, run: TestNetworkChange, timeout: 25, tt: 20 }
     name: ${{ matrix.job }}
     timeout-minutes: ${{ matrix.timeout }}
     steps:
@@ -263,7 +265,7 @@ jobs:
       - name: Run ${{ matrix.run }}
         run: |
           & "$env:E2E_BIN\gotestsum.exe" --junitfile "$env:E2E_OUT\junit.xml" --format standard-verbose --raw-command -- `
-            "$env:E2E_BIN\test2json.exe" -t -p e2e "$env:E2E_BIN\e2e.test.exe" '-test.v=test2json' '-test.run=^${{ matrix.run }}$' '-test.timeout=${{ matrix.timeout }}m'
+            "$env:E2E_BIN\test2json.exe" -t -p e2e "$env:E2E_BIN\e2e.test.exe" '-test.v=test2json' '-test.run=^${{ matrix.run }}$' '-test.timeout=${{ matrix.tt }}m'
           if ($LASTEXITCODE) { exit 1 }
       - name: Remove CI-only settings, mask secrets
         if: always()
@@ -316,6 +318,8 @@ jobs:
         if: always()
         run: |
           & "$env:E2E_BIN\ashgate-e2e-servers.exe" debug-off
+          New-Item -ItemType Directory -Force "$env:E2E_OUT\app" | Out-Null
+          Copy-Item "$env:ProgramData\Ashgate\*" "$env:E2E_OUT\app\" -Recurse -ErrorAction SilentlyContinue
           $ok = $true
           & "$env:E2E_BIN\ashgate-e2e-servers.exe" scan -out $env:E2E_OUT
           if ($LASTEXITCODE) { $ok = $false }

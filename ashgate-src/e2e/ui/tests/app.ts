@@ -65,6 +65,7 @@ export class App {
             this.page = p;
             this.watch();
             await p.waitForFunction(() => !!(window as any).__ashgateToken && !!document.querySelector("#page")?.children.length);
+            registerSecret("api-token", await p.evaluate(() => (window as any).__ashgateToken as string));
             return true;
           }
           await new Promise((r) => setTimeout(r, 500));
@@ -102,6 +103,18 @@ export class App {
       execFileSync("powershell", ["-NoProfile", "-Command", "Start-Sleep -Milliseconds 300"]);
     }
   }
+}
+
+// registerSecret adds a value to the run's secret register, so the secret
+// scan after the UI run looks for it and the artifacts get it masked.
+function registerSecret(name: string, value: string) {
+  if (!value) return;
+  console.log(`::add-mask::${value}`);
+  const file = path.join(OUT, "secrets.json");
+  let list: { name: string; value: string }[] = [];
+  try { list = JSON.parse(fs.readFileSync(file, "utf8")); } catch { /* first one */ }
+  if (!list.some((s) => s.value === value)) list.push({ name, value });
+  fs.writeFileSync(file, JSON.stringify(list));
 }
 
 export function cleanupPolicy() {

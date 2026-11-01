@@ -17,7 +17,10 @@ import (
 
 	"ashgate/e2e/harness"
 	"ashgate/internal/config"
+	"ashgate/internal/secret"
 )
+
+func directHost() string { return strings.Split(harness.DirectHostIP, ":")[0] }
 
 const plainSOCKS = 10808
 
@@ -38,7 +41,9 @@ func TestLeaks(t *testing.T) {
 	err := a.UpdateConfig(func(c *config.Config) {
 		c.Proxies = append(c.Proxies, config.Proxy{Name: "e2e-plain", Type: "vless", Address: s.Fx.XHTTP.Addr,
 			Link: s.Fx.PlainLink, SOCKSPort: plainSOCKS, LocalUser: "e2elocal", LocalPass: localPass})
-		c.DirectDomains = append(c.DirectDomains, "e2e-direct.example")
+		// Not under .example/.test/.local: Xray sends those "local" suffixes
+		// to the system DNS whenever a direct list exists.
+		c.DirectDomains = append(c.DirectDomains, "e2e-direct.example.com")
 	})
 	if err != nil {
 		t.Fatalf("plain proxy and direct domain: %v", err)
@@ -84,9 +89,9 @@ func TestLeaks(t *testing.T) {
 	}
 
 	t.Run("DNS", func(t *testing.T) {
-		tun := "t" + harness.RandHex(5) + ".e2e-tunnel.example"
-		tun2 := "u" + harness.RandHex(5) + ".e2e-tunnel.example"
-		dir := "d" + harness.RandHex(5) + ".e2e-direct.example"
+		tun := "t" + harness.RandHex(5) + ".e2e-tunnel.example.com"
+		tun2 := "u" + harness.RandHex(5) + ".e2e-tunnel.example.com"
+		dir := "d" + harness.RandHex(5) + ".e2e-direct.example.com"
 		since := time.Now()
 		var r1, r2, r3 harness.ClientResult
 		pkts, socks := phase(t, "dns", func() {
@@ -123,7 +128,7 @@ func TestLeaks(t *testing.T) {
 	})
 
 	t.Run("SystemResolver", func(t *testing.T) {
-		g1 := "g" + harness.RandHex(5) + ".e2e-tunnel.example"
+		g1 := "g" + harness.RandHex(5) + ".e2e-tunnel.example.com"
 		pkts, _ := phase(t, "getaddrinfo-off", func() {
 			harness.RunClient(s.Client, "lookup", "-name", g1)
 			time.Sleep(time.Second)
@@ -146,7 +151,7 @@ func TestLeaks(t *testing.T) {
 		}()
 		time.Sleep(2 * time.Second)
 		_, _ = harness.Run("ipconfig", "/flushdns")
-		g2 := "h" + harness.RandHex(5) + ".e2e-tunnel.example"
+		g2 := "h" + harness.RandHex(5) + ".e2e-tunnel.example.com"
 		pkts, _ = phase(t, "getaddrinfo-on", func() {
 			harness.RunClient(s.Client, "lookup", "-name", g2, "-timeout", "8s")
 			time.Sleep(time.Second)
@@ -217,15 +222,15 @@ func TestLeaks(t *testing.T) {
 		directIP := strings.Split(harness.DirectHostIP, ":")[0]
 		var tun, dir harness.ClientResult
 		pkts, socks := phase(t, "domains", func() {
-			tun = harness.RunClient(s.Client, "get", "-url", harness.URL(harness.TargetHostIP), "-host", "tunnel.example", "-n", "100000")
-			dir = harness.RunClient(s.Client, "get", "-url", harness.URL(harness.DirectHostIP), "-host", "x.e2e-direct.example", "-n", "1000", "-stall", "5s")
+			tun = harness.RunClient(s.Client, "get", "-url", harness.URL(harness.TargetHostIP), "-host", "tunnel.example.com", "-n", "100000")
+			dir = harness.RunClient(s.Client, "get", "-url", harness.URL(harness.DirectHostIP), "-host", "x.e2e-direct.example.com", "-n", "1000", "-stall", "5s")
 		})
 		if !tun.OK {
-			t.Errorf("Host tunnel.example through the tunnel: %s", tun)
+			t.Errorf("Host tunnel.example.com through the tunnel: %s", tun)
 		}
 		_ = dir
 		if len(harness.Filter(pkts, func(p harness.Packet) bool { return p.Dst == directIP && p.SYN })) == 0 {
-			t.Errorf("Host x.e2e-direct.example did not go direct (no SYN to %s on the card)", directIP)
+			t.Errorf("Host x.e2e-direct.example.com did not go direct (no SYN to %s on the card)", directIP)
 		}
 		if len(s.Fx.AccessSince(since, directIP)) > 0 {
 			t.Errorf("a direct domain went through the tunnel")
@@ -245,8 +250,10 @@ func TestLeaks(t *testing.T) {
 		defer s.Fx.RAW.Set(harness.GatePass)
 		var rs []harness.ClientResult
 		pkts, _ := phase(t, "ks-servers-down", func() {
+			// get, not a bare connect: the local relay accepts the TCP
+			// handshake itself before it dials the server.
 			for i := 0; i < 3; i++ {
-				rs = append(rs, harness.RunClient(s.Client, "tcp", "-addr", harness.TargetTCP, "-timeout", "3s"))
+				rs = append(rs, harness.RunClient(s.Client, "get", "-url", harness.URL(harness.TargetTCP), "-n", "1000", "-stall", "5s"))
 				rs = append(rs, harness.RunClient(s.Client, "udp", "-addr", harness.TargetUDP, "-timeout", "2s"))
 			}
 		})
@@ -256,7 +263,7 @@ func TestLeaks(t *testing.T) {
 				break
 			}
 		}
-		if leak := harness.Filter(pkts, harness.ToTestNet()); len(leak) > 0 {
+		if leak := harness.Filter(pkts, harness.ToTestNet(directHost())); len(leak) > 0 {
 			t.Errorf("kill switch: direct packets with the servers down:%s", harness.Brief(leak, 10))
 		}
 	})
@@ -275,7 +282,7 @@ func TestLeaks(t *testing.T) {
 		if r.OK {
 			t.Errorf("the proxied app connected while capture was stopped")
 		}
-		if leak := harness.Filter(pkts, harness.ToTestNet()); len(leak) > 0 {
+		if leak := harness.Filter(pkts, harness.ToTestNet(directHost())); len(leak) > 0 {
 			t.Errorf("kill switch: direct packets while stopped:%s", harness.Brief(leak, 10))
 		}
 		if err := a.StartCapture(); err != nil {
@@ -314,7 +321,7 @@ func TestLeaks(t *testing.T) {
 		if leak := harness.Filter(pkts, harness.DNSFor("gstatic")); len(leak) > 0 {
 			t.Errorf("health-check host resolved on the card:%s", harness.Brief(leak, 5))
 		}
-		if d := ownDirect(socks); len(d) > 0 {
+		if d := ownDirect(socks, directHost()); len(d) > 0 {
 			t.Errorf("ashgate.exe connected directly to %v during the refresh", d)
 		}
 	})
@@ -426,11 +433,19 @@ func TestLeaks(t *testing.T) {
 			t.Fatalf("other user: %v", err)
 		}
 		defer u.Delete()
-		if r, err := u.RunAs(s.Client, "dpapi", "-in", blob); err != nil {
+		var openErr error
+		profile, err := u.As(func() error {
+			_, openErr = secret.Open(sealed)
+			return nil
+		})
+		switch {
+		case err != nil:
 			env.Note("skipped", "DPAPI as another user: "+err.Error())
-			t.Errorf("run as another user: %v", err)
-		} else if r.OK {
+			t.Errorf("as another user: %v", err)
+		case openErr == nil:
 			t.Errorf("another Windows user decrypted the subscription")
+		default:
+			t.Logf("another user (profile loaded: %v): %v", profile, openErr)
 		}
 		if r, err := harness.RunAsSystem(s.Client, "dpapi", "-in", blob); err != nil {
 			t.Errorf("run as SYSTEM: %v", err)

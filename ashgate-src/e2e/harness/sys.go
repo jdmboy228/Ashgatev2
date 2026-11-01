@@ -4,6 +4,7 @@ package harness
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -38,9 +39,15 @@ var (
 	pGetExtendedUdpTable   = iphlpapi.NewProc("GetExtendedUdpTable")
 )
 
+// cmdTimeout bounds every helper command: a hung PowerShell must fail one
+// check, not eat the whole job.
+const cmdTimeout = 3 * time.Minute
+
 // PS runs a PowerShell script and returns its trimmed output.
 func PS(script string) (string, error) {
-	cmd := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+	ctx, cancel := context.WithTimeout(context.Background(), cmdTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
 		"-Command", "[Console]::OutputEncoding=[Text.Encoding]::UTF8; $ProgressPreference='SilentlyContinue'; "+script)
 	out, err := cmd.CombinedOutput()
 	s := strings.TrimSpace(string(out))
@@ -52,7 +59,9 @@ func PS(script string) (string, error) {
 
 // Run runs a program and returns its combined output.
 func Run(name string, args ...string) (string, error) {
-	out, err := exec.Command(name, args...).CombinedOutput()
+	ctx, cancel := context.WithTimeout(context.Background(), cmdTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, name, args...).CombinedOutput()
 	return strings.TrimSpace(string(out)), err
 }
 

@@ -187,7 +187,7 @@ func TestInstall(t *testing.T) {
 		var dlg harness.Window
 		err := harness.Eventually(40*time.Second, 300*time.Millisecond, func() error {
 			if ok, code := a.Exited(); ok {
-				return fmt.Errorf("exited with %d before showing a message", code)
+				return harness.Stop{Err: fmt.Errorf("exited with %d before showing a message", code)}
 			}
 			for _, w := range harness.Windows(uint32(a.PID)) {
 				if w.Class == "#32770" && w.Visible {
@@ -380,19 +380,23 @@ func checkSettingsACL(t *testing.T, env *harness.Env) {
 	}
 	u, err := harness.NewOtherUser(env)
 	if err != nil {
-		t.Logf("other user: %v", err)
+		t.Errorf("other user: %v", err)
 		return
 	}
 	defer u.Delete()
-	client := env.ClientExe(t, harness.ClientProxied)
-	r, err := u.RunAs(client, "read", "-path", harness.ConfigPath())
-	if err != nil {
+	var readErr error
+	_, err = u.As(func() error {
+		_, readErr = os.ReadFile(harness.ConfigPath())
+		return nil
+	})
+	switch {
+	case err != nil:
 		env.Note("skipped", "settings ACL as another user: "+err.Error())
-		t.Logf("run as other user: %v", err)
-		return
-	}
-	if r.OK {
-		t.Errorf("a standard user read config.json (%d bytes)", r.Bytes)
+		t.Logf("as another user: %v", err)
+	case readErr == nil:
+		t.Errorf("a standard user read config.json")
+	case !errors.Is(readErr, os.ErrPermission):
+		t.Errorf("a standard user got %v reading config.json, want access denied", readErr)
 	}
 }
 

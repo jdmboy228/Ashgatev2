@@ -81,7 +81,14 @@ func Launch(t testing.TB, env *Env, exe string, o LaunchOpts) *App {
 	if o.NoDebug {
 		return a
 	}
-	if err := a.connect(o.ReadyTimeout); err != nil {
+	first := o.ReadyTimeout
+	if !policyUsed && first > 20*time.Second {
+		// The variable is tried briefly: go-webview2 loads the runtime
+		// without the loader that reads it, so on most machines only the
+		// policy works.
+		first = 20 * time.Second
+	}
+	if err := a.connect(first); err != nil {
 		if policyUsed {
 			t.Fatalf("app API not reachable: %v", err)
 		}
@@ -92,8 +99,8 @@ func Launch(t testing.TB, env *Env, exe string, o LaunchOpts) *App {
 		if err := SetDebugPolicy(true); err != nil {
 			t.Fatalf("debug policy: %v", err)
 		}
+		// It stays for this test binary: TestMain and the workflow remove it.
 		policyUsed = true
-		t.Cleanup(func() { _ = SetDebugPolicy(false) })
 		a = start(t, env, exe, o, false)
 		if err := a.connect(o.ReadyTimeout); err != nil {
 			t.Fatalf("app API not reachable with the policy either: %v", err)
@@ -220,6 +227,16 @@ func SetDebugPolicy(on bool) error {
 	}
 	defer k.Close()
 	return k.SetStringValue(policyValue, debugArg)
+}
+
+// WithoutDebugPolicy runs fn with the debugging policy removed and puts it
+// back afterwards if this binary had set it.
+func WithoutDebugPolicy(fn func()) {
+	if policyUsed {
+		_ = SetDebugPolicy(false)
+		defer func() { _ = SetDebugPolicy(true) }()
+	}
+	fn()
 }
 
 // DebugPolicySet reports whether the policy value exists.

@@ -259,7 +259,15 @@ test.describe.serial("Ashgate window", () => {
     await dlg().locator("#p-name").fill("Подписка e2e");
     await dlg().locator("#p-suburl").fill(fx.subURL);
     await dlg().locator('button[type="submit"]').click();
-    await expect(dlg()).toHaveCount(0, { timeout: 30_000 });
+    // On a refusal, say why: the dialog's error text, a screenshot, and
+    // what the subscription server saw.
+    await expect(dlg()).toHaveCount(0, { timeout: 30_000 }).catch(async (e) => {
+      await page.screenshot({ path: shotPath("fail-subscription") }).catch(() => {});
+      const why = (await page.locator("#modal .field-err").allInnerTexts().catch(() => [])).join(" | ");
+      let hits = "";
+      try { hits = await (await fetch("http://127.0.0.1:19999/hits")).text(); } catch { /* no control API */ }
+      throw new Error(`the subscription dialog stayed open: "${why}"; server hits: ${hits.slice(0, 600)}; ${e}`);
+    });
     const row = page.locator(".prow", { hasText: "Подписка e2e" });
     await expect(row).toBeVisible();
     await expect(row).toContainText(/2 сервера/);

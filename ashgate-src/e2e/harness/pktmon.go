@@ -27,6 +27,8 @@ type Packet struct {
 	SrcPort int       `json:"sport,omitempty"`
 	DstPort int       `json:"dport,omitempty"`
 	SYN     bool      `json:"syn,omitempty"`
+	Flags   string    `json:"flags,omitempty"` // TCP flags, e.g. "FA" for FIN+ACK
+	Payload int       `json:"payload,omitempty"`
 	DNS     []string  `json:"dns,omitempty"` // query names
 }
 
@@ -35,8 +37,11 @@ func (p Packet) DstIP() net.IP { return net.ParseIP(p.Dst) }
 
 func (p Packet) String() string {
 	s := fmt.Sprintf("%s %s %s:%d -> %s:%d", p.Time.Format("15:04:05.000"), p.Proto, p.Src, p.SrcPort, p.Dst, p.DstPort)
-	if p.SYN {
-		s += " SYN"
+	if p.Flags != "" {
+		s += " [" + p.Flags + "]"
+	}
+	if p.Payload > 0 {
+		s += fmt.Sprintf(" %dB", p.Payload)
 	}
 	if len(p.DNS) > 0 {
 		s += " dns=" + strings.Join(p.DNS, ",")
@@ -123,6 +128,7 @@ func ReadPcapng(path string) ([]Packet, error) {
 		return nil, err
 	}
 	var out []Packet
+	seen := map[dupKey]time.Time{}
 	for {
 		data, ci, err := r.ReadPacketData()
 		if errors.Is(err, io.EOF) {
@@ -138,10 +144,38 @@ func ReadPcapng(path string) ([]Packet, error) {
 		}
 		if p, ok := decode(data, lt); ok {
 			p.Time = ci.Timestamp
+			// pktmon logs one packet once per network component it passes;
+			// keep the first sighting.
+			k := dupKey{p.Proto, p.Src, p.Dst, p.SrcPort, p.DstPort, p.Flags, p.Payload, sum(data)}
+			if t, ok := seen[k]; ok && p.Time.Sub(t) < 50*time.Millisecond {
+				continue
+			}
+			seen[k] = p.Time
 			out = append(out, p)
 		}
 	}
 	return out, nil
+}
+
+type dupKey struct {
+	proto, src, dst string
+	sport, dport    int
+	flags           string
+	payload         int
+	sum             uint32
+}
+
+// sum is a cheap fingerprint of the IP payload (headers may differ per component).
+func sum(b []byte) uint32 {
+	var h uint32 = 2166136261
+	start := 0
+	if len(b) > 34 {
+		start = 34 // past Ethernet + a minimal IPv4 header
+	}
+	for _, c := range b[start:] {
+		h = (h ^ uint32(c)) * 16777619
+	}
+	return h
 }
 
 func decode(data []byte, lt layers.LinkType) (Packet, bool) {
@@ -170,6 +204,15 @@ func decode(data []byte, lt layers.LinkType) (Packet, bool) {
 		t := l.(*layers.TCP)
 		p.Proto, p.SrcPort, p.DstPort = "tcp", int(t.SrcPort), int(t.DstPort)
 		p.SYN = t.SYN && !t.ACK
+		for _, f := range []struct {
+			on bool
+			c  string
+		}{{t.SYN, "S"}, {t.FIN, "F"}, {t.RST, "R"}, {t.PSH, "P"}, {t.ACK, "A"}} {
+			if f.on {
+				p.Flags += f.c
+			}
+		}
+		p.Payload = len(t.Payload)
 	} else if l := pk.Layer(layers.LayerTypeUDP); l != nil {
 		u := l.(*layers.UDP)
 		p.Proto, p.SrcPort, p.DstPort = "udp", int(u.SrcPort), int(u.DstPort)

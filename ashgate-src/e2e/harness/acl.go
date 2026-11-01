@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 	"unsafe"
@@ -123,22 +124,75 @@ func (u OtherUser) Delete() {
 	_, _ = PS(`Get-CimInstance Win32_UserProfile | Where-Object { $_.LocalPath -like '*\` + u.Name + `' } | Remove-CimInstance -ErrorAction SilentlyContinue`)
 }
 
-// RunAs runs exe with args as the user (profile loaded) and returns the
-// client JSON it wrote to a shared file.
-func (u OtherUser) RunAs(exe string, args ...string) (ClientResult, error) {
-	out := filepath.Join(SharedDir, fmt.Sprintf("out-%d.json", time.Now().UnixNano()))
-	quoted := make([]string, 0, len(args))
-	for _, a := range args {
-		quoted = append(quoted, "'"+strings.ReplaceAll(a, "'", "''")+"'")
+var (
+	advapi32                 = windows.NewLazySystemDLL("advapi32.dll")
+	userenv                  = windows.NewLazySystemDLL("userenv.dll")
+	pLogonUser               = advapi32.NewProc("LogonUserW")
+	pImpersonateLoggedOnUser = advapi32.NewProc("ImpersonateLoggedOnUser")
+	pLoadUserProfile         = userenv.NewProc("LoadUserProfileW")
+	pUnloadUserProfile       = userenv.NewProc("UnloadUserProfile")
+)
+
+type profileInfo struct {
+	Size, Flags                                        uint32
+	UserName, ProfilePath, DefaultPath, Server, Policy *uint16
+	Profile                                            windows.Handle
+}
+
+// As runs fn on this goroutine's thread while it impersonates the user
+// (logged on, profile loaded when possible, so DPAPI has the user's keys).
+// No process is started: an earlier Start-Process -Credential version hung
+// on the runner. profile reports whether the user's profile was loaded.
+func (u OtherUser) As(fn func() error) (profile bool, err error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	name, _ := windows.UTF16PtrFromString(u.Name)
+	dom, _ := windows.UTF16PtrFromString(".")
+	pw, _ := windows.UTF16PtrFromString(u.Pass)
+	var tok windows.Token
+	const interactive, network, providerDefault = 2, 3, 0
+	r, _, e := pLogonUser.Call(uintptr(unsafe.Pointer(name)), uintptr(unsafe.Pointer(dom)), uintptr(unsafe.Pointer(pw)),
+		interactive, providerDefault, uintptr(unsafe.Pointer(&tok)))
+	if r == 0 {
+		r, _, e = pLogonUser.Call(uintptr(unsafe.Pointer(name)), uintptr(unsafe.Pointer(dom)), uintptr(unsafe.Pointer(pw)),
+			network, providerDefault, uintptr(unsafe.Pointer(&tok)))
+		if r == 0 {
+			return false, fmt.Errorf("LogonUser %s: %v", u.Name, e)
+		}
 	}
-	script := fmt.Sprintf(`$p = ConvertTo-SecureString '%s' -AsPlainText -Force;`+
-		`$c = New-Object System.Management.Automation.PSCredential('%s', $p);`+
-		`Start-Process -FilePath '%s' -ArgumentList @(%s) -Credential $c -LoadUserProfile -WorkingDirectory '%s' -RedirectStandardOutput '%s' -Wait -WindowStyle Hidden`,
-		u.Pass, u.Name, exe, strings.Join(quoted, ","), SharedDir, out)
-	if o, err := PS(script); err != nil {
-		return ClientResult{}, fmt.Errorf("run as %s: %v: %s", u.Name, err, o)
+	defer tok.Close()
+	enablePrivileges("SeBackupPrivilege", "SeRestorePrivilege")
+	pi := profileInfo{Flags: 1 /* PI_NOUI */, UserName: name}
+	pi.Size = uint32(unsafe.Sizeof(pi))
+	if r, _, _ := pLoadUserProfile.Call(uintptr(tok), uintptr(unsafe.Pointer(&pi))); r != 0 {
+		profile = true
+		defer pUnloadUserProfile.Call(uintptr(tok), uintptr(pi.Profile))
 	}
-	return readResult(out)
+	if r, _, e := pImpersonateLoggedOnUser.Call(uintptr(tok)); r == 0 {
+		return profile, fmt.Errorf("ImpersonateLoggedOnUser: %v", e)
+	}
+	defer windows.RevertToSelf()
+	return profile, fn()
+}
+
+// enablePrivileges turns on privileges the elevated token holds but keeps
+// disabled (LoadUserProfile needs backup and restore).
+func enablePrivileges(names ...string) {
+	var tok windows.Token
+	if err := windows.OpenProcessToken(windows.CurrentProcess(), windows.TOKEN_ADJUST_PRIVILEGES|windows.TOKEN_QUERY, &tok); err != nil {
+		return
+	}
+	defer tok.Close()
+	for _, n := range names {
+		var luid windows.LUID
+		np, _ := windows.UTF16PtrFromString(n)
+		if windows.LookupPrivilegeValue(nil, np, &luid) != nil {
+			continue
+		}
+		tp := windows.Tokenprivileges{PrivilegeCount: 1}
+		tp.Privileges[0] = windows.LUIDAndAttributes{Luid: luid, Attributes: windows.SE_PRIVILEGE_ENABLED}
+		_ = windows.AdjustTokenPrivileges(tok, false, &tp, 0, nil, nil)
+	}
 }
 
 // RunAsSystem runs exe as LocalSystem through a one-off scheduled task.
