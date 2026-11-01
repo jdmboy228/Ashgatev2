@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -57,11 +58,29 @@ type Relay struct {
 type DNS struct {
 	// Mode is "proxy" (send queries to Servers through the rule's proxy)
 	// or "original" (send them to the destination the application chose).
-	Mode                  string   `json:"mode"`
-	Servers               []string `json:"servers"`
-	IncludeSystemResolver bool     `json:"includeSystemResolver"`
-	SystemResolverProxy   string   `json:"systemResolverProxy"`
+	Mode    string   `json:"mode"`
+	Servers []string `json:"servers"`
+	// SystemResolver decides the lookups of the Windows DNS client
+	// (svchost.exe), which resolves for every program that calls
+	// getaddrinfo, and DNS packets whose program is unknown. Ashgate cannot
+	// tell which program asked, so "tunnel" (also the empty value) sends
+	// them through SystemResolverProxy, except bypass names, which go to
+	// the provider's DNS unchanged. "direct" leaves them alone.
+	// 0.9.1 and older had includeSystemResolver, off by default; it is no
+	// longer read.
+	SystemResolver string `json:"systemResolver,omitempty"`
+	// SystemResolverProxy carries those lookups. Empty picks the proxy of
+	// the first enabled proxy rule, VLESS first.
+	SystemResolverProxy string `json:"systemResolverProxy"`
+	// Bootstrap lists DoH URLs for Ashgate's own lookups (proxy servers,
+	// the subscription host), so the provider's DNS never sees them. Each
+	// URL names an IP. Empty means public resolvers; tests point it at a
+	// fake one on loopback, the only place plain http is allowed.
+	Bootstrap []string `json:"bootstrap,omitempty"`
 }
+
+// SystemTunnel reports whether system lookups go through a proxy.
+func (d DNS) SystemTunnel() bool { return d.SystemResolver != "direct" }
 
 // Log selects the optional JSON-lines connection log.
 type Log struct {
@@ -115,6 +134,31 @@ var DefaultDirectDomains = []string{
 	"gazprombank.ru", "raiffeisen.ru", "sovcombank.ru", "pochtabank.ru", "psbank.ru",
 	"rshb.ru", "open.ru", "mkb.ru",
 	"yandex.ru", "ya.ru", "vk.com", "max.ru",
+}
+
+// DefaultDNSServers carry proxied DNS when dns.servers is empty.
+var DefaultDNSServers = []string{"1.1.1.1:53", "8.8.8.8:53"}
+
+// ProxyDNSServers is where proxied queries go: dns.servers, or the defaults
+// when "original" mode left it empty (system DNS and VLESS still need one).
+func (d DNS) ProxyDNSServers() []string {
+	if len(d.Servers) == 0 {
+		return append([]string(nil), DefaultDNSServers...)
+	}
+	return append([]string(nil), d.Servers...)
+}
+
+// RussianZones always go direct and resolve with the provider's DNS, like
+// DirectDomains: .ru, .рф (xn--p1ai in DNS) and .su. Russian sites then see
+// the real address and get local CDN answers.
+var RussianZones = []string{"ru", "xn--p1ai", "su"}
+
+// BypassDomains is every name that goes direct: the Russian zones and
+// DirectDomains, subdomains included.
+func (c *Config) BypassDomains() []string {
+	out := make([]string, 0, len(RussianZones)+len(c.DirectDomains))
+	out = append(out, RussianZones...)
+	return append(out, c.DirectDomains...)
 }
 
 // Rule maps one application to a proxy, a direct connection, or a drop.
@@ -208,7 +252,7 @@ func (c *Config) ApplyDefaults() {
 		c.DNS.Mode = "proxy"
 	}
 	if c.DNS.Mode == "proxy" && len(c.DNS.Servers) == 0 {
-		c.DNS.Servers = []string{"1.1.1.1:53", "8.8.8.8:53"}
+		c.DNS.Servers = append([]string(nil), DefaultDNSServers...)
 	}
 	if c.UDPUnsupported == "" {
 		c.UDPUnsupported = "block"
@@ -224,6 +268,13 @@ func (c *Config) ApplyDefaults() {
 	}
 	if c.DirectDomains == nil {
 		c.DirectDomains = append([]string(nil), DefaultDirectDomains...)
+	}
+	if c.DNS.SystemResolverProxy != "" {
+		// A deleted proxy left behind (0.9.1 kept the name while the
+		// switch was off) means the automatic choice, not a broken file.
+		if _, ok := c.ProxyByName(c.DNS.SystemResolverProxy); !ok {
+			c.DNS.SystemResolverProxy = ""
+		}
 	}
 	for i := range c.Rules {
 		if c.Rules[i].Enabled == nil {
@@ -319,12 +370,19 @@ func (c *Config) Validate() error {
 		}
 	}
 
-	if c.DNS.IncludeSystemResolver {
-		if c.DNS.SystemResolverProxy == "" {
-			return errors.New("dns.systemResolverProxy is required when includeSystemResolver is true")
-		}
+	switch c.DNS.SystemResolver {
+	case "", "tunnel", "direct":
+	default:
+		return fmt.Errorf("dns.systemResolver must be tunnel or direct, got %q", c.DNS.SystemResolver)
+	}
+	if c.DNS.SystemResolverProxy != "" {
 		if _, ok := names[c.DNS.SystemResolverProxy]; !ok {
 			return fmt.Errorf("dns.systemResolverProxy %q is not a configured proxy", c.DNS.SystemResolverProxy)
+		}
+	}
+	for i, u := range c.DNS.Bootstrap {
+		if err := checkBootstrap(u); err != nil {
+			return fmt.Errorf("dns.bootstrap[%d]: %w", i, err)
 		}
 	}
 
@@ -358,7 +416,7 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("rules[%d]: mask %q matches every program", i, r.Process)
 		}
 		if base == "svchost.exe" {
-			return fmt.Errorf("rules[%d]: do not match svchost.exe; use dns.includeSystemResolver for system DNS", i)
+			return fmt.Errorf("rules[%d]: do not match svchost.exe; system DNS follows dns.systemResolver", i)
 		}
 		if r.Group != "" {
 			continue // the group's route applies and is checked above
@@ -402,6 +460,26 @@ func checkRoute(action, proxy string, names map[string]struct{}) error {
 		}
 	default:
 		return fmt.Errorf("action must be proxy, direct or block, got %q", action)
+	}
+	return nil
+}
+
+// checkBootstrap accepts a DoH URL that needs no lookup itself: https to an
+// IP, or plain http to loopback (a test resolver).
+func checkBootstrap(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return err
+	}
+	ip := net.ParseIP(u.Hostname())
+	if ip == nil {
+		return fmt.Errorf("%q must name an IP address", raw)
+	}
+	switch {
+	case u.Scheme == "https":
+	case u.Scheme == "http" && ip.IsLoopback():
+	default:
+		return fmt.Errorf("%q must be https (http only on loopback)", raw)
 	}
 	return nil
 }

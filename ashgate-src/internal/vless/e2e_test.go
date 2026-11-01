@@ -1080,10 +1080,105 @@ func TestDNSThroughXray(t *testing.T) {
 
 // dnsQuery is a minimal recursive A query.
 func dnsQuery(id uint16, name string) []byte {
+	return dnsQueryType(id, name, 1)
+}
+
+func dnsQueryType(id uint16, name string, qtype uint16) []byte {
 	q := []byte{byte(id >> 8), byte(id), 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0}
 	for _, label := range strings.Split(name, ".") {
 		q = append(q, byte(len(label)))
 		q = append(q, label...)
 	}
-	return append(q, 0, 0, 1, 0, 1)
+	return append(q, 0, byte(qtype>>8), byte(qtype), 0, 1)
+}
+
+// tcpDNSRecorder answers DNS over TCP by echoing each query as a reply and
+// counts the queries it saw.
+func tcpDNSRecorder(t *testing.T) (string, func() int) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	seen := make(chan struct{}, 64)
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer c.Close()
+				for {
+					var hdr [2]byte
+					if _, err := io.ReadFull(c, hdr[:]); err != nil {
+						return
+					}
+					msg := make([]byte, int(hdr[0])<<8|int(hdr[1]))
+					if _, err := io.ReadFull(c, msg); err != nil {
+						return
+					}
+					seen <- struct{}{}
+					msg[2] |= 0x80
+					if _, err := c.Write(append(hdr[:], msg...)); err != nil {
+						return
+					}
+				}
+			}()
+		}
+	}()
+	return ln.Addr().String(), func() int { return len(seen) }
+}
+
+// A query type Xray's DNS does not answer (TXT here; HTTPS, SRV and MX
+// alike) goes as it is to the raw server through the tunnel: answered
+// while the server is up, unanswered while it is down, never sent direct.
+func TestOtherQueryTypesGoThroughTheTunnel(t *testing.T) {
+	const uuid = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+	rawDNS, count := tcpDNSRecorder(t)
+	port := mustFree(t)
+	t.Cleanup(startRealityServer(t, port, uuid, "", tlsDest(t)))
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	params := rawRealityParams(uuid, "", "firefox")
+	routing := vless.Routing{Direct: []string{"ru"}, DNS: []string{"https://1.1.1.1/dns-query"}, Raw: rawDNS}
+	ask := func(br *vless.Bridge, id uint16) bool {
+		us, err := vless.DialUDP(br.Addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer us.Close()
+		if err := us.Send(ctx, &net.UDPAddr{IP: net.ParseIP("192.168.1.1"), Port: 53}, dnsQueryType(id, "txt.example.com", 16)); err != nil {
+			t.Fatal(err)
+		}
+		got := make(chan []byte, 1)
+		go func() {
+			if _, b, err := us.Recv(ctx); err == nil {
+				got <- b
+			}
+		}()
+		select {
+		case b := <-got:
+			return len(b) >= 12 && int(b[0])<<8|int(b[1]) == int(id) && b[2]&0x80 != 0
+		case <-time.After(8 * time.Second):
+			return false
+		}
+	}
+	up, err := vless.ListenWith(ctx, net.JoinHostPort("127.0.0.1", itoa(port)), params, vless.Inbound{}, routing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(up.Close)
+	if !ask(up, 0x5151) || count() != 1 {
+		t.Fatalf("TXT through a working tunnel: the raw server saw %d queries", count())
+	}
+	down, err := vless.ListenWith(ctx, deadServer(t), params, vless.Inbound{}, routing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(down.Close)
+	if ask(down, 0x5252) || count() != 1 {
+		t.Fatalf("TXT with the tunnel down was answered (raw server saw %d)", count())
+	}
 }

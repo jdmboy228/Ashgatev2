@@ -118,7 +118,7 @@ function demoState() {
     config: {
       version: 1,
       relay: { tcp4: "127.0.0.1:34010", tcp6: "[::1]:34010" },
-      dns: { mode: "proxy", servers: ["1.1.1.1:53", "8.8.8.8:53"], includeSystemResolver: false, systemResolverProxy: "local" },
+      dns: { mode: "proxy", servers: ["1.1.1.1:53", "8.8.8.8:53"], systemResolver: "tunnel", systemResolverProxy: "" },
       bypassPrivate: true,
       killSwitch: true,
       udpUnsupported: "block",
@@ -227,16 +227,16 @@ function logHTML() {
 function settingsHTML() {
   const c = cfg();
   const dnsOn = c.dns.mode !== "original";
-  const sys = !!c.dns.includeSystemResolver;
+  const sys = c.dns.systemResolver !== "direct";
   const udp = c.udpUnsupported === "direct" ? 1 : 0;
   const names = (c.proxies || []).map((p) => p.name);
-  const selProxy = c.dns.systemResolverProxy || names[0] || "";
+  const selProxy = c.dns.systemResolverProxy || "";
   return `<div class="head"><div><h1>Настройки</h1><p class="sub">Применяются сразу · ${esc(state.path || "config.json")}</p></div>
   <div class="head-actions"><button class="btn ghost" data-act="open-folder" type="button">${icon("folder")}Открыть папку</button></div></div>
   ${group("DNS", [
     row("globe", "DNS приложений через прокси", "Порт 53 выбранных приложений уходит через прокси их правила", toggle("dns", dnsOn)),
     row("server", "DNS-серверы", "Куда отправлять эти запросы", `<input class="mono" id="dns-servers" value="${esc((c.dns.servers || []).join(", "))}" ${dnsOn ? "" : "disabled"}>`),
-    row("sliders", "Системный резолвер (svchost.exe)", "Влияет на DNS всех программ, не только выбранных", `${select("sys-proxy", names, selProxy, !sys)}${toggle("sys", sys)}`, true),
+    row("sliders", "DNS Windows через туннель", "Имена, которые программы спрашивают у Windows (svchost.exe), идут через прокси, кроме исключений и .ru, .рф, .su. Пока туннель не работает, они не разрешаются", `${select("sys-proxy", names, selProxy, !sys, "Авто")}${toggle("sys", sys)}`),
   ])}
   ${group("Защита от утечек", [
     row("shield", "Kill switch", "Приложения с правилом «прокси» и их дочерние процессы никогда не выходят в сеть напрямую. Пока перехват выключен или Ashgate закрыт, Брандмауэр Windows отключает их от сети", toggle("kill", !!c.killSwitch), true),
@@ -246,7 +246,7 @@ function settingsHTML() {
     row("link", "Не проксировать частные сети", "10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, fc00::/7 — напрямую", toggle("bypass", !!c.bypassPrivate)),
   ])}
   ${group("Исключения", [
-    row("link", "Напрямую, без VLESS", "По одному домену в строке, поддомены тоже. Эти сайты открываются напрямую, даже если правило приложения ведёт через VLESS, и их имена разрешает системный DNS", `<div class="field" style="width:240px"><textarea class="mono" id="direct-domains" rows="6" spellcheck="false">${esc((c.directDomains || []).join("\n"))}</textarea></div>`),
+    row("link", "Напрямую, без VLESS", "По одному домену в строке, поддомены тоже. Эти сайты открываются напрямую, даже если правило приложения ведёт через VLESS, и их имена разрешает DNS провайдера. .ru, .рф и .su — всегда напрямую", `<div class="field" style="width:240px"><textarea class="mono" id="direct-domains" rows="6" spellcheck="false">${esc((c.directDomains || []).join("\n"))}</textarea></div>`),
   ])}
   ${group("Запуск и журнал", [
     row("rocket", "Запускать с Windows", "При входе в систему открывается окно и включается перехват", toggle("auto", !!state.autostart)),
@@ -323,8 +323,11 @@ function toggle(key, on) {
 function segCtrl(key, labels, values, active) {
   return `<div class="seg">${labels.map((l, i) => `<button type="button" data-act="seg" data-key="${key}" data-value="${values[i]}" class="${i === active ? "on" : ""}">${l}</button>`).join("")}</div>`;
 }
-function select(id, names, value, disabled) {
-  const opts = names.map((n) => `<option ${n === value ? "selected" : ""}>${esc(n)}</option>`).join("");
+// select lists proxy names; auto, when given, is a first option with an
+// empty value.
+function select(id, names, value, disabled, auto) {
+  let opts = names.map((n) => `<option value="${esc(n)}" ${n === value ? "selected" : ""}>${esc(n)}</option>`).join("");
+  if (auto) opts = `<option value="" ${value ? "" : "selected"}>${esc(auto)}</option>` + opts;
   return `<select id="${id}" ${disabled ? "disabled" : ""}>${opts || `<option value="">нет прокси</option>`}</select>`;
 }
 
@@ -1257,7 +1260,7 @@ function renameProxyRefs(from, to) {
 }
 function proxyInUse(name) {
   return (cfg().rules || []).some((r) => r.proxy === name) || (cfg().groups || []).some((g) => g.proxy === name) ||
-    (cfg().dns.includeSystemResolver && cfg().dns.systemResolverProxy === name);
+    (cfg().dns.systemResolver !== "direct" && cfg().dns.systemResolverProxy === name);
 }
 // dnsServer adds the default port to a bare IP: "1.1.1.1" -> "1.1.1.1:53".
 function dnsServer(s) {
@@ -1273,6 +1276,8 @@ function cleanDomains(text) {
   for (let d of String(text || "").split(/[\s,;]+/)) {
     d = d.trim().toLowerCase().replace(/^[a-z]+:\/\//, "").replace(/[\/?#].*$/, "").replace(/:\d+$/, "");
     d = d.replace(/^\*?\.+/, "").replace(/\.+$/, "");
+    // Cyrillic names (госуслуги.рф) as DNS spells them: xn--….xn--p1ai.
+    if (/[^\x00-\x7f]/.test(d)) { try { d = new URL("http://" + d).hostname; } catch { /* left for the server to reject */ } }
     if (d && !out.includes(d)) out.push(d);
   }
   return out;
@@ -1284,7 +1289,7 @@ function readSettings() {
   const dnsInput = document.getElementById("dns-servers");
   c.dns.servers = dnsInput.value.split(/[,\s]+/).map(dnsServer).filter(Boolean);
   if (c.dns.servers.length) dnsInput.value = c.dns.servers.join(", ");
-  c.dns.includeSystemResolver = document.querySelector('[data-key="sys"]').classList.contains("on");
+  c.dns.systemResolver = document.querySelector('[data-key="sys"]').classList.contains("on") ? "tunnel" : "direct";
   const sp = document.getElementById("sys-proxy");
   c.dns.systemResolverProxy = sp ? sp.value : "";
   const udp = document.querySelector('[data-key="udp"].on');

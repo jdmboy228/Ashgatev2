@@ -146,12 +146,25 @@ func (r *Resolver) pruneLocked(now time.Time) {
 
 // Lookup implements engine.Resolver.
 func (r *Resolver) Lookup(proto uint8, src packet.Addr) (rules.Process, bool) {
+	return r.lookup(proto, src, false)
+}
+
+// LookupLive is Lookup without sockets that already closed. Their entry
+// stays for closeGrace so a connection's last packets keep their owner, but
+// a new socket of another program may already have the port and its event
+// may still be on the way: for DNS that would credit the query to the
+// wrong program. Unknown, the packet waits for the event.
+func (r *Resolver) LookupLive(proto uint8, src packet.Addr) (rules.Process, bool) {
+	return r.lookup(proto, src, true)
+}
+
+func (r *Resolver) lookup(proto uint8, src packet.Addr, live bool) (rules.Process, bool) {
 	if r == nil || src.Port == 0 {
 		return rules.Process{}, false
 	}
 	now := r.now()
 	r.mu.Lock()
-	if p, ok := r.socketLocked(proto, src, now); ok {
+	if p, ok := r.socketLocked(proto, src, now, live); ok {
 		r.mu.Unlock()
 		return r.finish(p)
 	}
@@ -166,7 +179,7 @@ func (r *Resolver) Lookup(proto uint8, src packet.Addr) (rules.Process, bool) {
 		} else if r.helperAt.IsZero() || now.Sub(r.helperAt) >= helperGap {
 			r.helperAt = now
 		}
-		if p, ok := r.socketLocked(proto, src, now); ok {
+		if p, ok := r.socketLocked(proto, src, now, live); ok {
 			r.mu.Unlock()
 			return r.finish(p)
 		}
@@ -197,19 +210,22 @@ func (r *Resolver) finish(p rules.Process) (rules.Process, bool) {
 	return p, true
 }
 
-func (r *Resolver) socketLocked(proto uint8, src packet.Addr, now time.Time) (rules.Process, bool) {
+// socketLocked finds a socket event for src. live skips closed sockets.
+func (r *Resolver) socketLocked(proto uint8, src packet.Addr, now time.Time, live bool) (rules.Process, bool) {
 	if e, ok := r.exact[exactKey{proto, src}]; ok {
-		if alive(e, now) {
+		if !alive(e, now) {
+			delete(r.exact, exactKey{proto, src})
+		} else if !live || e.until.IsZero() {
 			return e.proc, true
 		}
-		delete(r.exact, exactKey{proto, src})
 	}
 	wk := wildKey{proto, src.Port}
 	if e, ok := r.wild[wk]; ok {
-		if alive(e, now) {
+		if !alive(e, now) {
+			delete(r.wild, wk)
+		} else if !live || e.until.IsZero() {
 			return e.proc, true
 		}
-		delete(r.wild, wk)
 	}
 	return rules.Process{}, false
 }

@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"ashgate/internal/bootstrap"
 	"ashgate/internal/config"
 	"ashgate/internal/logbuf"
 	"ashgate/internal/runtime"
@@ -147,6 +148,7 @@ func (handler) Execute(args []string, requests <-chan svc.ChangeRequest, changes
 	if err != nil {
 		return false, 1
 	}
+	bootstrap.Default.SetFile(bootstrap.CacheFile(path))
 	if cfg.Log.File == "" {
 		cfg.Log.File = defaultLog(path)
 	}

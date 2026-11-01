@@ -909,7 +909,7 @@ func ruConfig(err error) string {
 	case strings.Contains(s, "Не удалось разобрать ссылку VLESS"):
 		return s
 	case strings.Contains(s, "systemResolverProxy"):
-		return "Для системного резолвера выберите прокси."
+		return "Прокси для DNS Windows нет в списке. Выберите другой или «Авто»."
 	case strings.Contains(s, "matches every program"):
 		return "Маска совпадает со всеми программами. Укажите имя или часть пути, например *\\Discord\\*.exe."
 	case strings.Contains(s, "process is required"):

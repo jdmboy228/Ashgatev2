@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"sync"
 
+	"ashgate/internal/bootstrap"
 	"ashgate/internal/config"
 	"ashgate/internal/engine"
 	"ashgate/internal/logbuf"
@@ -149,6 +151,8 @@ func WireVLESS(ctx context.Context, m *vless.Manager, cfg *config.Config) (map[s
 		return nil, errors.New("VLESS: локальный мост не запущен")
 	}
 	items := make([]vless.Endpoint, 0)
+	// Server names below are looked up with these (test) resolvers.
+	bootstrap.Default.SetServers(cfg.DNS.Bootstrap)
 	routing := RoutingFor(cfg)
 	empty := map[string]bool{}
 	for i := range cfg.Proxies {
@@ -190,12 +194,19 @@ func WireVLESS(ctx context.Context, m *vless.Manager, cfg *config.Config) (map[s
 	return status, err
 }
 
-// RoutingFor is what every bridge does besides proxying: the direct
-// domains, and Xray's DNS for port 53 when DNS goes through the proxy.
+// RoutingFor is what every bridge does besides proxying: the bypass names
+// (Russian zones and direct domains) go direct, and port 53 goes to Xray's
+// DNS. In "original" mode too: the server an app chose (often the router)
+// cannot be reached from the VPS, and a failed lookup makes browsers ask
+// Windows instead.
 func RoutingFor(cfg *config.Config) vless.Routing {
-	rt := vless.Routing{Direct: append([]string(nil), cfg.DirectDomains...)}
-	if cfg.DNS.Mode == "proxy" {
-		rt.DNS = vless.DNSServers(cfg.DNS.Servers)
+	servers := cfg.DNS.ProxyDNSServers()
+	rt := vless.Routing{Direct: cfg.BypassDomains(), DNS: vless.DNSServers(servers)}
+	for _, s := range servers {
+		if host, _, err := net.SplitHostPort(s); err == nil && net.ParseIP(host) != nil {
+			rt.Raw = s
+			break
+		}
 	}
 	return rt
 }

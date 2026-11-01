@@ -102,7 +102,9 @@ func TestValidateErrors(t *testing.T) {
 		}, "must be empty"},
 		{"bad theme", Config{UI: UI{Theme: "blue"}}, "theme"},
 		{"bad udp", Config{UDPUnsupported: "drop"}, "udpUnsupported"},
-		{"system dns", Config{DNS: DNS{IncludeSystemResolver: true}}, "systemResolverProxy"},
+		{"system dns mode", Config{DNS: DNS{SystemResolver: "on"}}, "systemResolver"},
+		{"bootstrap name", Config{DNS: DNS{Bootstrap: []string{"https://dns.google/dns-query"}}}, "IP address"},
+		{"bootstrap plain http", Config{DNS: DNS{Bootstrap: []string{"http://1.1.1.1/dns-query"}}}, "https"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -422,5 +424,54 @@ func TestRelayMustBeLoopback(t *testing.T) {
 		if err := c.Validate(); (err == nil) != tc.ok {
 			t.Errorf("relay %s %s: err=%v", tc.tcp4, tc.tcp6, err)
 		}
+	}
+}
+
+// A 0.9.1 file always wrote includeSystemResolver, false by default. It
+// must not keep system lookups out of the tunnel, and a leftover proxy
+// name kept for a deleted proxy means the automatic choice.
+func TestOldSystemResolverFieldsLoad(t *testing.T) {
+	raw := []byte(`{
+		"version": 1,
+		"dns": {"mode": "proxy", "servers": ["1.1.1.1:53"], "includeSystemResolver": false, "systemResolverProxy": "gone"},
+		"proxies": [{"name": "h", "type": "socks5", "address": "127.0.0.1:1080"}],
+		"rules": []
+	}`)
+	path := filepath.Join(t.TempDir(), "c.json")
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.DNS.SystemTunnel() {
+		t.Fatal("system lookups must go through the tunnel by default")
+	}
+	if cfg.DNS.SystemResolverProxy != "" {
+		t.Fatalf("stale proxy name kept: %q", cfg.DNS.SystemResolverProxy)
+	}
+	if err := Save(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	saved, _ := os.ReadFile(path)
+	if strings.Contains(string(saved), "includeSystemResolver") {
+		t.Fatal("the old field is written back")
+	}
+}
+
+func TestBypassDomainsIncludeRussianZones(t *testing.T) {
+	c := Default()
+	c.DirectDomains = []string{"example.org"}
+	if got := strings.Join(c.BypassDomains(), ","); got != "ru,xn--p1ai,su,example.org" {
+		t.Fatalf("BypassDomains = %s", got)
+	}
+}
+
+func TestBootstrapURLs(t *testing.T) {
+	c := Default()
+	c.DNS.Bootstrap = []string{"https://1.1.1.1/dns-query", "http://127.0.0.1:8053/dns-query", "https://[2606:4700:4700::1111]/dns-query"}
+	if err := c.Validate(); err != nil {
+		t.Fatal(err)
 	}
 }

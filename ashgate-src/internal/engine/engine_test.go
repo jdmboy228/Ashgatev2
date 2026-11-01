@@ -708,7 +708,7 @@ func TestRefreshBypassSkipsDNSForIPLiterals(t *testing.T) {
 		t.Fatalf("looked up %v, want only proxy.example.com", looked)
 	}
 	for _, ip := range []string{"203.0.113.10", "2001:db8::1", "198.51.100.7"} {
-		if !e.destinationBypass(packet.FromIP(net.ParseIP(ip), 443), false) {
+		if !e.destinationBypass(packet.FromIP(net.ParseIP(ip), 443), false, false) {
 			t.Errorf("%s not in the bypass set", ip)
 		}
 	}

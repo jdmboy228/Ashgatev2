@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"ashgate/internal/autostart"
+	"ashgate/internal/bootstrap"
 	"ashgate/internal/config"
 	"ashgate/internal/gui"
 	"ashgate/internal/killswitch"
@@ -19,6 +20,7 @@ import (
 	"ashgate/internal/runtime"
 	"ashgate/internal/service"
 	"ashgate/internal/version"
+	"ashgate/internal/vless"
 	"ashgate/internal/windivert"
 )
 
@@ -47,6 +49,9 @@ const helpText = `Ashgate — прозрачный прокси для отде�
 
 // Main runs one invocation and returns an exit code.
 func Main() int {
+	// VLESS server names are looked up over DoH, never with the provider's
+	// DNS; see internal/bootstrap.
+	vless.ResolveServer = bootstrap.Default.LookupIP
 	if service.RunningAsService() {
 		if err := service.Serve(); err != nil {
 			fmt.Fprintln(os.Stderr, err)
@@ -190,6 +195,7 @@ func cmdRun(args []string) int {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
+	bootstrap.Default.SetFile(bootstrap.CacheFile(path))
 	file := cfg.Log.File
 	if file == "" {
 		file = filepath.Join(filepath.Dir(path), "ashgate.log")

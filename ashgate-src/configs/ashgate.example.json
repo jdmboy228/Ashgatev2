@@ -7,7 +7,7 @@
   "dns": {
     "mode": "proxy",
     "servers": ["1.1.1.1:53", "8.8.8.8:53"],
-    "includeSystemResolver": false,
+    "systemResolver": "tunnel",
     "systemResolverProxy": ""
   },
   "bypassPrivate": false,
