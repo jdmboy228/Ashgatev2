@@ -19,24 +19,12 @@ The app is in `ashgate-src/` (Go module `ashgate`). The installer is `installer.
 
 ## E2E progress (2026-11-01)
 
-Done:
-- `windows-e2e.yml` is green on push: run 41298533622 (all 8 jobs, version 0.9.1).
-- Dispatch run 41299555403 (long tests): connectivity passed, including the return to XHTTP after
-  1205 s with exactly 2 switches. Two failures remain, listed below.
-- App bugs found and fixed in 0.9.1 are in `ashgate-src/CHANGELOG.md`.
-
-Pending:
-- **Goroutine growth.** Not a leak: goroutines stay flat at 37, apart from two ~60 s spikes that go
-  back to 37. The 10-min run failed because the test client's 10-min HTTP timeout
-  (`e2e/cmd/client/main.go` `client()`) cut the 630 s `hold` stream at 600 s. Fix: give `hold` a
-  timeout of secs+60 s. Optionally compare medians of the first and last 5 samples in
-  `perf_test.go`.
-- **UI apps step.** A race in `ui.spec.ts`: the second "ap-add" fills `#ap-add-path` while
-  `renderModal()` rebuilds the dialog. Fix: wait for the dialog, then fill and check
-  `toHaveValue` inside `toPass()`. Small app bug behind it: `renderModal()` in `app.js` loses the
-  focused field and the typed text when the installed-apps list arrives. Fix: call `apReadModal()`
-  first and restore the focus.
-- **go-webview2 patch.** Its `PermissionRequested` (pkg/edge/chromium.go) passes `kind` by value to
-  `GetPermissionKind`, so the clipboard-read allow never matches and WebView2 asks for the
-  clipboard. Fix: a patched copy of the module via `replace` in go.mod (pass `&kind`), or fix it
-  upstream. Not done: the other option, allowing every permission kind, is too broad.
+- Green on version 0.9.1: push run 41315227236, and the long workflow_dispatch run 41316470292
+  (failover back to XHTTP after 1204 s, 10-minute stability and growth). All 8 jobs pass.
+- App bugs found and fixed are in `ashgate-src/CHANGELOG.md` under 0.9.1.
+- go-webview2 is a patched copy in `ashgate-src/third_party/go-webview2`, pulled in by `replace` in
+  go.mod. See its PATCHES.md, and keep the patch when updating the module.
+- Flagged, not changed:
+  - The page keeps polling `/api/state` every 3 s while in the tray.
+  - `schtasks.exe` runs once a minute for the autostart check.
+  - `ashgate.exe` has no VERSIONINFO resource.
