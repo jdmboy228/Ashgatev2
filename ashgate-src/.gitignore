@@ -10,3 +10,5 @@ ashgate.json
 /vendor/
 e2e/ui/node_modules/
 e2e/ui/out/
+# The patched go-webview2 embeds its WebView2Loader.dll (go:embed).
+!third_party/go-webview2/webviewloader/sdk/**/*.dll

@@ -60,3 +60,6 @@ require (
 	layeh.com/gopher-luar v1.0.11 // indirect
 	lukechampine.com/blake3 v1.4.1 // indirect
 )
+
+// A patched copy: see third_party/go-webview2/PATCHES.md.
+replace github.com/jchv/go-webview2 => ./third_party/go-webview2

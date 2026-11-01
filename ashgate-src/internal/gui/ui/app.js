@@ -525,10 +525,24 @@ function render() {
 
 function renderModal() {
   const root = document.getElementById("modal");
-  if (!modal) { root.innerHTML = ""; return; }
+  if (!modal) { root.innerHTML = ""; root.drawnFor = null; return; }
+  // A redraw of the same dialog (its app lists arrived, a save finished)
+  // keeps what was typed and the field and caret the user is in.
+  const again = root.drawnFor === modal;
+  const el = again && root.contains(document.activeElement) ? document.activeElement : null;
+  const id = el && el.id;
+  let sel = null;
+  try { sel = el ? [el.selectionStart, el.selectionEnd] : null; } catch (e) { sel = null; }
+  if (again && AP_MODALS[modal.kind]) apReadModal();
   if (modal.kind === "proxy") root.innerHTML = proxyDialog();
   else if (AP_MODALS[modal.kind]) root.innerHTML = AP_MODALS[modal.kind]();
   else if (modal.kind === "confirm" || modal.kind === "alert") root.innerHTML = confirmDialog();
+  root.drawnFor = modal;
+  const back = id && document.getElementById(id);
+  if (back) {
+    back.focus();
+    if (sel && sel[0] !== null && sel[0] !== undefined) { try { back.setSelectionRange(sel[0], sel[1]); } catch (e) { /* not a text field */ } }
+  }
 }
 function confirmDialog() {
   const alert = modal.kind === "alert";

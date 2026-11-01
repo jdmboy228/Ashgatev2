@@ -36,6 +36,9 @@ this version is the module above.
 - License: MIT
 - Ashgate links this package into `ashgate.exe`. The Microsoft Edge WebView2
   runtime is not bundled; Windows 10/11 normally already has it.
+- Ashgate builds a patched copy in `third_party/go-webview2` (see its
+  `PATCHES.md`); its embedded `WebView2Loader.dll` is Microsoft's, under
+  `webviewloader/sdk/LICENSE.txt`.
 
 ## Fonts embedded in the window
 
