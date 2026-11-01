@@ -475,7 +475,9 @@ func checkNothingLeft(t *testing.T, env *harness.Env) {
 	if exists(env.InstallDir) {
 		var names []string
 		_ = filepath.Walk(env.InstallDir, func(p string, _ os.FileInfo, _ error) error {
-			names = append(names, p)
+			if p != env.InstallDir {
+				names = append(names, p)
+			}
 			return nil
 		})
 		left(env.InstallDir + " " + strings.Join(names, ", "))

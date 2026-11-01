@@ -298,22 +298,28 @@ jobs:
         env:
           PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
         run: npm ci --no-audit --no-fund
-      - name: Install Setup.exe and start the test servers
+      - name: Install Setup.exe
         run: |
           New-Item -ItemType Directory -Force $env:E2E_OUT, C:\ashgate-e2e\apps | Out-Null
           $p = Start-Process -FilePath $env:E2E_SETUP -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/SP-',"/LOG=$env:E2E_OUT\setup.log" -Wait -PassThru
           if ($p.ExitCode) { throw "Setup.exe exit code $($p.ExitCode)" }
           Copy-Item "$env:E2E_BIN\ashgate-e2e-client.exe" C:\ashgate-e2e\apps\ashgate-e2e-client.exe
-          Start-Process -FilePath "$env:E2E_BIN\ashgate-e2e-servers.exe" -ArgumentList 'serve','-out',$env:E2E_OUT `
-            -RedirectStandardOutput "$env:E2E_OUT\servers.log" -RedirectStandardError "$env:E2E_OUT\servers-err.log"
+      # The test servers and Playwright share one step: the runner ends a
+      # step's processes when the step ends.
+      - name: UI tests (with the test servers)
+        working-directory: ashgate-src/e2e/ui
+        run: |
+          $srv = Start-Process -FilePath "$env:E2E_BIN\ashgate-e2e-servers.exe" -ArgumentList 'serve','-out',$env:E2E_OUT `
+            -RedirectStandardOutput "$env:E2E_OUT\servers.log" -RedirectStandardError "$env:E2E_OUT\servers-err.log" -PassThru
           $deadline = (Get-Date).AddSeconds(60)
           while (-not (Test-Path "$env:E2E_OUT\fixtures.json")) {
-            if ((Get-Date) -gt $deadline) { Get-Content "$env:E2E_OUT\servers-err.log" -ErrorAction SilentlyContinue; throw "test servers did not start" }
+            if ($srv.HasExited -or (Get-Date) -gt $deadline) { Get-Content "$env:E2E_OUT\servers-err.log" -ErrorAction SilentlyContinue; throw "test servers did not start" }
             Start-Sleep -Milliseconds 500
           }
-      - name: UI tests
-        working-directory: ashgate-src/e2e/ui
-        run: npx playwright test
+          npx playwright test
+          $code = $LASTEXITCODE
+          if ($srv.HasExited) { Write-Host "test servers exited early with $($srv.ExitCode)" }
+          exit $code
       - name: Secret scan, remove CI-only settings, mask
         if: always()
         run: |
