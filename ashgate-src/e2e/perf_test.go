@@ -333,7 +333,27 @@ func TestPerf(t *testing.T) {
 		env.Metric("growth.handles_per_min", hSlope, "/min", "lower")
 		env.Metric("growth.threads_per_min", tSlope, "/min", "lower")
 		env.Metric("growth.private_MB_per_min", pSlope, "MB/min", "lower")
-		first, last := rest[0], rest[len(rest)-1]
+		// Medians of the first and last five samples: a short burst of
+		// connections at either end is not growth.
+		mid := func(ss []sample) sample {
+			med := func(f func(sample) float64) float64 {
+				v := make([]float64, len(ss))
+				for i, s := range ss {
+					v[i] = f(s)
+				}
+				return median(v)
+			}
+			return sample{At: med(func(s sample) float64 { return s.At }),
+				Handles:    uint32(med(func(s sample) float64 { return float64(s.Handles) })),
+				Threads:    uint32(med(func(s sample) float64 { return float64(s.Threads) })),
+				PrivateMB:  med(func(s sample) float64 { return s.PrivateMB }),
+				Goroutines: int(med(func(s sample) float64 { return float64(s.Goroutines) }))}
+		}
+		k := 5
+		if len(rest) < 2*k {
+			k = len(rest) / 2
+		}
+		first, last := mid(rest[:k]), mid(rest[len(rest)-k:])
 		if first.Goroutines >= 0 {
 			env.Metric("growth.goroutines_per_min", gSlope, "/min", "lower")
 			env.Metric("run.goroutines_end", float64(last.Goroutines), "", "lower")

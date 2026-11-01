@@ -90,6 +90,21 @@ async function noFieldErrors(where: string) {
   expect(errs, `validation errors on valid input (${where})`).toEqual([]);
 }
 
+// typeKept types into a dialog field and checks the text survives the
+// dialog's own redraws (its app lists load in the background): a redraw used
+// to drop what was typed.
+async function typeKept(field: import("@playwright/test").Locator, text: string) {
+  await field.fill(text);
+  await page.waitForTimeout(2000);
+  await expect(field, "the dialog lost typed text when it redrew").toHaveValue(text);
+}
+
+// saveRules presses «Сохранить» on the unsaved-changes bar if it shows up.
+async function saveRules() {
+  const save = page.locator('[data-act="rules-save"]');
+  if (await save.waitFor({ state: "visible", timeout: 3000 }).then(() => true, () => false)) await save.click();
+}
+
 async function toast(re: RegExp) {
   await expect(page.locator("#toast")).toBeVisible();
   await expect(page.locator("#toast")).toHaveText(re);
@@ -286,24 +301,23 @@ test.describe.serial("Ashgate window", () => {
     await page.locator('[data-act="ap-add"]').first().click();
     await expect(dlg()).toBeVisible();
     await screens("dialog-ap-add");
-    await dlg().locator("#ap-add-path").fill(CLIENT);
+    await typeKept(dlg().locator("#ap-add-path"), CLIENT);
     const route = dlg().locator("#ap-add-route");
     const value = await route.locator("option", { hasText: "Подписка e2e" }).first().getAttribute("value");
     await route.selectOption(value || "");
     await dlg().locator('button[type="submit"]').click();
     await expect(dlg()).toHaveCount(0);
-    // Rules are saved with the dirty bar.
-    if (await page.locator('[data-act="rules-save"]').isVisible().catch(() => false)) {
-      await page.locator('[data-act="rules-save"]').click();
-    }
+    await saveRules();
     const card = page.locator(".ap-card", { hasText: "ashgate-e2e-client" });
     await expect(card).toBeVisible();
 
     // A second rule so grouping can be tried.
     await page.locator('[data-act="ap-add"]').first().click();
-    await dlg().locator("#ap-add-path").fill("C:\\Windows\\System32\\curl.exe");
+    await expect(dlg()).toBeVisible();
+    await typeKept(dlg().locator("#ap-add-path"), "C:\\Windows\\System32\\curl.exe");
     await dlg().locator('button[type="submit"]').click();
-    if (await page.locator('[data-act="rules-save"]').isVisible().catch(() => false)) await page.locator('[data-act="rules-save"]').click();
+    await expect(dlg()).toHaveCount(0);
+    await saveRules();
     await expect(page.locator(".ap-card", { hasText: "curl" })).toBeVisible();
 
     // Switch off and on.
@@ -346,7 +360,7 @@ test.describe.serial("Ashgate window", () => {
       await dlg().locator("#ap-gnew-name").fill("Группа e2e");
       await dlg().locator('button[type="submit"]').click();
       await expect(dlg()).toHaveCount(0);
-      if (await page.locator('[data-act="rules-save"]').isVisible().catch(() => false)) await page.locator('[data-act="rules-save"]').click();
+      await saveRules();
       const rename = page.locator('[data-act="ap-grename"]').first();
       if (!(await rename.isVisible())) await page.locator('.ap-card.group [data-act="ap-menu"]').first().click().catch(() => {});
       if (await page.locator('[data-act="ap-grename"]').first().isVisible().catch(() => false)) {
@@ -355,7 +369,7 @@ test.describe.serial("Ashgate window", () => {
         await closeDialog();
       }
       await page.locator('[data-act="ap-gsplit"]').first().click().catch(() => {});
-      if (await page.locator('[data-act="rules-save"]').isVisible().catch(() => false)) await page.locator('[data-act="rules-save"]').click();
+      await saveRules();
     } else {
       findings.push({ kind: "groups", text: "no «group» button after selecting two rules" });
     }
@@ -364,7 +378,7 @@ test.describe.serial("Ashgate window", () => {
     const curl = page.locator(".ap-card", { hasText: "curl" });
     await curl.locator('[data-act="ap-menu"]').click();
     await page.locator('[data-act="ap-del"]').first().click();
-    if (await page.locator('[data-act="rules-save"]').isVisible().catch(() => false)) await page.locator('[data-act="rules-save"]').click();
+    await saveRules();
     await expect(page.locator(".ap-card", { hasText: "curl" })).toHaveCount(0);
     await screens("page-rules-filled");
   });

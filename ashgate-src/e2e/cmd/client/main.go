@@ -264,7 +264,10 @@ func par(u string, n int64, seed string, k int, stall time.Duration) result {
 
 func hold(u string, secs, rate int, seed string, stall time.Duration) result {
 	start := time.Now()
-	resp, err := client("").Get(fmt.Sprintf("%s/hold?secs=%d&rate=%d&seed=%s", strings.TrimRight(u, "/"), secs, rate, seed))
+	// The stream itself lasts secs; the stall watcher catches a hang.
+	c := client("")
+	c.Timeout = time.Duration(secs)*time.Second + time.Minute
+	resp, err := c.Get(fmt.Sprintf("%s/hold?secs=%d&rate=%d&seed=%s", strings.TrimRight(u, "/"), secs, rate, seed))
 	if err != nil {
 		return result{Error: err.Error()}
 	}
