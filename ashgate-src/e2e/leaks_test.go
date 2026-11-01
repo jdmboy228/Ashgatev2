@@ -439,7 +439,11 @@ func TestLeaks(t *testing.T) {
 	})
 
 	t.Run("HealthAndSubscriptionThroughTunnel", func(t *testing.T) {
-		verified := harness.WaitTunnelHealthy(t, s.Fx, s.Started, 150*time.Second).Time
+		// Capture was just restarted, and while the servers were down a
+		// backup may have taken over: wait for a check of this tunnel, not
+		// the first one of the session, then give the app time to note it.
+		verified := harness.WaitTunnelHealthy(t, s.Fx, time.Now(), 150*time.Second).Time
+		time.Sleep(2 * time.Second)
 		since := time.Now()
 		pkts, socks := phase(t, "sub-refresh", func() {
 			if err := a.Post("/api/subscription/refresh", map[string]string{"name": harness.SubName}, nil); err != nil {
