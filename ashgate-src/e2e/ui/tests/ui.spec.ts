@@ -397,8 +397,8 @@ test.describe.serial("Ashgate window", () => {
     await nav("log");
     await page.locator("#log-filter").fill("ashgate");
     await page.locator('#log-seg [data-act="proto"][data-value="TCP"]').click();
-    await page.locator('[data-act="pause"]').click();
-    await page.locator('[data-act="pause"]').click();
+    await page.locator('#pause-btn').click();
+    await page.locator('#pause-btn').click();
     await page.locator('[data-act="clear"]').click();
     await expect(dlg()).toBeVisible();
     await closeDialog();

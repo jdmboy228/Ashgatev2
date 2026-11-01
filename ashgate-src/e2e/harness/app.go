@@ -397,10 +397,14 @@ func (a *App) UpdateConfig(fn func(c *config.Config)) error {
 	return a.Post("/api/config", map[string]any{"config": c}, nil)
 }
 
-// SetAutostart turns the logon task on or off through the API.
+// SetAutostart turns the logon task on or off through the API. The config
+// goes back exactly as the app sent it: an older version rejects fields it
+// does not know (the upgrade test drives 0.7.7 this way).
 func (a *App) SetAutostart(on bool) error {
-	s, err := a.State()
-	if err != nil {
+	var s struct {
+		Config json.RawMessage `json:"config"`
+	}
+	if err := a.Get("/api/state", &s); err != nil {
 		return err
 	}
 	return a.Post("/api/config", map[string]any{"config": s.Config, "autostart": on}, nil)
@@ -421,6 +425,11 @@ func (a *App) StartCapture() error {
 				return errors.New(s.Error)
 			}
 			return errors.New("capture not running yet")
+		}
+		// Versions before 0.9.1 report running before the kill-switch
+		// firewall block is lifted.
+		if len(s.KillSwitch.Blocked) > 0 {
+			return errors.New("kill-switch firewall block not lifted yet")
 		}
 		return nil
 	})

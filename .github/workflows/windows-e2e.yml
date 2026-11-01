@@ -164,14 +164,21 @@ jobs:
           }
           $re = 'const Version = "([^"]+)"'
           $cur = (Select-String ashgate-src/internal/version/version.go -Pattern $re).Matches[0].Groups[1].Value
-          foreach ($c in (git log --format=%H -- ashgate-src/internal/version/version.go)) {
-            $v = ((git show "${c}:ashgate-src/internal/version/version.go") | Select-String -Pattern $re).Matches[0].Groups[1].Value
-            git cat-file -e "${c}:build-installer.ps1" 2>$null
-            $hasBuild = ($LASTEXITCODE -eq 0)
-            if ($v -and $v -ne $cur -and $hasBuild) {
+          $verOf = { param($c) ((git show "${c}:ashgate-src/internal/version/version.go") | Select-String -Pattern $re).Matches[0].Groups[1].Value }
+          $commits = @(git log --format=%H -- ashgate-src/internal/version/version.go)
+          # The newest other version, then the commit that introduced it
+          # (its release commit), not later work that still carried it.
+          $prev = $null
+          foreach ($c in $commits) { $v = & $verOf $c; if ($v -and $v -ne $cur) { $prev = $v; break } }
+          if ($prev) {
+            [array]::Reverse($commits)
+            foreach ($c in $commits) {
+              if ((& $verOf $c) -ne $prev) { continue }
+              git cat-file -e "${c}:build-installer.ps1" 2>$null
+              if ($LASTEXITCODE -ne 0) { continue }
               "mode=build" >> $env:GITHUB_OUTPUT
               "commit=$c" >> $env:GITHUB_OUTPUT
-              "what=version $v built from $($c.Substring(0,7)) (no published release)" >> $env:GITHUB_OUTPUT
+              "what=version $prev built from its release commit $($c.Substring(0,7)) (no published release)" >> $env:GITHUB_OUTPUT
               exit 0
             }
           }
