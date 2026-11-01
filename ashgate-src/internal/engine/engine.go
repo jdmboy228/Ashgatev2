@@ -426,7 +426,7 @@ func (e *Engine) fastPath(pkt []byte, h *packet.Header) (Result, bool) {
 			return res, true
 		}
 		if h.SYN && !h.ACK {
-			if flow := e.byClient[h.Src]; flow != nil && flow.orig.Equal(h.Dst) {
+			if flow := e.byClient[h.Src]; flow != nil && flow.orig.Equal(h.Dst) && flow.closedAt.IsZero() {
 				return e.rewriteForward(pkt, h, flow, snap), true
 			}
 			if flow := e.byClient[h.Src]; flow != nil {

@@ -229,7 +229,12 @@ func (e *Engine) sweep(now time.Time) {
 		f.mu.Lock()
 		accepted := f.conn != nil
 		f.mu.Unlock()
-		if !accepted && now.Sub(f.created) > 30*time.Second {
+		switch {
+		case !f.closedAt.IsZero():
+			if now.Sub(f.closedAt) >= tcpCloseGrace {
+				staleTCP = append(staleTCP, f)
+			}
+		case !accepted && now.Sub(f.created) > 30*time.Second:
 			staleTCP = append(staleTCP, f)
 		}
 	}

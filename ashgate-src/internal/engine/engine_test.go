@@ -747,6 +747,16 @@ func TestLatePacketsOfClosedFlowAreDropped(t *testing.T) {
 		t.Fatal("no flow")
 	}
 	e.finishTCP(flow)
+	// For a short grace the mapping stays, so the last FIN and ACKs of both
+	// ends are still translated and the app's socket can close cleanly.
+	fin, _ := packet.BuildTCP(app, dst, 0x11)
+	if r := e.HandlePacket(fin, Meta{}, true); r.Action != ActionModified {
+		t.Fatalf("FIN right after the relay closed went %v, want it translated to the relay", r.Action)
+	}
+	if e.Active() != 0 {
+		t.Fatalf("an ended flow still counts as active: %d", e.Active())
+	}
+	e.sweep(time.Now().Add(tcpCloseGrace + time.Second))
 	res.set(false)                                         // the app has exited
 	for _, flags := range []byte{0x11, 0x10, 0x18, 0x04} { // FIN+ACK, ACK, PSH+ACK, RST
 		pkt, _ := packet.BuildTCP(app, dst, flags)

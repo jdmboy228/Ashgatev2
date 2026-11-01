@@ -25,6 +25,9 @@ type tcpFlow struct {
 	ifIdx    uint32
 	subIfIdx uint32
 	created  time.Time
+	// closedAt is set when the relay ended; the mapping lives on for
+	// tcpCloseGrace (see closeFlowLocked).
+	closedAt time.Time
 	conn     net.Conn
 	live     bool
 	parent   string
@@ -45,6 +48,9 @@ func (e *Engine) ServeConn(conn net.Conn) {
 	}
 	e.mu.Lock()
 	flow := e.byAlloc[allocKey{ver: ver, port: uint16(ta.Port)}]
+	if flow != nil && !flow.closedAt.IsZero() {
+		flow = nil // ended: only its last packets may still pass
+	}
 	if flow != nil {
 		flow.mu.Lock()
 		flow.conn = conn
@@ -106,8 +112,39 @@ func (e *Engine) serveFlow(conn net.Conn, flow *tcpFlow) {
 
 func (e *Engine) finishTCP(flow *tcpFlow) {
 	e.mu.Lock()
-	e.dropFlowLocked(flow)
+	e.closeFlowLocked(flow)
 	e.mu.Unlock()
+}
+
+// tcpCloseGrace keeps the mapping of an ended flow. Its last FIN and ACKs
+// can still sit in the capture queue when the relay closes; dropped
+// untranslated, they left the app's socket half-closed, and it went on
+// sending toward the server later (a crash of Ashgate then put it on the
+// wire). The janitor drops the mapping afterwards; closedTCP then drops
+// whatever is still late.
+const tcpCloseGrace = 10 * time.Second
+
+// closeFlowLocked ends a relayed flow and keeps its mapping for
+// tcpCloseGrace, so both ends can finish closing through it.
+func (e *Engine) closeFlowLocked(flow *tcpFlow) {
+	if flow == nil || !flow.closedAt.IsZero() {
+		return
+	}
+	flow.closedAt = e.now()
+	if flow.live {
+		flow.live = false
+		e.active.Add(-1)
+		if flow.stat != nil {
+			flow.stat.flows.Add(-1)
+		}
+	}
+	flow.mu.Lock()
+	c := flow.conn
+	flow.conn = nil
+	flow.mu.Unlock()
+	if c != nil {
+		_ = c.Close()
+	}
 }
 
 func (e *Engine) dropFlowLocked(flow *tcpFlow) {
