@@ -208,6 +208,34 @@ func TestDirectDNSIsNotCached(t *testing.T) {
 	}
 }
 
+// staleRes knows only a closed socket of a program without a rule on the
+// port; a new DNS socket of someone else has it now.
+type staleRes struct{}
+
+func (staleRes) Lookup(uint8, packet.Addr) (rules.Process, bool) {
+	return rules.Process{PID: 2, Name: "direct.exe"}, true
+}
+
+func (staleRes) LookupLive(uint8, packet.Addr) (rules.Process, bool) {
+	return rules.Process{}, false
+}
+
+func TestDNSIgnoresClosedSocketOwner(t *testing.T) {
+	e, _ := newEngine(t, testConfig(), staleRes{}, &fakeDial{}, nil)
+	pkt := udpDNS(t, packet.V4(10, 0, 0, 6, 50090), packet.V4(192, 168, 1, 1, 53), "a.example.com")
+	if r := e.HandlePacket(append([]byte(nil), pkt...), Meta{}, false); r.Action != ActionUnknown {
+		t.Fatalf("first try went %v, want a hold for the new socket's event", r.Action)
+	}
+	if r := e.HandlePacket(pkt, Meta{}, true); r.Action != ActionUDP {
+		t.Fatalf("query on a reused port went %v, want the tunnel", r.Action)
+	}
+	// Other traffic still uses the closed socket's owner (its last packets).
+	other, _ := packet.BuildUDP(packet.V4(10, 0, 0, 6, 50091), packet.V4(198, 51, 100, 1, 5000), []byte{1})
+	if r := e.HandlePacket(other, Meta{}, true); r.Action != ActionPass {
+		t.Fatalf("non-DNS of direct.exe went %v", r.Action)
+	}
+}
+
 func TestSystemProxyChoice(t *testing.T) {
 	proxies := map[string]config.Proxy{
 		"socks": {Name: "socks", Type: "socks5"},

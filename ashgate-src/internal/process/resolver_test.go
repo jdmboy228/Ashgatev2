@@ -67,6 +67,27 @@ func TestCloseGrace(t *testing.T) {
 	}
 }
 
+// A DNS socket's port is soon another program's: a live lookup does not
+// credit it to the program whose socket on it just closed.
+func TestLookupLiveSkipsClosedSockets(t *testing.T) {
+	r, _ := testResolver(time.Unix(1000, 0))
+	exact, wild := packet.V4(10, 0, 0, 8, 50000), packet.V4(0, 0, 0, 0, 50001)
+	r.Observe(packet.ProtoUDP, exact, 3, true)
+	r.Observe(packet.ProtoUDP, wild, 3, true)
+	for _, a := range []packet.Addr{exact, packet.V4(10, 0, 0, 8, 50001)} {
+		if _, ok := r.Lookup(packet.ProtoUDP, a); !ok {
+			t.Fatalf("Lookup %s: the closed socket should stay visible", a)
+		}
+		if p, ok := r.LookupLive(packet.ProtoUDP, a); ok {
+			t.Fatalf("LookupLive %s found the closed socket of PID %d", a, p.PID)
+		}
+	}
+	r.Observe(packet.ProtoUDP, exact, 4, false)
+	if p, ok := r.LookupLive(packet.ProtoUDP, exact); !ok || p.PID != 4 {
+		t.Fatalf("new socket on the port: %+v %v", p, ok)
+	}
+}
+
 func TestHelperDoesNotOverrideSocket(t *testing.T) {
 	r, _ := testResolver(time.Unix(1000, 0))
 	local := packet.V4(10, 0, 0, 2, 5555)

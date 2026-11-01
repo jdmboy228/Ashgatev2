@@ -75,6 +75,12 @@ type Resolver interface {
 	Lookup(proto uint8, src packet.Addr) (rules.Process, bool)
 }
 
+// liveResolver also answers without sockets that already closed; see
+// process.Resolver.LookupLive. DNS uses it.
+type liveResolver interface {
+	LookupLive(proto uint8, src packet.Addr) (rules.Process, bool)
+}
+
 // Allocator reserves a local port used as the source of a redirected TCP handshake.
 type Allocator interface {
 	Reserve(ver int) (port uint16, release func(), err error)
@@ -420,7 +426,11 @@ func (e *Engine) HandlePacket(pkt []byte, meta Meta, final bool) Result {
 
 	var proc rules.Process
 	found := false
-	if e.resolver != nil {
+	if lr, ok := e.resolver.(liveResolver); ok && h.Proto == packet.ProtoUDP && h.Dst.Port == 53 {
+		// A DNS socket's port is soon reused: never credit a query to the
+		// program whose socket on it just closed.
+		proc, found = lr.LookupLive(h.Proto, h.Src)
+	} else if e.resolver != nil {
 		proc, found = e.resolver.Lookup(h.Proto, h.Src)
 	}
 
