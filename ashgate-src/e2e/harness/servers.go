@@ -453,9 +453,14 @@ func (f *Fixture) SetDoH(up bool) {
 	if up {
 		return
 	}
+	// Close outside the lock: countedConn.Close takes it too.
 	f.dohMu.Lock()
-	defer f.dohMu.Unlock()
+	open := make([]net.Conn, 0, len(f.dohConns))
 	for c := range f.dohConns {
+		open = append(open, c)
+	}
+	f.dohMu.Unlock()
+	for _, c := range open {
 		_ = c.Close()
 	}
 }
