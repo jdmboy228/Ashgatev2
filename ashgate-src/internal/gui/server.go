@@ -282,13 +282,14 @@ func (c *controller) api(w http.ResponseWriter, r *http.Request) {
 		}
 		png, ok := icons.get(r.URL.Query().Get("path"))
 		if !ok {
-			// A miss is cached too; tell the browser to keep it briefly.
-			w.Header().Set("Cache-Control", "private, max-age=300")
+			// no-store: the URL carries the window token (an <img> cannot
+			// send headers), and WebView2's disk cache, which any program of
+			// the user can read, is keyed by URL. Misses are remembered by
+			// the page; hits are cached in memory here (icons.get).
 			http.NotFound(w, r)
 			return
 		}
 		w.Header().Set("Content-Type", "image/png")
-		w.Header().Set("Cache-Control", "private, max-age=86400")
 		w.Write(png)
 	case "/api/processes":
 		if r.Method != http.MethodGet {
@@ -629,8 +630,10 @@ func (c *controller) start() error {
 		// Capture ended, by Stop or by a failure: block proxied apps.
 		c.syncKill()
 	}()
-	// Capture is up, so the firewall block can be lifted.
-	c.kickKill()
+	// Capture is up, so the firewall block can be lifted. Wait for it (and
+	// for the guard), like stop does: until then proxied apps are still
+	// blocked, and the window would already say "running".
+	c.syncKill()
 	return nil
 }
 

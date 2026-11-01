@@ -23,3 +23,6 @@ const (
 
 // Quit has no window to stop outside Windows.
 func Quit(time.Duration) int { return QuitNotRunning }
+
+// RemoveWebViewData has no WebView2 profile to remove outside Windows.
+func RemoveWebViewData() {}

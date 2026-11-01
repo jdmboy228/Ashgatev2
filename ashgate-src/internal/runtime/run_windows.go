@@ -186,6 +186,11 @@ func start(parent context.Context, cfg *config.Config, logs *logbuf.Buffer, brid
 		_ = netH.Close()
 		_ = sockH.Close()
 		_ = flowH.Close()
+		// The driver does not unload by itself. Stop it before releasing
+		// the engine mutex, so a new Start cannot race the unload.
+		if err := windivert.StopDriver(); err != nil && logs != nil {
+			logs.Add(logbuf.Event{Process: "ashgate", Status: "error", Error: "WinDivert: " + err.Error()})
+		}
 		windows.CloseHandle(mutex)
 		close(s.done)
 	}()

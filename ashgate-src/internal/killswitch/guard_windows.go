@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"golang.org/x/sys/windows"
+
+	"ashgate/internal/windivert"
 )
 
 // StartGuard starts a helper process that blocks the saved targets if this
@@ -59,7 +61,9 @@ func RunGuard(args []string) error {
 	ph, err := windows.OpenProcess(windows.SYNCHRONIZE, false, uint32(*pid))
 	if err != nil {
 		// The parent is already gone: block now.
-		return New(*state).Block(loadTargets(*state))
+		err := New(*state).Block(loadTargets(*state))
+		_ = windivert.StopDriver()
+		return err
 	}
 	defer windows.CloseHandle(ph)
 	pname, _ := windows.UTF16PtrFromString(*event)
@@ -75,5 +79,8 @@ func RunGuard(args []string) error {
 	if got == windows.WAIT_OBJECT_0 {
 		return nil // clean stop: Ashgate manages the rules itself
 	}
-	return New(*state).Block(loadTargets(*state))
+	// Ashgate died: Windows closed its WinDivert handles, the driver stays.
+	err = New(*state).Block(loadTargets(*state))
+	_ = windivert.StopDriver()
+	return err
 }

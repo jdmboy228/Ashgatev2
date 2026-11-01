@@ -134,10 +134,7 @@ func Run(configPath string, startCapture bool) error {
 		_ = srv.Shutdown(ctx)
 	}()
 
-	data := filepath.Join(os.Getenv("LOCALAPPDATA"), "Ashgate", "WebView2")
-	if os.Getenv("LOCALAPPDATA") == "" {
-		data = filepath.Join(os.TempDir(), "Ashgate", "WebView2")
-	}
+	data := webViewDataDir()
 	_ = os.MkdirAll(data, 0o700)
 
 	w := webview2.NewWithOptions(webview2.WebViewOptions{
@@ -755,6 +752,28 @@ func alert(text string) {
 	pMessageBox.Call(0, uintptr(unsafe.Pointer(body)), uintptr(unsafe.Pointer(title)), 0x10)
 	runtime.KeepAlive(body)
 	runtime.KeepAlive(title)
+}
+
+// webViewDataDir is the WebView2 profile of the window.
+func webViewDataDir() string {
+	if os.Getenv("LOCALAPPDATA") == "" {
+		return filepath.Join(os.TempDir(), "Ashgate", "WebView2")
+	}
+	return filepath.Join(os.Getenv("LOCALAPPDATA"), "Ashgate", "WebView2")
+}
+
+// RemoveWebViewData deletes the WebView2 profile (ashgate cleanup, run by
+// the uninstaller). Its processes can hold files for a moment after the
+// window closed, so it retries for up to 10 seconds.
+func RemoveWebViewData() {
+	dir := webViewDataDir()
+	for i := 0; i < 20; i++ {
+		if err := os.RemoveAll(dir); err == nil {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	_ = os.Remove(filepath.Dir(dir)) // the Ashgate folder, if now empty
 }
 
 // dropQuitMessage removes a pending WM_QUIT from this thread's queue.

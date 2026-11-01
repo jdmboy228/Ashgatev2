@@ -19,6 +19,7 @@ import (
 	"ashgate/internal/runtime"
 	"ashgate/internal/service"
 	"ashgate/internal/version"
+	"ashgate/internal/windivert"
 )
 
 const helpText = `Ashgate — прозрачный прокси для отдельных приложений Windows.
@@ -154,6 +155,14 @@ func cmdCleanup(args []string) int {
 	if err := autostart.Disable(); err != nil {
 		code = 1
 	}
+	// A loaded driver keeps WinDivert64.sys locked: the uninstaller could
+	// not delete it, and the next install would ask for a restart.
+	if err := windivert.StopDriver(); err != nil {
+		code = 1
+	}
+	// The WebView2 profile lives in the user's AppData, outside the
+	// install folder, and can hold form data.
+	gui.RemoveWebViewData()
 	return code
 }
 
