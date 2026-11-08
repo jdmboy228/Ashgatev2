@@ -45,6 +45,19 @@ func fileExists(path string) bool {
 	return err == nil
 }
 
+// ProtectedDir is the shared ProgramData folder, created and locked down
+// when needed. A file the elevated window hands to another elevated
+// program (the autostart task) is written here, not to %TEMP%, where the
+// user's own programs could swap it before it is read.
+func ProtectedDir() (string, error) {
+	dir := filepath.Dir(sharedPath())
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	secureDir(dir)
+	return dir, nil
+}
+
 func sharedPath() string {
 	programData := os.Getenv("ProgramData")
 	if programData == "" {

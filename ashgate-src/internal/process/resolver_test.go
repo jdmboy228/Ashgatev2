@@ -1,6 +1,7 @@
 package process
 
 import (
+	"sync"
 	"testing"
 	"time"
 
@@ -113,12 +114,131 @@ func TestHelperFallback(t *testing.T) {
 	}
 }
 
-func TestUnnamedProcessIsUnknown(t *testing.T) {
+// A running process whose image cannot be read (System, a protected
+// process) is known: with a proxy rule an unknown owner is dropped. A
+// process that is gone stays unknown.
+func TestUnreadableProcesses(t *testing.T) {
 	r, _ := testResolver(time.Unix(1000, 0))
 	r.SetImage(func(uint32) rules.Process { return rules.Process{} })
-	r.Observe(packet.ProtoTCP, packet.V4(1, 2, 3, 4, 9), 8, false)
-	if _, ok := r.Lookup(packet.ProtoTCP, packet.V4(1, 2, 3, 4, 9)); ok {
-		t.Fatal("empty image should look unknown so the capture loop can retry")
+	r.SetPresent(func(pid uint32) bool { return pid != 66 })
+	for i, pid := range []uint32{4, 1234, 66} {
+		r.Observe(packet.ProtoTCP, packet.V4(1, 2, 3, 4, uint16(100+i)), pid, false)
+	}
+	if p, ok := r.Lookup(packet.ProtoTCP, packet.V4(1, 2, 3, 4, 100)); !ok || p.PID != 4 || p.Name != "System" {
+		t.Fatalf("PID 4: %+v %v", p, ok)
+	}
+	if p, ok := r.Lookup(packet.ProtoTCP, packet.V4(1, 2, 3, 4, 101)); !ok || p.PID != 1234 || p.Name != "" {
+		t.Fatalf("protected process: %+v %v", p, ok)
+	}
+	if p, ok := r.Lookup(packet.ProtoTCP, packet.V4(1, 2, 3, 4, 102)); ok {
+		t.Fatalf("an exited process was found: %+v", p)
+	}
+}
+
+// waitLoad waits for a table read in progress.
+func waitLoad(r *Resolver) {
+	r.mu.Lock()
+	ch := r.loading
+	r.mu.Unlock()
+	if ch != nil {
+		<-ch
+	}
+}
+
+// Before the last try a lookup never waits for the tables: it starts one
+// read in the background and answers "unknown"; the packet is asked about
+// again and then finds the new table.
+func TestTableReadIsBackgroundAndSingle(t *testing.T) {
+	start := time.Unix(1000, 0)
+	r, clock := testResolver(start)
+	a, b := packet.V4(10, 0, 0, 4, 5000), packet.V4(10, 0, 0, 4, 5001)
+	release := make(chan struct{})
+	var mu sync.Mutex
+	reads := 0
+	r.SetHelper(func() ([]Endpoint, error) {
+		mu.Lock()
+		reads++
+		mu.Unlock()
+		<-release
+		return []Endpoint{{Proto: packet.ProtoTCP, Addr: a, PID: 21}, {Proto: packet.ProtoTCP, Addr: b, PID: 22}}, nil
+	})
+	for _, src := range []packet.Addr{a, a, a, b, b} {
+		if _, ok := r.Owner(packet.ProtoTCP, src, true, false); ok {
+			t.Fatal("found before any table was read")
+		}
+	}
+	close(release)
+	waitLoad(r)
+	*clock = start.Add(15 * time.Millisecond)
+	if p, ok := r.Owner(packet.ProtoTCP, b, true, false); !ok || p.PID != 22 {
+		t.Fatalf("retry after the read: %+v %v", p, ok)
+	}
+	// The last try of a packet held since the read began needs no new one.
+	*clock = start.Add(60 * time.Millisecond)
+	if p, ok := r.Owner(packet.ProtoTCP, a, true, true); !ok || p.PID != 21 {
+		t.Fatalf("last try: %+v %v", p, ok)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if reads != 1 {
+		t.Fatalf("%d table reads, want 1", reads)
+	}
+}
+
+// A new flow is never credited to the program whose socket on the port
+// just closed: not through its closed entry, and not through a table read
+// before the close, which may still list that socket.
+func TestLiveLookupDistrustsTableFromBeforeClose(t *testing.T) {
+	start := time.Unix(1000, 0)
+	r, clock := testResolver(start)
+	local := packet.V4(10, 0, 0, 4, 5300)
+	owner := uint32(3)
+	r.SetHelper(func() ([]Endpoint, error) {
+		return []Endpoint{{Proto: packet.ProtoUDP, Addr: local, PID: owner}}, nil
+	})
+	if p, ok := r.Lookup(packet.ProtoUDP, local); !ok || p.PID != 3 {
+		t.Fatalf("table: %+v %v", p, ok)
+	}
+	*clock = start.Add(10 * time.Millisecond)
+	r.Observe(packet.ProtoUDP, local, 3, true)
+	// Within helperGap no new read may start; the old table must not answer.
+	*clock = start.Add(20 * time.Millisecond)
+	if p, ok := r.Owner(packet.ProtoUDP, local, true, true); ok {
+		t.Fatalf("credited to the closed socket's program: %+v", p)
+	}
+	// The mid-connection lookup still finds the closing socket's owner.
+	if p, ok := r.Owner(packet.ProtoUDP, local, false, true); !ok || p.PID != 3 {
+		t.Fatalf("grace lookup: %+v %v", p, ok)
+	}
+	// A program binds the port; its event is late, a new table lists it.
+	owner = 8
+	*clock = start.Add(70 * time.Millisecond)
+	if _, ok := r.Owner(packet.ProtoUDP, local, true, false); ok {
+		t.Fatal("answered from the old table")
+	}
+	waitLoad(r)
+	*clock = start.Add(85 * time.Millisecond)
+	if p, ok := r.Owner(packet.ProtoUDP, local, true, false); !ok || p.PID != 8 {
+		t.Fatalf("new owner: %+v %v", p, ok)
+	}
+}
+
+// The last try for a packet that came after the newest table (the queue
+// was full, no miss was recorded) reads the tables once more.
+func TestLastTryReadsStaleTable(t *testing.T) {
+	start := time.Unix(1000, 0)
+	r, clock := testResolver(start)
+	local := packet.V4(10, 0, 0, 4, 5400)
+	var rows []Endpoint
+	reads := 0
+	r.SetHelper(func() ([]Endpoint, error) { reads++; return rows, nil })
+	if _, ok := r.Lookup(packet.ProtoTCP, local); ok || reads != 1 {
+		t.Fatalf("empty table: ok %v, reads %d", ok, reads)
+	}
+	rows = []Endpoint{{Proto: packet.ProtoTCP, Addr: local, PID: 30}}
+	*clock = start.Add(100 * time.Millisecond)
+	if p, ok := r.LookupLive(packet.ProtoTCP, local); !ok || p.PID != 30 || reads != 2 {
+		t.Fatalf("stale table: %+v %v, reads %d", p, ok, reads)
 	}
 }
 

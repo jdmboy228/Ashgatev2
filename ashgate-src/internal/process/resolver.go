@@ -19,6 +19,14 @@ const (
 	maxImages = 4096
 	// maxParents bounds the ancestor chain.
 	maxParents = 8
+	// maxMisses bounds missAt; a full map is cleared.
+	maxMisses = 4096
+	// missKeep is how long a miss is remembered. Held packets are decided
+	// within 50 ms; older entries are of packets decided elsewhere.
+	missKeep = 10 * time.Second
+	// systemPID is the kernel ("System"). It has no image to read, and its
+	// sockets (SMB, NetBIOS) belong to no program a rule can name.
+	systemPID = 4
 )
 
 type exactKey struct {
@@ -34,6 +42,8 @@ type wildKey struct {
 type entry struct {
 	proc  rules.Process
 	until time.Time
+	// closed is when the socket closed; zero while it is open.
+	closed time.Time
 }
 
 // Resolver remembers SOCKET/FLOW events and falls back to the IP Helper tables.
@@ -45,11 +55,22 @@ type Resolver struct {
 	helper     map[exactKey]uint32
 	helperWild map[wildKey]uint32
 	images     map[uint32]rules.Process
-	helperAt   time.Time
+	// helperAt is when the tables in helper were read (the read's start);
+	// triedAt is when the last read started, failed ones included. loading
+	// is closed when the read in progress ends; nil when none runs.
+	helperAt time.Time
+	triedAt  time.Time
+	loading  chan struct{}
+	// missAt is when a lookup of a socket first came back empty. Its packet
+	// is held from then, so only tables read after it can list its socket.
+	missAt     map[exactKey]time.Time
 	pruneAt    time.Time
 	now        func() time.Time
 	image      func(pid uint32) rules.Process
 	loadHelper func() ([]Endpoint, error)
+	// present reports that a process with pid runs, even one whose image
+	// cannot be read (a protected process). Nil means it does.
+	present func(pid uint32) bool
 	// exited reports that pid no longer names the process cached for it.
 	// Windows reuses PIDs, so a cached name must be checked before reuse.
 	// Nil means the platform cannot tell; the cache is then only size-capped.
@@ -73,6 +94,7 @@ func New() *Resolver {
 		helper:     map[exactKey]uint32{},
 		helperWild: map[wildKey]uint32{},
 		images:     map[uint32]rules.Process{},
+		missAt:     map[exactKey]time.Time{},
 		now:        time.Now,
 		image: func(pid uint32) rules.Process {
 			return rules.Process{PID: pid}
@@ -91,6 +113,7 @@ func (r *Resolver) Observe(proto uint8, local packet.Addr, pid uint32, closing b
 	proc := r.resolve(pid)
 	e := entry{proc: proc}
 	if closing {
+		e.closed = now
 		e.until = now.Add(closeGrace)
 	}
 	r.mu.Lock()
@@ -139,60 +162,93 @@ func (r *Resolver) pruneLocked(now time.Time) {
 			delete(r.images, pid)
 		}
 	}
+	for k, at := range r.missAt {
+		if now.Sub(at) > missKeep {
+			delete(r.missAt, k)
+		}
+	}
 	if len(r.images) > maxImages {
 		clear(r.images)
 	}
 }
 
-// Lookup implements engine.Resolver.
+// Lookup implements engine.Resolver. It is a last try: it may read the
+// IP Helper tables before it answers.
 func (r *Resolver) Lookup(proto uint8, src packet.Addr) (rules.Process, bool) {
-	return r.lookup(proto, src, false)
+	return r.Owner(proto, src, false, true)
 }
 
-// LookupLive is Lookup without sockets that already closed. Their entry
-// stays for closeGrace so a connection's last packets keep their owner, but
-// a new socket of another program may already have the port and its event
-// may still be on the way: for DNS that would credit the query to the
-// wrong program. Unknown, the packet waits for the event.
+// LookupLive is Lookup without sockets that already closed; see Owner.
 func (r *Resolver) LookupLive(proto uint8, src packet.Addr) (rules.Process, bool) {
-	return r.lookup(proto, src, true)
+	return r.Owner(proto, src, true, true)
 }
 
-func (r *Resolver) lookup(proto uint8, src packet.Addr, live bool) (rules.Process, bool) {
+// Owner finds the program of the local socket src.
+//
+// live is for a packet that starts a flow (a TCP SYN, any UDP): a closed
+// socket's entry stays for closeGrace so a connection's last packets keep
+// their owner, but its port may already be another program's whose event
+// is still on the way. Live, such an entry does not count, and neither
+// does a table read before that socket closed: the table may still list
+// it. Unknown, the packet waits for the event or a newer table.
+//
+// final is the last try for a held packet. Before it, a lookup never waits
+// for the tables (four table reads on the packet goroutine stall every
+// packet): a missing or outdated table starts a read in the background
+// and the answer is "unknown", so the capture loop holds the packet and
+// asks again. The last try waits for a read when none since the packet
+// came has finished, at most one per helperGap.
+func (r *Resolver) Owner(proto uint8, src packet.Addr, live, final bool) (rules.Process, bool) {
 	if r == nil || src.Port == 0 {
 		return rules.Process{}, false
 	}
+	key := exactKey{proto, src}
 	now := r.now()
 	r.mu.Lock()
-	if p, ok := r.socketLocked(proto, src, now, live); ok {
+	p, ok, closed := r.socketLocked(proto, src, now, live)
+	if ok {
+		delete(r.missAt, key)
 		r.mu.Unlock()
 		return r.finish(p)
 	}
-	need := r.loadHelper != nil && (r.helperAt.IsZero() || now.Sub(r.helperAt) >= helperGap)
-	r.mu.Unlock()
-
-	if need {
-		rows, err := r.loadHelper()
+	since := r.sinceLocked(key, now, closed, live)
+	if !final {
+		if r.tableFromLocked(since) {
+			if p, ok := r.helperLocked(proto, src); ok {
+				delete(r.missAt, key)
+				r.mu.Unlock()
+				return r.finish(p)
+			}
+		}
+		if _, seen := r.missAt[key]; !seen {
+			if len(r.missAt) >= maxMisses {
+				clear(r.missAt)
+			}
+			r.missAt[key] = now
+		}
+		if !r.tableFromLocked(since) {
+			r.startLoadLocked(now)
+		}
+		r.mu.Unlock()
+		return rules.Process{}, false
+	}
+	delete(r.missAt, key)
+	for try := 0; try < 2 && !r.tableFromLocked(since); try++ {
+		ch := r.loading
+		if ch == nil {
+			if ch = r.startLoadLocked(r.now()); ch == nil {
+				break // read too recently; use what there is
+			}
+		}
+		r.mu.Unlock()
+		<-ch
 		r.mu.Lock()
-		if err == nil {
-			r.storeHelper(rows, now)
-		} else if r.helperAt.IsZero() || now.Sub(r.helperAt) >= helperGap {
-			r.helperAt = now
-		}
-		if p, ok := r.socketLocked(proto, src, now, live); ok {
-			r.mu.Unlock()
-			return r.finish(p)
-		}
-		p, ok := r.helperLocked(proto, src)
-		r.mu.Unlock()
-		if !ok {
-			return rules.Process{}, false
-		}
-		return r.finish(p)
 	}
-
-	r.mu.Lock()
-	p, ok := r.helperLocked(proto, src)
+	// The socket's event may have come while the tables were read.
+	p, ok, closed = r.socketLocked(proto, src, r.now(), live)
+	if !ok && r.tableFromLocked(closed) {
+		p, ok = r.helperLocked(proto, src)
+	}
 	r.mu.Unlock()
 	if !ok {
 		return rules.Process{}, false
@@ -200,34 +256,101 @@ func (r *Resolver) lookup(proto uint8, src packet.Addr, live bool) (rules.Proces
 	return r.finish(p)
 }
 
+// sinceLocked is the oldest table read that can answer for key. For a new
+// flow it must be read after the packet came (the socket existed by then)
+// and after the socket closed; otherwise a read within helperGap will do,
+// or after the first miss, since an older one already had no answer.
+func (r *Resolver) sinceLocked(key exactKey, now, closed time.Time, live bool) time.Time {
+	since, seen := r.missAt[key]
+	switch {
+	case seen:
+	case live:
+		since = now
+	default:
+		since = now.Add(-helperGap).Add(time.Nanosecond)
+	}
+	if closed.After(since) {
+		since = closed
+	}
+	return since
+}
+
+// tableFromLocked reports a table read at or after since. A zero since
+// takes any table.
+func (r *Resolver) tableFromLocked(since time.Time) bool {
+	return !r.helperAt.IsZero() && !r.helperAt.Before(since)
+}
+
+// startLoadLocked starts a table read on its own goroutine unless one
+// runs or the last one started less than helperGap ago. It returns the
+// channel closed when the read ends, or nil when none was started.
+func (r *Resolver) startLoadLocked(now time.Time) chan struct{} {
+	if r.loadHelper == nil || r.loading != nil {
+		return nil
+	}
+	if !r.triedAt.IsZero() && now.Sub(r.triedAt) < helperGap {
+		return nil
+	}
+	ch := make(chan struct{})
+	r.loading, r.triedAt = ch, now
+	go func() {
+		rows, err := r.loadHelper()
+		r.mu.Lock()
+		if err == nil {
+			r.storeHelper(rows, now)
+		}
+		r.loading = nil
+		r.mu.Unlock()
+		close(ch)
+	}()
+	return ch
+}
+
 func (r *Resolver) finish(p rules.Process) (rules.Process, bool) {
 	if p.Name == "" && p.Path == "" {
 		p = r.resolve(p.PID)
 	}
-	if p.Name == "" && p.Path == "" {
+	if p.Name != "" || p.Path != "" {
+		return p, true
+	}
+	switch {
+	case p.PID == systemPID:
+		return rules.Process{PID: systemPID, Name: "System"}, true
+	case p.PID == 0, r.present != nil && !r.present(p.PID):
+		// The program is gone: its packets are a dead socket's last ones,
+		// which the engine decides as having no program.
 		return rules.Process{}, false
 	}
-	return p, true
+	// Running, but its image cannot be read (a protected process): it is
+	// known, and no rule names it.
+	return rules.Process{PID: p.PID}, true
 }
 
-// socketLocked finds a socket event for src. live skips closed sockets.
-func (r *Resolver) socketLocked(proto uint8, src packet.Addr, now time.Time, live bool) (rules.Process, bool) {
+// socketLocked finds a socket event for src. live skips closed sockets
+// and reports the latest close among them.
+func (r *Resolver) socketLocked(proto uint8, src packet.Addr, now time.Time, live bool) (p rules.Process, ok bool, closed time.Time) {
 	if e, ok := r.exact[exactKey{proto, src}]; ok {
-		if !alive(e, now) {
+		switch {
+		case !alive(e, now):
 			delete(r.exact, exactKey{proto, src})
-		} else if !live || e.until.IsZero() {
-			return e.proc, true
+		case !live || e.until.IsZero():
+			return e.proc, true, time.Time{}
+		default:
+			closed = e.closed
 		}
 	}
 	wk := wildKey{proto, src.Port}
 	if e, ok := r.wild[wk]; ok {
-		if !alive(e, now) {
+		switch {
+		case !alive(e, now):
 			delete(r.wild, wk)
-		} else if !live || e.until.IsZero() {
-			return e.proc, true
+		case !live || e.until.IsZero():
+			return e.proc, true, time.Time{}
+		case e.closed.After(closed):
+			closed = e.closed
 		}
 	}
-	return rules.Process{}, false
+	return rules.Process{}, false, closed
 }
 
 // helperLocked returns only the PID. finish resolves the name through
@@ -362,4 +485,9 @@ func (r *Resolver) SetExited(fn func(pid uint32) bool) {
 // SetHelper overrides the IP Helper refresh. Tests use it.
 func (r *Resolver) SetHelper(fn func() ([]Endpoint, error)) {
 	r.loadHelper = fn
+}
+
+// SetPresent overrides the check that a process runs. Tests use it.
+func (r *Resolver) SetPresent(fn func(pid uint32) bool) {
+	r.present = fn
 }

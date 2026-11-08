@@ -130,8 +130,12 @@ func start(parent context.Context, cfg *config.Config, logs *logbuf.Buffer, brid
 	}
 	var ln6 net.Listener
 	ln6, err = net.Listen("tcp", cp.Relay.TCP6)
-	if err != nil && logs != nil {
-		logs.Add(logbuf.Event{Proto: "TCP", Dest: cp.Relay.TCP6, Status: "error", Error: "IPv6-приёмник не открыт: " + err.Error()})
+	if err != nil {
+		// Whatever holds the port must not get routed IPv6 TCP.
+		eng.DisableIPv6Relay()
+		if logs != nil {
+			logs.Add(logbuf.Event{Proto: "TCP", Dest: cp.Relay.TCP6, Status: "error", Error: "IPv6-приёмник не открыт: " + err.Error()})
+		}
 		err = nil
 	}
 

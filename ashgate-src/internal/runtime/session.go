@@ -25,6 +25,8 @@ type Session struct {
 
 	mu  sync.Mutex
 	err error
+	// failed is closed when capture fails; see Failed.
+	failed chan struct{}
 }
 
 // Apply installs a new configuration. Existing TCP flows keep their proxy.
@@ -131,6 +133,24 @@ func (s *Session) Done() <-chan struct{} {
 	return s.done
 }
 
+// Failed is closed the moment capture fails by itself, before the teardown
+// that ends with Done, which can take seconds (handles, workers, driver).
+// The kill switch blocks at once instead of waiting for Done.
+func (s *Session) Failed() <-chan struct{} {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.failed == nil {
+		s.failed = make(chan struct{})
+		if s.err != nil {
+			close(s.failed)
+		}
+	}
+	return s.failed
+}
+
 // Err is the first background failure, if the capture loop stopped by itself.
 func (s *Session) Err() error {
 	if s == nil {
@@ -146,10 +166,15 @@ func (s *Session) setErr(err error) {
 		return
 	}
 	s.mu.Lock()
-	if s.err == nil {
-		s.err = err
+	defer s.mu.Unlock()
+	if s.err != nil {
+		return
 	}
-	s.mu.Unlock()
+	s.err = err
+	if s.failed == nil {
+		s.failed = make(chan struct{})
+	}
+	close(s.failed)
 }
 
 // WireVLESS starts or updates the local bridges for every VLESS proxy and

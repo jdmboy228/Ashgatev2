@@ -60,3 +60,17 @@ func TestFailedAddIsNotRecorded(t *testing.T) {
 		t.Fatal("failed rule recorded as blocked")
 	}
 }
+
+func TestTargetsRoundTrip(t *testing.T) {
+	state := filepath.Join(t.TempDir(), "killswitch.json")
+	if got := LoadTargets(state); len(got) != 0 {
+		t.Fatalf("no file: %v", got)
+	}
+	want := []string{`C:\Apps\a.exe`, `C:\Apps\b.exe`}
+	if err := SaveTargets(state, want); err != nil {
+		t.Fatal(err)
+	}
+	if got := LoadTargets(state); strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("got %v", got)
+	}
+}

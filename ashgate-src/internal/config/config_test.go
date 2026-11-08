@@ -460,11 +460,92 @@ func TestOldSystemResolverFieldsLoad(t *testing.T) {
 	}
 }
 
-func TestBypassDomainsIncludeRussianZones(t *testing.T) {
+// .ru, .рф and .su are ordinary entries of the starter list. Names are
+// kept as typed and matched in DNS spelling.
+func TestBypassDomainsAreTheListInDNSSpelling(t *testing.T) {
 	c := Default()
-	c.DirectDomains = []string{"example.org"}
-	if got := strings.Join(c.BypassDomains(), ","); got != "ru,xn--p1ai,su,example.org" {
+	if got := strings.Join(c.DirectDomains[:3], ","); got != "ru,рф,su" {
+		t.Fatalf("starter list begins with %s", got)
+	}
+	c.DirectDomains = []string{"example.org", "госуслуги.рф", "рф"}
+	if err := c.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(c.BypassDomains(), ","); got != "example.org,xn--c1aapkosapc.xn--p1ai,xn--p1ai" {
 		t.Fatalf("BypassDomains = %s", got)
+	}
+	c.DirectDomains = []string{}
+	if got := c.BypassDomains(); len(got) != 0 {
+		t.Fatalf("an empty list bypasses %v", got)
+	}
+}
+
+func TestDirectDomainValidation(t *testing.T) {
+	for _, d := range []string{"ru", "su", "рф", "gosuslugi.ru", "госуслуги.рф", "xn--c1aapkosapc.xn--p1ai", "a-b.example.com"} {
+		if !validDomain(d) {
+			t.Errorf("%q rejected", d)
+		}
+	}
+	for _, d := range []string{"", ".", "a..b", "-a.ru", "a-.ru", "a_b.ru", "Gosuslugi.ru", "ГОСУСЛУГИ.РФ", "a b.ru", "vk.com/feed", "ru.", strings.Repeat("a", 64) + ".ru"} {
+		if validDomain(d) {
+			t.Errorf("%q accepted", d)
+		}
+	}
+}
+
+// A file from before 0.9.3 had the zones always direct and the window
+// saved Cyrillic names as xn--. Once upgraded, deleting a zone sticks and
+// an empty list stays empty.
+func TestDirectDomainsUpgradeOnce(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "c.json")
+	write := func(raw string) {
+		t.Helper()
+		if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	load := func() *Config {
+		t.Helper()
+		c, err := Load(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	write(`{"version": 1, "directDomains": ["vk.com", "xn--c1aapkosapc.xn--p1ai", "su"]}`)
+	c := load()
+	if got := strings.Join(c.DirectDomains, ","); got != "ru,рф,vk.com,госуслуги.рф,su" {
+		t.Fatalf("upgraded list %s", got)
+	}
+	if c.Revision != currentRevision {
+		t.Fatalf("revision %d", c.Revision)
+	}
+	c.DirectDomains = []string{"vk.com"}
+	if err := Save(path, c); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(load().DirectDomains, ","); got != "vk.com" {
+		t.Fatalf("deleted zones came back: %s", got)
+	}
+
+	write(`{"version": 1, "directDomains": []}`)
+	if got := strings.Join(load().DirectDomains, ","); got != "ru,рф,su" {
+		t.Fatalf("an old empty list keeps the zones direct: got %s", got)
+	}
+	write(`{"version": 1, "revision": 1, "directDomains": []}`)
+	c = load()
+	if c.DirectDomains == nil || len(c.DirectDomains) != 0 {
+		t.Fatalf("an empty list did not stay empty: %#v", c.DirectDomains)
+	}
+	if err := Save(path, c); err != nil {
+		t.Fatal(err)
+	}
+	if got := load().DirectDomains; got == nil || len(got) != 0 {
+		t.Fatalf("an empty list did not survive a save: %#v", got)
+	}
+	write(`{"version": 1}`)
+	if got := load().DirectDomains; len(got) != len(DefaultDirectDomains) {
+		t.Fatalf("no list in the file: %v", got)
 	}
 }
 

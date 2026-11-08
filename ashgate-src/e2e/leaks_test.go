@@ -53,6 +53,8 @@ func TestLeaks(t *testing.T) {
 		// Not under .example/.test/.local: Xray sends those "local" suffixes
 		// to the system DNS whenever a direct list exists.
 		c.DirectDomains = append(c.DirectDomains, "e2e-direct.example.com")
+		// The zones are list entries: ru stays, su is deleted (SystemResolver).
+		c.DirectDomains = slices.DeleteFunc(c.DirectDomains, func(d string) bool { return d == "su" })
 	})
 	if err != nil {
 		t.Fatalf("plain proxy and direct domain: %v", err)
@@ -134,13 +136,18 @@ func TestLeaks(t *testing.T) {
 
 	// getaddrinfo goes through the Windows DNS client (svchost.exe), which
 	// resolves for every program, and Ashgate cannot tell which one asked:
-	// a routed app's name goes through the tunnel, bypass names (.ru, .рф,
-	// .su, the direct list, LAN names) to the provider's DNS.
+	// a routed app's name goes through the tunnel, bypass names (the direct
+	// list, with the zones ru and рф by default, LAN names) to the
+	// provider's DNS. The zone su was deleted from the list above.
 	t.Run("SystemResolver", func(t *testing.T) {
+		if direct := readConfig(t).DirectDomains; !slices.Contains(direct, "ru") || slices.Contains(direct, "su") {
+			t.Errorf("direct list %v: want the zone ru kept and su deleted", direct)
+		}
 		_, _ = harness.Run("ipconfig", "/flushdns")
 		tun := "g" + harness.RandHex(5) + ".e2e-tunnel.example.com"
 		dir := "x" + harness.RandHex(5) + ".e2e-direct.example.com"
 		ru := "e2e-" + harness.RandHex(6) + ".ru"
+		su := "e2e-" + harness.RandHex(6) + ".su"
 		ctl := "c" + harness.RandHex(5) + ".e2e-tunnel.example.com"
 		doh := s.Fx.DoHBytes()
 		var rTun, rDir, rRU, rLoop, rCtl harness.ClientResult
@@ -149,6 +156,7 @@ func TestLeaks(t *testing.T) {
 			rTun = harness.RunClient(s.Client, "lookup", "-name", tun, "-timeout", "15s")
 			rDir = harness.RunClient(s.Client, "lookup", "-name", dir, "-timeout", "15s")
 			rRU = harness.RunClient(s.Client, "lookup", "-name", ru, "-timeout", "15s")
+			harness.RunClient(s.Client, "lookup", "-name", su, "-timeout", "15s")
 			// The app's own query for a bypass name: Xray asks Windows, and
 			// Windows' query must go to the provider, not loop back to Xray.
 			start := time.Now()
@@ -166,7 +174,10 @@ func TestLeaks(t *testing.T) {
 			t.Errorf("%s (direct list) did not go to the provider's DNS", dir)
 		}
 		if len(harness.Filter(pkts, harness.DNSFor(ru))) == 0 {
-			t.Errorf("%s (.ru) did not go to the provider's DNS", ru)
+			t.Errorf("%s (the list entry ru) did not go to the provider's DNS", ru)
+		}
+		if leak := harness.Filter(pkts, harness.DNSFor(su)); len(leak) > 0 {
+			t.Errorf("%s (.su, deleted from the list) left the machine in plain text:%s", su, harness.Brief(leak, 5))
 		}
 		if !rLoop.OK || !strings.Contains(rLoop.Answer, "rcode=0") || strings.Contains(rLoop.Answer, "answers=0") {
 			t.Errorf("ya.ru through Xray's DNS got no address in %s: %s (svchost → Ashgate → Xray → svchost loop?)", loopTook.Round(time.Millisecond), rLoop)

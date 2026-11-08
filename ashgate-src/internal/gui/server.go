@@ -666,7 +666,12 @@ func (c *controller) start() error {
 	// reentrant, and holding it here froze the window on Start (0.7.1).
 	c.mu.Unlock()
 	go func() {
-		<-sess.Done()
+		select {
+		case <-sess.Failed():
+			c.blockNow() // see killswitch.go
+			<-sess.Done()
+		case <-sess.Done():
+		}
 		c.mu.Lock()
 		if c.sess == sess {
 			if e := sess.Err(); e != nil {
