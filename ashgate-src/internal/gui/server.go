@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"mime"
 	"net"
 	"net/http"
 	"os"
@@ -169,6 +170,10 @@ func (c *controller) Handler() http.Handler {
 				http.Error(w, "forbidden", http.StatusForbidden)
 				return
 			}
+			if r.Method == http.MethodPost && !jsonRequest(r) {
+				http.Error(w, "content type", http.StatusUnsupportedMediaType)
+				return
+			}
 			c.api(w, r)
 			return
 		}
@@ -179,7 +184,8 @@ func (c *controller) Handler() http.Handler {
 // authorized accepts requests addressed to the loopback listener that carry
 // the window token. The Host check stops DNS-rebinding pages; the token stops
 // cross-site requests and other local programs. Image tags cannot send
-// headers, so the token may also come as the "t" query parameter.
+// headers, so only the icon may carry the token as the "t" query parameter.
+// A browser request from another origin is refused even with the token.
 func (c *controller) authorized(r *http.Request) bool {
 	host, _, err := net.SplitHostPort(r.Host)
 	if err != nil {
@@ -190,11 +196,21 @@ func (c *controller) authorized(r *http.Request) bool {
 	default:
 		return false
 	}
+	if o := r.Header.Get("Origin"); o != "" && o != "http://"+r.Host {
+		return false
+	}
 	got := r.Header.Get(tokenHeader)
-	if got == "" {
+	if got == "" && r.Method == http.MethodGet && r.URL.Path == "/api/icon" {
 		got = r.URL.Query().Get("t")
 	}
 	return c.token != "" && subtle.ConstantTimeCompare([]byte(got), []byte(c.token)) == 1
+}
+
+// jsonRequest tells whether a POST says its body is JSON. A form or a
+// no-cors fetch from a web page cannot send that type without a preflight.
+func jsonRequest(r *http.Request) bool {
+	t, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	return err == nil && t == "application/json"
 }
 
 func (c *controller) api(w http.ResponseWriter, r *http.Request) {
@@ -208,6 +224,10 @@ func (c *controller) api(w http.ResponseWriter, r *http.Request) {
 		// The window polls several times a second. When it already has the
 		// newest log generation, skip re-sending up to 300 events.
 		since, _ := strconv.ParseUint(r.URL.Query().Get("gen"), 10, 64)
+		if r.URL.Query().Get("auto") == "1" {
+			// The Settings page opened: read the autostart task again.
+			c.askAuto()
+		}
 		writeJSON(w, http.StatusOK, c.snapshotSince(since))
 	case "/api/start":
 		c.post(w, r, func() (any, error) { return nil, c.start() })
@@ -222,7 +242,9 @@ func (c *controller) api(w http.ResponseWriter, r *http.Request) {
 			if err := readJSON(r, &body); err != nil {
 				return nil, err
 			}
-			if err := c.replace(&body.Config); err != nil {
+			err := c.replace(&body.Config)
+			var warn *applyWarning
+			if err != nil && !errors.As(err, &warn) {
 				return nil, err
 			}
 			if body.Autostart != nil {
@@ -230,7 +252,7 @@ func (c *controller) api(w http.ResponseWriter, r *http.Request) {
 					return nil, err
 				}
 			}
-			return nil, nil
+			return savedAnswer(err)
 		})
 	case "/api/vless/parse":
 		c.post(w, r, func() (any, error) {
@@ -255,7 +277,16 @@ func (c *controller) api(w http.ResponseWriter, r *http.Request) {
 			if err := readJSON(r, &body); err != nil {
 				return nil, err
 			}
-			p, err := c.proxyForProbe(body.Name, body.Proxy)
+			if body.Proxy != nil {
+				// A draft from the proxy dialog: checked as typed, never
+				// stored, so the saved proxy keeps its own result.
+				p, err := draftForProbe(*body.Proxy)
+				if err != nil {
+					return nil, err
+				}
+				return probeCheck(context.Background(), p), nil
+			}
+			p, err := c.proxyForProbe(body.Name)
 			if err != nil {
 				return nil, err
 			}
@@ -264,16 +295,21 @@ func (c *controller) api(w http.ResponseWriter, r *http.Request) {
 	case "/api/probe-all":
 		c.post(w, r, func() (any, error) {
 			list := c.runtimeCfg().Proxies
+			out := map[string]probe.Report{}
+			var mu sync.Mutex
 			var wg sync.WaitGroup
 			for _, p := range list {
 				wg.Add(1)
 				go func(p config.Proxy) {
 					defer wg.Done()
-					c.probeOne(p)
+					rep := c.probeOne(p)
+					mu.Lock()
+					out[p.Name] = rep
+					mu.Unlock()
 				}(p)
 			}
 			wg.Wait()
-			return c.snapshot().Checks, nil
+			return out, nil
 		})
 	case "/api/icon":
 		if r.Method != http.MethodGet {
@@ -348,7 +384,7 @@ func (c *controller) api(w http.ResponseWriter, r *http.Request) {
 			if err := readJSON(r, &body); err != nil {
 				return nil, err
 			}
-			return nil, c.addSub(body.Name, body.URL)
+			return savedAnswer(c.addSub(body.Name, body.URL))
 		})
 	case "/api/subscription/refresh":
 		c.post(w, r, func() (any, error) {
@@ -372,6 +408,9 @@ func (c *controller) api(w http.ResponseWriter, r *http.Request) {
 			path, err := c.hooks.browse()
 			if err != nil {
 				return nil, err
+			}
+			if path == "" {
+				return map[string]any{"path": "", "cancelled": true}, nil
 			}
 			return map[string]string{"path": path}, nil
 		})
@@ -544,42 +583,50 @@ func (c *controller) snapshotSince(since uint64) stateView {
 	}
 }
 
-// autoEvery is how often the autostart task is re-read. Reading it starts
-// schtasks.exe, which is far too slow for every status poll.
-const autoEvery = time.Minute
-
-// refreshAuto re-reads the autostart task in the background when the cached
-// value is old. Only the very first read waits, so the Settings toggle is
-// right from the start; later polls never wait for schtasks.
+// refreshAuto reads the autostart task once, at the first state request,
+// so the Settings toggle is right from the start. Reading it starts
+// schtasks.exe, far too slow for a poll: later reads happen only when the
+// Settings page opens (askAuto) and the value is set by a change.
 func (c *controller) refreshAuto() {
 	if c.hooks.autostart == nil {
 		return
 	}
 	c.mu.Lock()
-	first := c.autoAt.IsZero()
-	stale := time.Since(c.autoAt) >= autoEvery && !c.autoBusy
-	if stale {
+	first := c.autoAt.IsZero() && !c.autoBusy
+	if first {
 		c.autoBusy = true
 	}
 	c.mu.Unlock()
-	if !stale {
-		return
-	}
-	read := func() {
-		on, err := c.hooks.autostart()
-		c.mu.Lock()
-		c.autoAt = time.Now()
-		c.autoBusy = false
-		if err == nil {
-			c.auto = on
-		}
-		c.mu.Unlock()
-	}
 	if first {
-		read()
+		c.readAuto()
+	}
+}
+
+// askAuto re-reads the autostart task in the background.
+func (c *controller) askAuto() {
+	if c.hooks.autostart == nil {
 		return
 	}
-	go read()
+	c.mu.Lock()
+	run := !c.autoAt.IsZero() && !c.autoBusy
+	if run {
+		c.autoBusy = true
+	}
+	c.mu.Unlock()
+	if run {
+		go c.readAuto()
+	}
+}
+
+func (c *controller) readAuto() {
+	on, err := c.hooks.autostart()
+	c.mu.Lock()
+	c.autoAt = time.Now()
+	c.autoBusy = false
+	if err == nil {
+		c.auto = on
+	}
+	c.mu.Unlock()
 }
 
 func (c *controller) running() (bool, int64, string) {
@@ -687,6 +734,11 @@ func (c *controller) replace(next *config.Config) error {
 	}
 	c.mu.Lock()
 	c.cfg = cp
+	for name := range c.checks {
+		if _, ok := cp.ProxyByName(name); !ok {
+			delete(c.checks, name) // deleted or renamed
+		}
+	}
 	c.syncSubsLocked(cp, time.Now())
 	rcfg := c.materializeLocked(cloneCfg(cp))
 	sess := c.sess
@@ -706,9 +758,25 @@ func (c *controller) replace(next *config.Config) error {
 		}
 	}
 	if syncErr != nil {
-		return errors.New(ruConfig(syncErr))
+		return &applyWarning{msg: ruConfig(syncErr)}
 	}
 	return nil
+}
+
+// applyWarning means the config was saved, but the VLESS bridges or the
+// running engine did not take all of it (a busy port, for one). The window
+// shows it as a warning, not as a failed save.
+type applyWarning struct{ msg string }
+
+func (w *applyWarning) Error() string { return w.msg }
+
+// savedAnswer is the reply to a save: a warning still means saved.
+func savedAnswer(err error) (any, error) {
+	var warn *applyWarning
+	if errors.As(err, &warn) {
+		return map[string]any{"ok": true, "warning": warn.msg}, nil
+	}
+	return nil, err
 }
 
 func (c *controller) syncBridges(cfg *config.Config) error {
@@ -759,18 +827,25 @@ func (c *controller) applyAutostart(on bool) error {
 	return nil
 }
 
-func (c *controller) proxyForProbe(name string, p *config.Proxy) (config.Proxy, error) {
-	if p != nil && (strings.TrimSpace(p.Address) != "" || p.Type == "vless" || strings.TrimSpace(p.Link) != "") {
-		if p.Type == "" {
-			p.Type = "socks5"
-		}
-		if p.Type == "vless" {
-			if err := p.Prepare(); err != nil {
-				return config.Proxy{}, err
-			}
-		}
-		return *p, nil
+// draftForProbe readies a proxy the dialog has not saved. It never falls
+// back to the saved proxy of that name: that would check something else.
+func draftForProbe(p config.Proxy) (config.Proxy, error) {
+	if p.Type == "" {
+		p.Type = "socks5"
 	}
+	p.Sub = nil
+	if p.Type == "vless" {
+		if err := p.Prepare(); err != nil {
+			return config.Proxy{}, err
+		}
+	}
+	if strings.TrimSpace(p.Address) == "" {
+		return config.Proxy{}, errors.New("Укажите адрес: хост:порт, например 127.0.0.1:1080")
+	}
+	return p, nil
+}
+
+func (c *controller) proxyForProbe(name string) (config.Proxy, error) {
 	// A subscription is checked on its active server.
 	got, ok := c.runtimeCfg().ProxyByName(name)
 	if !ok {
@@ -783,7 +858,7 @@ func (c *controller) proxyForProbe(name string, p *config.Proxy) (config.Proxy, 
 }
 
 func (c *controller) probeOne(p config.Proxy) probe.Report {
-	rep := probe.Check(context.Background(), p)
+	rep := probeCheck(context.Background(), p)
 	if p.Name != "" {
 		c.mu.Lock()
 		c.checks[p.Name] = rep
@@ -1013,6 +1088,7 @@ var (
 	lookPath      = exec.LookPath
 	statFile      = os.Stat
 	checkUpdate   = update.Check
+	probeCheck    = probe.Check
 )
 
 // iconCache keeps app icons, and the names that have none, so redrawing the
