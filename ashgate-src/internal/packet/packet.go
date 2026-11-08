@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math/bits"
 	"net"
 )
 
@@ -531,14 +532,40 @@ func checksum(b []byte) uint16 {
 	return fold(addBytes(0, b))
 }
 
+// addBytes adds b as big-endian 16-bit words to the one's complement sum.
+// It reads 8 bytes at a time: 2^16 is 1 modulo 0xFFFF, so a 64-bit word
+// sums like its four 16-bit words, and a carry out of bit 63 is added back
+// in. The result is folded to 16 bits (zero only when everything was), so
+// callers can still add small values before fold.
 func addBytes(sum uint32, b []byte) uint32 {
-	for i := 0; i+1 < len(b); i += 2 {
-		sum += uint32(binary.BigEndian.Uint16(b[i:]))
+	acc := uint64(sum)
+	var c uint64
+	for len(b) >= 32 {
+		acc, c = bits.Add64(acc, binary.BigEndian.Uint64(b), 0)
+		acc, c = bits.Add64(acc, binary.BigEndian.Uint64(b[8:]), c)
+		acc, c = bits.Add64(acc, binary.BigEndian.Uint64(b[16:]), c)
+		acc, c = bits.Add64(acc, binary.BigEndian.Uint64(b[24:]), c)
+		acc, c = bits.Add64(acc, 0, c)
+		acc += c
+		b = b[32:]
 	}
-	if len(b)%2 == 1 {
-		sum += uint32(b[len(b)-1]) << 8
+	for len(b) >= 8 {
+		acc, c = bits.Add64(acc, binary.BigEndian.Uint64(b), 0)
+		acc += c
+		b = b[8:]
 	}
-	return sum
+	acc = acc&0xFFFFFFFF + acc>>32
+	for len(b) >= 2 {
+		acc += uint64(binary.BigEndian.Uint16(b))
+		b = b[2:]
+	}
+	if len(b) == 1 {
+		acc += uint64(b[0]) << 8
+	}
+	for acc > 0xFFFF {
+		acc = acc&0xFFFF + acc>>16
+	}
+	return uint32(acc)
 }
 
 func fold(sum uint32) uint16 {

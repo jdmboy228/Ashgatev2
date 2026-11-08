@@ -127,9 +127,9 @@ func (e *Engine) readUDP(flow *udpFlow, sess dialer.Session) {
 			flow.stat.down.Add(n)
 		}
 		flow.touch(e.now())
-		if err := e.injectUDP(flow, payload); err != nil {
-			return
-		}
+		// A reply that cannot be built (too big for one packet) or
+		// injected is lost like any UDP datagram; the flow goes on.
+		_ = e.injectUDP(flow, payload)
 	}
 }
 
