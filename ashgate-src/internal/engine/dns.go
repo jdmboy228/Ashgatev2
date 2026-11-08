@@ -210,6 +210,7 @@ func (e *Engine) systemDNS(pkt []byte, h *packet.Header, meta Meta, proc rules.P
 			e.rememberBlock(h)
 			return Result{Action: ActionDrop}
 		}
+		e.debugDNS(h, proc, "DNS Windows: нет прокси для туннеля")
 		e.rememberDirectExceptDNS(h)
 		return Result{Action: ActionPass}
 	}

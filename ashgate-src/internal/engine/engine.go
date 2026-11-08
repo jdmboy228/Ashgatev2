@@ -120,7 +120,7 @@ type Engine struct {
 	resolver Resolver
 	now      func() time.Time
 	selfPID  uint32
-	verbose  bool
+	verbose  atomic.Bool
 
 	snap atomic.Pointer[snapshot]
 	// servers holds the proxies' own IP:port; see RefreshBypass.
@@ -164,6 +164,9 @@ type Engine struct {
 	// last log line about them, written at unknownLogAt.
 	unknownDrops int
 	unknownLogAt time.Time
+	// parseDrops and parseLogAt do the same for packets that do not parse.
+	parseDrops int
+	parseLogAt time.Time
 	// stats are per-rule counters keyed by RuleKey.
 	stats map[string]*ruleStat
 	// rotatedAt is when the direct/block caches last aged; see sweep.
@@ -267,7 +270,6 @@ func New(cfg *config.Config, opt Options) (*Engine, error) {
 	} else if !opt.SkipSelf {
 		e.selfPID = uint32(os.Getpid())
 	}
-	e.verbose = strings.EqualFold(cfg.Log.Level, "debug")
 	if opt.Injector != nil {
 		e.SetInjector(opt.Injector)
 	}
@@ -300,6 +302,7 @@ func (e *Engine) Apply(cfg *config.Config) error {
 		return err
 	}
 	e.snap.Store(snap)
+	e.verbose.Store(strings.EqualFold(cfg.Log.Level, "debug"))
 	e.mu.Lock()
 	e.directTCP = newAgeSet[packet.Addr]()
 	e.directUDP = newAgeSet[udpKey]()
@@ -471,8 +474,16 @@ func parseRelay(addr string, ver int) (packet.Addr, error) {
 func (e *Engine) HandlePacket(pkt []byte, meta Meta, final bool) Result {
 	var h packet.Header
 	if err := packet.Parse(pkt, &h); err != nil {
-		// No transport header means no ports to route by. Dropping would
-		// risk odd but legitimate traffic (offload packets).
+		// The filter only takes TCP and UDP, so this is one whose headers
+		// do not parse. With proxy rules it may be a routed program's and
+		// is dropped (CI saw the DNS client's lookups leave in plain text
+		// while such packets passed). The log says what it was.
+		if snap := e.snap.Load(); snap != nil && snap.strict {
+			e.mu.Lock()
+			e.parseDropLocked(pkt, err)
+			e.mu.Unlock()
+			return Result{Action: ActionDrop}
+		}
 		return Result{Action: ActionPass}
 	}
 	if h.L4Off == 0 {
@@ -764,6 +775,9 @@ func (e *Engine) decide(pkt []byte, h *packet.Header, meta Meta, proc rules.Proc
 		}
 		return e.startUDP(pkt, h, meta, proc, p, snap, parent, stat, dec.KillSwitch, false)
 	default:
+		if dns {
+			e.debugDNS(h, proc, "программа без правила: DNS напрямую")
+		}
 		e.rememberDirectExceptDNS(h)
 		return Result{Action: ActionPass}
 	}
@@ -849,6 +863,28 @@ const (
 	// maxFragHeld bounds fragHeld; a full set ages at once.
 	maxFragHeld = 4096
 )
+
+// parseDropLocked logs a dropped packet whose headers do not parse, at
+// most once per unknownLogEvery, with its size and first bytes.
+func (e *Engine) parseDropLocked(pkt []byte, err error) {
+	e.parseDrops++
+	now := e.now()
+	if !e.parseLogAt.IsZero() && now.Sub(e.parseLogAt) < unknownLogEvery {
+		return
+	}
+	e.parseLogAt = now
+	head := pkt[:min(len(pkt), 24)]
+	e.log(logbuf.Event{Status: "blocked", Error: fmt.Sprintf("неразборчивый пакет отброшен (%d): %v, %d байт, %x", e.parseDrops, err, len(pkt), head)})
+	e.parseDrops = 0
+}
+
+// debugDNS logs, at log level debug only, why a DNS packet went direct.
+func (e *Engine) debugDNS(h *packet.Header, proc rules.Process, why string) {
+	if !e.verbose.Load() {
+		return
+	}
+	e.log(logbuf.Event{Process: display(proc), PID: proc.PID, Proto: protoName(h.Proto), Dest: h.Dst.String(), Status: "direct", Error: why, Time: e.now()})
+}
 
 // unknownDropLocked counts a dropped packet of no known program and logs
 // the count at most once per unknownLogEvery.
@@ -1027,7 +1063,7 @@ func (e *Engine) log(ev logbuf.Event) {
 	if e.logs == nil {
 		return
 	}
-	if !e.verbose && ev.Proto == "UDP" && (ev.Status == "open" || ev.Status == "closed" || ev.Status == "direct") && strings.HasSuffix(ev.Dest, ":53") {
+	if !e.verbose.Load() && ev.Proto == "UDP" && (ev.Status == "open" || ev.Status == "closed" || ev.Status == "direct") && strings.HasSuffix(ev.Dest, ":53") {
 		return
 	}
 	if ev.Time.IsZero() {

@@ -343,9 +343,9 @@ func TestUnknownOwnerDroppedWithProxyRules(t *testing.T) {
 	if r := e.HandlePacket(udp, Meta{}, true); r.Action != ActionUDP {
 		t.Fatalf("UDP with its owner known went %v", r.Action)
 	}
-	// A packet without a parseable transport header has no ports to route
-	// by; it passes even with proxy rules.
-	if r := e.HandlePacket([]byte{0x45, 0, 0}, Meta{}, true); r.Action != ActionPass {
+	// A packet whose headers do not parse may be a routed program's: with
+	// proxy rules it is dropped, and the log says what it was.
+	if r := e.HandlePacket([]byte{0x45, 0, 0}, Meta{}, true); r.Action != ActionDrop {
 		t.Fatalf("unparsable packet went %v", r.Action)
 	}
 	cfg := testConfig()

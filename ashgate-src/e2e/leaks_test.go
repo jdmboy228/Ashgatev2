@@ -48,6 +48,9 @@ func TestLeaks(t *testing.T) {
 	pid := uint32(a.PID)
 	localPass := env.Secrets.Add("local-pass", "lp"+harness.RandHex(10), true)
 	err := a.UpdateConfig(func(c *config.Config) {
+		// Debug logs every DNS packet that goes direct and why, so a leak
+		// in the pcap can be traced in ashgate.log.
+		c.Log.Level = "debug"
 		c.Proxies = append(c.Proxies, config.Proxy{Name: "e2e-plain", Type: "vless", Address: s.Fx.XHTTP.Addr,
 			Link: s.Fx.PlainLink, SOCKSPort: plainSOCKS, LocalUser: "e2elocal", LocalPass: localPass})
 		// Not under .example/.test/.local: Xray sends those "local" suffixes
