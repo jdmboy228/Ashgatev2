@@ -145,9 +145,9 @@ func start(parent context.Context, cfg *config.Config, logs *logbuf.Buffer, brid
 		_ = eng.ForwardUDP(ctx, d)
 	})
 	wg.Add(1)
-	go readEvents(ctx, sockH, res, &wg)
+	go readEvents(ctx, sockH, res, eng, &wg)
 	wg.Add(1)
-	go readEvents(ctx, flowH, res, &wg)
+	go readEvents(ctx, flowH, res, eng, &wg)
 	// Up to 16 batches (1024 packets) wait for consume; the driver's
 	// queue holds the rest.
 	pkts := make(chan netBatch, 16)
@@ -205,7 +205,10 @@ func start(parent context.Context, cfg *config.Config, logs *logbuf.Buffer, brid
 	return s, nil
 }
 
-func readEvents(ctx context.Context, h windivert.Handle, res *process.Resolver, wg *sync.WaitGroup) {
+// udpProto is IPPROTO_UDP in a socket event.
+const udpProto = 17
+
+func readEvents(ctx context.Context, h windivert.Handle, res *process.Resolver, eng *engine.Engine, wg *sync.WaitGroup) {
 	defer wg.Done()
 	var addr windivert.Address
 	for {
@@ -218,6 +221,10 @@ func readEvents(ctx context.Context, h windivert.Handle, res *process.Resolver, 
 		ev := addr.Event()
 		closing := ev == windivert.EventSocketClose || ev == windivert.EventFlowDeleted
 		res.Observe(addr.Protocol(), addr.Local(), addr.ProcessID(), closing)
+		if ev == windivert.EventSocketClose && addr.Protocol() == udpProto {
+			// The port's next socket may be a routed program's.
+			eng.ForgetUDPPort(addr.Local().Port)
+		}
 	}
 }
 

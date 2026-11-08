@@ -212,6 +212,7 @@ func (e *Engine) sweep(now time.Time) {
 		e.rotatedAt = now
 		e.directTCP.rotate()
 		e.directUDP.rotate()
+		e.reindexDirectUDP()
 		e.blockTCP.rotate()
 		e.blockUDP.rotate()
 		e.closedTCP.rotate()

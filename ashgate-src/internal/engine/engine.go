@@ -135,8 +135,10 @@ type Engine struct {
 	byAlloc   map[allocKey]*tcpFlow
 	directTCP ageSet[packet.Addr]
 	directUDP ageSet[udpKey]
-	blockTCP  ageSet[packet.Addr]
-	blockUDP  ageSet[udpKey]
+	// directPorts indexes directUDP by source port; see udpport.go.
+	directPorts map[uint16]map[udpKey]struct{}
+	blockTCP    ageSet[packet.Addr]
+	blockUDP    ageSet[udpKey]
 	// closedTCP holds the app side of proxied TCP flows that ended. Their
 	// last packets (FIN, ACK, keepalives, retransmits) often come after the
 	// relay closed and after the app exited, when the owner can no longer
@@ -300,6 +302,7 @@ func (e *Engine) Apply(cfg *config.Config) error {
 	e.mu.Lock()
 	e.directTCP = newAgeSet[packet.Addr]()
 	e.directUDP = newAgeSet[udpKey]()
+	e.directPorts = nil
 	e.blockTCP = newAgeSet[packet.Addr]()
 	e.blockUDP = newAgeSet[udpKey]()
 	e.unknownUDP = newAgeSet[udpKey]()
@@ -860,7 +863,7 @@ func (e *Engine) startUDP(pkt []byte, h *packet.Header, meta Meta, proc rules.Pr
 	}
 	if p.Type != "socks5" && p.Type != "vless" && h.Dst.Port != 53 {
 		if snap.udpUnsupported == "direct" && !killSwitch {
-			e.directUDP.add(key)
+			e.addDirectUDP(key)
 			e.log(logbuf.Event{Process: display(proc), PID: proc.PID, Proto: "UDP", Dest: h.Dst.String(), Via: "direct", Status: "direct", Error: "http proxy has no udp; sent direct"})
 			return Result{Action: ActionPass}
 		}
@@ -976,7 +979,7 @@ func (e *Engine) rememberDirect(h *packet.Header) {
 		e.directTCP.add(h.Src)
 		return
 	}
-	e.directUDP.add(udpKey{Src: h.Src, Dst: h.Dst})
+	e.addDirectUDP(udpKey{Src: h.Src, Dst: h.Dst})
 }
 
 // rememberDirectExceptDNS is rememberDirect for anything but UDP to port

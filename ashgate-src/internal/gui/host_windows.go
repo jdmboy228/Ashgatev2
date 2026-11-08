@@ -16,6 +16,7 @@ import (
 	"time"
 	"unsafe"
 
+	"ashgate/internal/atomicfile"
 	"ashgate/internal/autostart"
 	"ashgate/internal/bootstrap"
 	"ashgate/internal/config"
@@ -642,12 +643,7 @@ func (h *host) saveWindow() {
 		return
 	}
 	buf = append(buf, '\n')
-	path := h.windowFile()
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, buf, 0o600); err != nil {
-		return
-	}
-	_ = os.Rename(tmp, path)
+	_ = atomicfile.Write(h.windowFile(), buf)
 }
 
 func frameSize(hwnd uintptr) (int32, int32) {

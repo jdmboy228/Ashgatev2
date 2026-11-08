@@ -20,6 +20,8 @@ import (
 	"sync"
 	"time"
 
+	"ashgate/internal/atomicfile"
+
 	"golang.org/x/net/dns/dnsmessage"
 )
 
@@ -299,11 +301,7 @@ func (r *Resolver) store(host string, ips []net.IP, ttl time.Duration) {
 	if file == "" || err != nil {
 		return
 	}
-	tmp := file + ".tmp"
-	_ = os.Remove(tmp)
-	if os.WriteFile(tmp, raw, 0o600) == nil {
-		_ = os.Rename(tmp, file)
-	}
+	_ = atomicfile.Write(file, raw)
 }
 
 // loadLocked reads the cache file once. Expired entries stay: they are
