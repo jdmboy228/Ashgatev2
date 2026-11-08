@@ -204,7 +204,7 @@ func trayShowMenu() {
 		tray.menu = hwnd
 	}
 	tray.dpi = dpi
-	tray.hover = 2
+	tray.hover = 0
 	ensureFonts(dpi)
 	ensureLogo(dpi)
 	pSetWindowPos.Call(tray.menu, ^uintptr(0), uintptr(x), uintptr(y), uintptr(w), uintptr(h), swpShowWindow)
@@ -288,9 +288,11 @@ func trayProc(hwnd, msg, wp, lp uintptr) uintptr {
 			trayHideMenu()
 		}
 		if wp == 0x0D {
+			// Enter acts on the row under the mouse; with none it opens the
+			// window. It used to start or stop capture.
 			id := tray.hover
 			if id == 0 {
-				id = 2
+				id = 1
 			}
 			trayAct(id)
 		}
