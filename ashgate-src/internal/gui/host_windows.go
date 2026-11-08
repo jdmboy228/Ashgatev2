@@ -353,6 +353,8 @@ func hostProc(hwnd, msg, wp, lp uintptr) uintptr {
 			h.noteNormal()
 			h.saveWindow()
 			pShowWindow.Call(hwnd, swHide)
+			// Hidden now: a quick re-show must wake the page again.
+			h.shown = false
 			return 0
 		}
 	case wmNcCalcSize:

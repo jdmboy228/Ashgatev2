@@ -1918,16 +1918,22 @@ async function main() {
 // it stops: the tray icon gets its state from Go, and the host wakes the
 // page when it is shown again.
 let polling = false;
+// wakeAsked: the window came back while a poll was in flight. That poll may
+// have read "hidden" before the wake, so it must not stop on it.
+let wakeAsked = false;
 async function poll() {
   polling = true;
+  wakeAsked = false;
   await refresh();
-  if (document.hidden || (state && state.hidden && failedPolls === 0)) { polling = false; return; }
+  if (!wakeAsked && (document.hidden || (state && state.hidden && failedPolls === 0))) { polling = false; return; }
   let wait = 1000;
   if (failedPolls) wait = 2000;
   else if (page === "log" && !paused) wait = 250;
   setTimeout(poll, wait);
 }
 function wakePoll() {
-  if (!polling && !DEMO) poll();
+  if (DEMO) return;
+  if (polling) wakeAsked = true;
+  else poll();
 }
 main();
