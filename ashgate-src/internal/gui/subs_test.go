@@ -15,8 +15,10 @@ import (
 	"time"
 
 	"ashgate/internal/config"
+	"ashgate/internal/engine"
 	"ashgate/internal/failover"
 	"ashgate/internal/logbuf"
+	"ashgate/internal/subs"
 	"ashgate/internal/testkit"
 )
 
@@ -284,5 +286,114 @@ func TestCheckTunnel(t *testing.T) {
 	serve(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
 	if got := checkTunnel(ctx, px.Addr, "u", "p"); got != failover.Failed {
 		t.Fatalf("captive portal answer: %v", got)
+	}
+}
+
+// fakeTunnel is a running capture session whose relays the test scripts.
+type fakeTunnel struct {
+	mu sync.Mutex
+	h  engine.RelayHealth
+}
+
+func (f *fakeTunnel) Running() bool { return true }
+
+func (f *fakeTunnel) RelayHealth(string) engine.RelayHealth {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.h
+}
+
+func (f *fakeTunnel) set(h engine.RelayHealth) {
+	f.mu.Lock()
+	f.h = h
+	f.mu.Unlock()
+}
+
+// Relays through the active server keep dying: a health check starts at
+// once, not at the next 60 s timer, and no more than once per 15 s.
+// Switching still takes the second failed check, 10 s later.
+func TestDeadRelaysStartAnEarlyCheck(t *testing.T) {
+	old, oldSess := subRand, sessionOf
+	subRand = func() float64 { return 0.5 }
+	ft := &fakeTunnel{}
+	sessionOf = func(*controller) tunnelSession { return ft }
+	t.Cleanup(func() { subRand, sessionOf = old, oldSess })
+
+	logs, _ := logbuf.New(50, "")
+	c := newController(filepath.Join(t.TempDir(), "config.json"), config.Default(), logs, hooks{})
+	t.Cleanup(c.shutdown)
+	const name = "sub"
+	base := time.Now()
+	g := &subGroup{entries: subs.Entries([]string{subLink("xhttp", "x1"), subLink("tcp", "raw1")}),
+		fo: failover.New(2, base, failover.Defaults, subRand), nextFetch: base.Add(24 * time.Hour)}
+	c.mu.Lock()
+	c.subs = map[string]*subGroup{name: g}
+	c.mu.Unlock()
+
+	// tick runs one loop round and waits for the check it started.
+	tick := func(now time.Time) (checked bool) {
+		t.Helper()
+		c.subsTick(now)
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			c.mu.Lock()
+			busy, at := g.checking, g.earlyAt
+			c.mu.Unlock()
+			if !busy {
+				return at.Equal(now)
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("the health check did not finish")
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	active := func() int {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return g.fo.Active
+	}
+
+	ft.set(engine.RelayHealth{Dead: 2, Since: base.Add(-2 * time.Second)})
+	if tick(base) {
+		t.Fatal("two dead relays started a check")
+	}
+	ft.set(engine.RelayHealth{Dead: 3, Since: base.Add(-2 * time.Second)})
+	if !tick(base) {
+		t.Fatal("three dead relays did not start a check")
+	}
+	if active() != 0 {
+		t.Fatal("one failed check switched the server")
+	}
+	// New dead relays right after: no second early check within 15 s.
+	ft.set(engine.RelayHealth{Dead: 5, Since: base.Add(time.Second)})
+	if tick(base.Add(5 * time.Second)) {
+		t.Fatal("a second early check within 15 s")
+	}
+	// The regular re-check after the 10 s backoff fails too: switch.
+	tick(base.Add(16 * time.Second))
+	if active() != 1 {
+		t.Fatal("two failed checks did not switch the server")
+	}
+
+	early := 0
+	for _, e := range logs.Snapshot() {
+		if strings.Contains(e.Error, "проверяю его сейчас") {
+			early++
+		}
+	}
+	if early != 1 {
+		t.Fatalf("%d early check log lines, want 1", early)
+	}
+
+	// Dead relays opened before the switch belong to the old server.
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	g.fo.SwitchedAt = base.Add(16 * time.Second)
+	if g.earlyCheck(base.Add(40*time.Second), engine.RelayHealth{Dead: 4, Since: base.Add(10 * time.Second)}) {
+		t.Fatal("relays of the previous server counted")
+	}
+	if !g.earlyCheck(base.Add(40*time.Second), engine.RelayHealth{Dead: 4, Since: base.Add(30 * time.Second)}) {
+		t.Fatal("relays of the new server did not count")
 	}
 }

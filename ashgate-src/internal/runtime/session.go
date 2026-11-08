@@ -84,6 +84,15 @@ func (s *Session) RuleStats() map[string]engine.RuleStat {
 	return s.eng.RuleStats()
 }
 
+// RelayHealth is how the recent TCP relays through proxy went; see
+// engine.RelayHealth.
+func (s *Session) RelayHealth(proxy string) engine.RelayHealth {
+	if s == nil || s.eng == nil {
+		return engine.RelayHealth{}
+	}
+	return s.eng.RelayHealth(proxy)
+}
+
 // Traffic is bytes relayed by this session.
 func (s *Session) Traffic() (up, down int64) {
 	if s == nil || s.eng == nil {
