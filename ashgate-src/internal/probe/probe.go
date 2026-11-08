@@ -89,15 +89,66 @@ func CheckTarget(ctx context.Context, p config.Proxy, host string, port uint16) 
 		ms := millis(start)
 		rep := Report{OK: true, Millis: ms, Label: fmt.Sprintf("%d мс", ms), Detail: "TCP доступен"}
 		// VLESS carries UDP inside the tunnel (XUDP); Ashgate opens it in
-		// process, not through SOCKS5 UDP ASSOCIATE.
+		// process, not through SOCKS5 UDP ASSOCIATE. A session opens
+		// without sending anything, so only an answer proves it works.
 		if us, err := vless.DialUDP(br.Addr); err == nil {
-			rep.UDP = true
-			rep.Detail = "TCP и UDP"
+			uctx, ucancel := context.WithTimeout(ctx, udpWait)
+			ok := udpAnswers(uctx, us)
+			ucancel()
 			_ = us.Close()
+			if ok {
+				rep.UDP = true
+				rep.Detail = "TCP и UDP"
+			} else {
+				rep.Detail = "TCP доступен, UDP не отвечает"
+			}
+		} else {
+			rep.Detail = "TCP доступен, UDP недоступен"
 		}
 		return rep
 	default:
 		return Report{Label: "нет ответа", Detail: "неизвестный тип прокси"}
+	}
+}
+
+// udpWait is how long the UDP probe waits for the DNS answer.
+const udpWait = 3 * time.Second
+
+// udpSession is the part of a UDP session the probe uses.
+type udpSession interface {
+	Send(ctx context.Context, dst *net.UDPAddr, payload []byte) error
+	Recv(ctx context.Context) (*net.UDPAddr, []byte, error)
+}
+
+// dnsProbe is a DNS A query for www.gstatic.com with the given id.
+func dnsProbe(id uint16) []byte {
+	q := []byte{byte(id >> 8), byte(id), 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0}
+	for _, label := range []string{"www", "gstatic", "com"} {
+		q = append(q, byte(len(label)))
+		q = append(q, label...)
+	}
+	return append(q, 0, 0, 1, 0, 1)
+}
+
+// udpAnswers sends one DNS query to 1.1.1.1:53 through s and reports that an
+// answer for it arrives before ctx ends. The bridge routes port 53 to
+// Xray's DNS, which asks through the tunnel. Any answer counts, even an
+// error one: it came through UDP.
+func udpAnswers(ctx context.Context, s udpSession) bool {
+	const id = 0xA5E7
+	dst := &net.UDPAddr{IP: net.IPv4(1, 1, 1, 1), Port: 53}
+	if err := s.Send(ctx, dst, dnsProbe(id)); err != nil {
+		return false
+	}
+	for {
+		_, b, err := s.Recv(ctx)
+		if err != nil {
+			return false
+		}
+		// An answer: our id and the response bit.
+		if len(b) >= 12 && uint16(b[0])<<8|uint16(b[1]) == id && b[2]&0x80 != 0 {
+			return true
+		}
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"io"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -287,8 +288,12 @@ func TestDirectOtherAndSelf(t *testing.T) {
 	}
 }
 
+// Without a proxy rule nothing is routed, and a packet whose program is
+// still unknown after the hold passes as before.
 func TestUnknownThenPass(t *testing.T) {
-	e, _ := newEngine(t, testConfig(), fixedRes{}, &fakeDial{}, nil)
+	cfg := testConfig()
+	cfg.Rules = []config.Rule{{Process: "direct.exe", Action: "direct"}}
+	e, _ := newEngine(t, cfg, fixedRes{}, &fakeDial{}, nil)
 	pkt, err := packet.BuildTCP(packet.V4(10, 0, 0, 9, 2222), packet.V4(1, 1, 1, 1, 443), 0x02)
 	if err != nil {
 		t.Fatal(err)
@@ -301,11 +306,62 @@ func TestUnknownThenPass(t *testing.T) {
 	}
 }
 
+// With a proxy rule an unknown program may be the routed one: its new
+// connections and UDP are dropped, and the drop is not remembered, so a
+// retransmit whose owner is known by then follows its rule.
+func TestUnknownOwnerDroppedWithProxyRules(t *testing.T) {
+	res := &switchRes{p: rules.Process{PID: 5, Name: "curl.exe"}}
+	e, logs := newEngine(t, testConfig(), res, &fakeDial{}, nil)
+	src, dst := packet.V4(10, 0, 0, 9, 2223), packet.V4(198, 51, 100, 9, 443)
+	syn, _ := packet.BuildTCP(src, dst, 0x02)
+	udp, _ := packet.BuildUDP(packet.V4(10, 0, 0, 9, 2224), dst, []byte("q"))
+	for i := 0; i < 3; i++ {
+		if r := e.HandlePacket(append([]byte(nil), syn...), Meta{}, true); r.Action != ActionDrop {
+			t.Fatalf("SYN of an unknown program went %v", r.Action)
+		}
+		if r := e.HandlePacket(append([]byte(nil), udp...), Meta{}, true); r.Action != ActionDrop {
+			t.Fatalf("UDP of an unknown program went %v", r.Action)
+		}
+	}
+	lines := 0
+	for _, ev := range logs.Snapshot() {
+		if strings.Contains(ev.Error, "программа не определена") {
+			lines++
+		}
+	}
+	if lines != 1 {
+		t.Fatalf("%d log lines about unknown programs, want 1: %v", lines, logs.Snapshot())
+	}
+	// A stream of the dropped UDP flow is not held again, packet by packet.
+	if r := e.HandlePacket(append([]byte(nil), udp...), Meta{}, false); r.Action != ActionDrop {
+		t.Fatalf("next UDP of the dropped flow went %v, want no new hold", r.Action)
+	}
+	res.set(true)
+	if r := e.HandlePacket(append([]byte(nil), syn...), Meta{}, true); r.Action != ActionModified {
+		t.Fatalf("retransmit with its owner known went %v", r.Action)
+	}
+	if r := e.HandlePacket(udp, Meta{}, true); r.Action != ActionUDP {
+		t.Fatalf("UDP with its owner known went %v", r.Action)
+	}
+	// A packet whose headers do not parse may be a routed program's: with
+	// proxy rules it is dropped, and the log says what it was.
+	if r := e.HandlePacket([]byte{0x45, 0, 0}, Meta{}, true); r.Action != ActionDrop {
+		t.Fatalf("unparsable packet went %v", r.Action)
+	}
+	cfg := testConfig()
+	cfg.Rules = nil
+	plain, _ := newEngine(t, cfg, fixedRes{}, &fakeDial{}, nil)
+	if r := plain.HandlePacket([]byte{0x45, 0, 0}, Meta{}, true); r.Action != ActionPass {
+		t.Fatalf("without proxy rules an unparsable packet went %v", r.Action)
+	}
+}
+
 // After capture restarts (a crash), a socket whose app has exited may still
 // send keepalives or its last FIN/ACK. Its owner is gone, the new engine
 // does not know the flow was proxied: the packet must not leave directly.
 func TestOwnerlessMidConnectionPacketIsDropped(t *testing.T) {
-	e, _ := newEngine(t, testConfig(), fixedRes{}, &fakeDial{}, nil)
+	res := &switchRes{p: rules.Process{PID: 7, Name: "direct.exe"}}
+	e, _ := newEngine(t, testConfig(), res, &fakeDial{}, nil)
 	src, dst := packet.V4(10, 0, 0, 9, 2300), packet.V4(198, 51, 100, 10, 443)
 	ack, _ := packet.BuildTCP(src, dst, 0x10)
 	if r := e.HandlePacket(append([]byte(nil), ack...), Meta{}, false); r.Action != ActionUnknown {
@@ -319,6 +375,7 @@ func TestOwnerlessMidConnectionPacketIsDropped(t *testing.T) {
 		t.Fatalf("next packet of that socket went %v", r.Action)
 	}
 	// A new connection from the same port is decided afresh.
+	res.set(true)
 	syn, _ := packet.BuildTCP(src, dst, 0x02)
 	if r := e.HandlePacket(syn, Meta{}, true); r.Action != ActionPass {
 		t.Fatalf("new SYN went %v", r.Action)
@@ -708,8 +765,11 @@ func TestRefreshBypassSkipsDNSForIPLiterals(t *testing.T) {
 		t.Fatalf("looked up %v, want only proxy.example.com", looked)
 	}
 	for _, ip := range []string{"203.0.113.10", "2001:db8::1", "198.51.100.7"} {
-		if !e.destinationBypass(packet.FromIP(net.ParseIP(ip), 443), false) {
-			t.Errorf("%s not in the bypass set", ip)
+		if !e.proxyServer(packet.FromIP(net.ParseIP(ip), 1080)) {
+			t.Errorf("%s:1080 not in the set of proxy servers", ip)
+		}
+		if e.proxyServer(packet.FromIP(net.ParseIP(ip), 443)) {
+			t.Errorf("%s:443 counts as a proxy server", ip)
 		}
 	}
 }

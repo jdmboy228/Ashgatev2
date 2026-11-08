@@ -15,6 +15,8 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+
+	"ashgate/internal/atomicfile"
 )
 
 // RuleName names every firewall rule Ashgate adds.
@@ -153,11 +155,7 @@ func (f *Firewall) saveLocked() error {
 	if err := os.MkdirAll(filepath.Dir(f.state), 0o755); err != nil {
 		return err
 	}
-	tmp := f.state + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, f.state)
+	return atomicfile.Write(f.state, data)
 }
 
 // valid accepts absolute Windows paths to an .exe. A quote would break the

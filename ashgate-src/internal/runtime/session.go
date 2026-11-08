@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"sync"
 
+	"ashgate/internal/bootstrap"
 	"ashgate/internal/config"
 	"ashgate/internal/engine"
 	"ashgate/internal/logbuf"
@@ -23,6 +25,8 @@ type Session struct {
 
 	mu  sync.Mutex
 	err error
+	// failed is closed when capture fails; see Failed.
+	failed chan struct{}
 }
 
 // Apply installs a new configuration. Existing TCP flows keep their proxy.
@@ -82,6 +86,15 @@ func (s *Session) RuleStats() map[string]engine.RuleStat {
 	return s.eng.RuleStats()
 }
 
+// RelayHealth is how the recent TCP relays through proxy went; see
+// engine.RelayHealth.
+func (s *Session) RelayHealth(proxy string) engine.RelayHealth {
+	if s == nil || s.eng == nil {
+		return engine.RelayHealth{}
+	}
+	return s.eng.RelayHealth(proxy)
+}
+
 // Traffic is bytes relayed by this session.
 func (s *Session) Traffic() (up, down int64) {
 	if s == nil || s.eng == nil {
@@ -120,6 +133,24 @@ func (s *Session) Done() <-chan struct{} {
 	return s.done
 }
 
+// Failed is closed the moment capture fails by itself, before the teardown
+// that ends with Done, which can take seconds (handles, workers, driver).
+// The kill switch blocks at once instead of waiting for Done.
+func (s *Session) Failed() <-chan struct{} {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.failed == nil {
+		s.failed = make(chan struct{})
+		if s.err != nil {
+			close(s.failed)
+		}
+	}
+	return s.failed
+}
+
 // Err is the first background failure, if the capture loop stopped by itself.
 func (s *Session) Err() error {
 	if s == nil {
@@ -135,10 +166,15 @@ func (s *Session) setErr(err error) {
 		return
 	}
 	s.mu.Lock()
-	if s.err == nil {
-		s.err = err
+	defer s.mu.Unlock()
+	if s.err != nil {
+		return
 	}
-	s.mu.Unlock()
+	s.err = err
+	if s.failed == nil {
+		s.failed = make(chan struct{})
+	}
+	close(s.failed)
 }
 
 // WireVLESS starts or updates the local bridges for every VLESS proxy and
@@ -149,6 +185,8 @@ func WireVLESS(ctx context.Context, m *vless.Manager, cfg *config.Config) (map[s
 		return nil, errors.New("VLESS: локальный мост не запущен")
 	}
 	items := make([]vless.Endpoint, 0)
+	// Server names below are looked up with these (test) resolvers.
+	bootstrap.Default.SetServers(cfg.DNS.Bootstrap)
 	routing := RoutingFor(cfg)
 	empty := map[string]bool{}
 	for i := range cfg.Proxies {
@@ -190,12 +228,19 @@ func WireVLESS(ctx context.Context, m *vless.Manager, cfg *config.Config) (map[s
 	return status, err
 }
 
-// RoutingFor is what every bridge does besides proxying: the direct
-// domains, and Xray's DNS for port 53 when DNS goes through the proxy.
+// RoutingFor is what every bridge does besides proxying: the bypass names
+// (Russian zones and direct domains) go direct, and port 53 goes to Xray's
+// DNS. In "original" mode too: the server an app chose (often the router)
+// cannot be reached from the VPS, and a failed lookup makes browsers ask
+// Windows instead.
 func RoutingFor(cfg *config.Config) vless.Routing {
-	rt := vless.Routing{Direct: append([]string(nil), cfg.DirectDomains...)}
-	if cfg.DNS.Mode == "proxy" {
-		rt.DNS = vless.DNSServers(cfg.DNS.Servers)
+	servers := cfg.DNS.ProxyDNSServers()
+	rt := vless.Routing{Direct: cfg.BypassDomains(), DNS: vless.DNSServers(servers)}
+	for _, s := range servers {
+		if host, _, err := net.SplitHostPort(s); err == nil && net.ParseIP(host) != nil {
+			rt.Raw = s
+			break
+		}
 	}
 	return rt
 }

@@ -31,7 +31,7 @@ type Dialer interface {
 // Net is the production dialer.
 type Net struct{}
 
-// DialTCP connects through SOCKS5, HTTP CONNECT, or a local VLESS bridge.
+// DialTCP connects through SOCKS5, HTTP CONNECT, or a VLESS bridge.
 func (Net) DialTCP(ctx context.Context, p config.Proxy, host string, port uint16) (net.Conn, error) {
 	switch p.Type {
 	case "socks5":
@@ -39,11 +39,15 @@ func (Net) DialTCP(ctx context.Context, p config.Proxy, host string, port uint16
 	case "http":
 		return httpproxy.Dial(ctx, p, host, port)
 	case "vless":
-		via, err := vlessSocks(p)
-		if err != nil {
+		if p.Local == "" {
+			return nil, errors.New("VLESS: локальный мост не запущен")
+		}
+		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		c, err := socks5.Dial(ctx, via, host, port)
+		// In-process: a loopback SOCKS5 hop would double the packets
+		// capture sees and cost a handshake per connection.
+		c, err := vless.DialTCP(p.Local, host, port)
 		if err != nil {
 			return nil, vless.Explain(err)
 		}
@@ -72,16 +76,4 @@ func (Net) DialUDP(ctx context.Context, p config.Proxy) (Session, error) {
 	default:
 		return nil, ErrUDPUnsupported
 	}
-}
-
-func vlessSocks(p config.Proxy) (config.Proxy, error) {
-	if p.Local == "" {
-		return config.Proxy{}, errors.New("VLESS: локальный мост не запущен")
-	}
-	// The private inbound's login is made up on every start; see
-	// runtime.WireVLESS.
-	return config.Proxy{
-		Name: p.Name, Type: "socks5", Address: p.Local,
-		Username: p.LocalAuthUser, Password: p.LocalAuthPass,
-	}, nil
 }

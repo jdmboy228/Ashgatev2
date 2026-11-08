@@ -9,7 +9,6 @@ import (
 
 	"ashgate/internal/config"
 	"ashgate/internal/dialer"
-	"ashgate/internal/httpproxy"
 	"ashgate/internal/logbuf"
 	"ashgate/internal/packet"
 	"ashgate/internal/rules"
@@ -31,16 +30,27 @@ type udpFlow struct {
 	closed bool
 	parent string
 	stat   *ruleStat
-	sess   dialer.Session
+	// sys marks system DNS (see dns.go): split by name per packet, and
+	// DNS over TCP through SOCKS5.
+	sys  bool
+	sess dialer.Session
 	// failedAt is the last failed DialUDP. While the proxy is down, packets
 	// within udpRetry of it are dropped instead of each starting a new
 	// association and logging another error.
 	failedAt time.Time
-	mu       sync.Mutex
+	// mu guards closed, sess and failedAt and is never held across I/O.
+	// dialMu serializes the dial and is.
+	mu     sync.Mutex
+	dialMu sync.Mutex
 }
 
 const (
 	udpRetry = 3 * time.Second
+	// udpIdle retires a UDP flow; dnsIdle a DNS one sooner. A DNS flow is
+	// one query and its answer (Xray's DNS gives up within ~10 s), and with
+	// every Windows lookup going through the tunnel there are many.
+	udpIdle = 30 * time.Second
+	dnsIdle = 15 * time.Second
 	// httpDNSParallel bounds concurrent DNS-over-CONNECT queries. Each one
 	// is a full TCP round trip, so running them inline would let four slow
 	// lookups stall every proxied UDP flow.
@@ -60,64 +70,79 @@ func (e *Engine) ForwardUDP(ctx context.Context, d UDPDatagram) error {
 		return nil
 	}
 	flow.touch(e.now())
-	if flow.proxy.Type == "http" {
+	if flow.proxy.Type == "http" || (flow.sys && flow.proxy.Type == "socks5") {
 		select {
 		case e.dnsSem <- struct{}{}:
 			go func() {
 				defer func() { <-e.dnsSem }()
-				_ = e.forwardHTTPDns(ctx, flow, d.Payload)
+				_ = e.forwardDNSTCP(ctx, flow, d.Payload)
 			}()
 			return nil
 		default:
-			return e.forwardHTTPDns(ctx, flow, d.Payload)
+			return e.forwardDNSTCP(ctx, flow, d.Payload)
 		}
 	}
 	return e.forwardSOCKS(ctx, flow, d)
 }
 
-func (e *Engine) forwardHTTPDns(ctx context.Context, flow *udpFlow, payload []byte) error {
-	server := flow.relay.String()
-	resp, err := httpproxy.DNSQuery(ctx, flow.proxy, server, payload)
-	if err != nil {
-		flow.stat.fail(err.Error(), e.now())
-		e.log(logbuf.Event{Process: display(flow.proc), PID: flow.proc.PID, Proto: "UDP", Dest: flow.orig.String(), Via: flow.proxy.Name, Status: "error", Error: err.Error()})
+func (e *Engine) forwardSOCKS(ctx context.Context, flow *udpFlow, d UDPDatagram) error {
+	sess, err := e.udpSession(ctx, flow, d.Payload)
+	if sess == nil {
 		return err
 	}
-	n := int64(len(resp))
-	flow.down.Add(n)
-	e.bytesDown.Add(n)
-	if flow.stat != nil {
-		flow.stat.down.Add(n)
-	}
-	return e.injectUDP(flow, resp)
-}
-
-func (e *Engine) forwardSOCKS(ctx context.Context, flow *udpFlow, d UDPDatagram) error {
-	flow.mu.Lock()
-	defer flow.mu.Unlock()
-	if flow.closed {
-		return nil
-	}
-	if flow.sess == nil {
-		if !flow.failedAt.IsZero() && e.now().Sub(flow.failedAt) < udpRetry {
-			return nil
-		}
-		sess, err := e.dial.DialUDP(ctx, flow.proxy)
-		if err != nil {
-			flow.stat.fail(err.Error(), e.now())
-			flow.failedAt = e.now()
-			e.log(logbuf.Event{Process: display(flow.proc), PID: flow.proc.PID, Proto: "UDP", Dest: flow.orig.String(), Via: flow.proxy.Name, Status: "error", Error: err.Error()})
-			return err
-		}
-		flow.sess = sess
-		go e.readUDP(flow, sess)
-	}
+	// Sent outside flow.mu: the Janitor and Stop take it, and must not wait
+	// for I/O.
 	dst := &net.UDPAddr{IP: flow.relay.NetIP(), Port: int(flow.relay.Port)}
-	if err := flow.sess.Send(ctx, dst, d.Payload); err != nil {
+	if err := sess.Send(ctx, dst, d.Payload); err != nil {
 		e.log(logbuf.Event{Process: display(flow.proc), PID: flow.proc.PID, Proto: "UDP", Dest: flow.orig.String(), Via: flow.proxy.Name, Status: "error", Error: err.Error()})
+		e.failDNS(flow, d.Payload)
 		return err
 	}
 	return nil
+}
+
+// udpSession returns the flow's session and opens it when there is none. It
+// returns nil when the datagram is not to be sent: the flow is closed, or
+// the proxy is down and err says so (nil for a retry-window drop). flow.mu
+// only guards the fields; dialMu keeps two dials of one flow apart, so the
+// dial itself, which does I/O, never holds flow.mu.
+func (e *Engine) udpSession(ctx context.Context, flow *udpFlow, payload []byte) (dialer.Session, error) {
+	flow.dialMu.Lock()
+	defer flow.dialMu.Unlock()
+	flow.mu.Lock()
+	closed, sess, failedAt := flow.closed, flow.sess, flow.failedAt
+	flow.mu.Unlock()
+	if closed {
+		return nil, nil
+	}
+	if sess != nil {
+		return sess, nil
+	}
+	if !failedAt.IsZero() && e.now().Sub(failedAt) < udpRetry {
+		e.failDNS(flow, payload)
+		return nil, nil
+	}
+	sess, err := e.dial.DialUDP(ctx, flow.proxy)
+	if err != nil {
+		flow.mu.Lock()
+		flow.failedAt = e.now()
+		flow.mu.Unlock()
+		flow.stat.fail(err.Error(), e.now())
+		e.log(logbuf.Event{Process: display(flow.proc), PID: flow.proc.PID, Proto: "UDP", Dest: flow.orig.String(), Via: flow.proxy.Name, Status: "error", Error: err.Error()})
+		e.failDNS(flow, payload)
+		return nil, err
+	}
+	flow.mu.Lock()
+	if flow.closed {
+		// Retired while dialing.
+		flow.mu.Unlock()
+		_ = sess.Close()
+		return nil, nil
+	}
+	flow.sess = sess
+	flow.mu.Unlock()
+	go e.readUDP(flow, sess)
+	return sess, nil
 }
 
 func (e *Engine) readUDP(flow *udpFlow, sess dialer.Session) {
@@ -134,9 +159,9 @@ func (e *Engine) readUDP(flow *udpFlow, sess dialer.Session) {
 			flow.stat.down.Add(n)
 		}
 		flow.touch(e.now())
-		if err := e.injectUDP(flow, payload); err != nil {
-			return
-		}
+		// A reply that cannot be built (too big for one packet) or
+		// injected is lost like any UDP datagram; the flow goes on.
+		_ = e.injectUDP(flow, payload)
 	}
 }
 
@@ -219,6 +244,7 @@ func (e *Engine) sweep(now time.Time) {
 		e.rotatedAt = now
 		e.directTCP.rotate()
 		e.directUDP.rotate()
+		e.reindexDirectUDP()
 		e.blockTCP.rotate()
 		e.blockUDP.rotate()
 		e.closedTCP.rotate()
@@ -241,7 +267,11 @@ func (e *Engine) sweep(now time.Time) {
 	var staleUDP []*udpFlow
 	for _, f := range e.udp {
 		last := time.Unix(0, f.last.Load())
-		if now.Sub(last) > 30*time.Second {
+		idle := udpIdle
+		if f.orig.Port == 53 {
+			idle = dnsIdle
+		}
+		if now.Sub(last) > idle {
 			staleUDP = append(staleUDP, f)
 		}
 	}

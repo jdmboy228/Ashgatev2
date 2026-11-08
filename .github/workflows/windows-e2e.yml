@@ -235,6 +235,9 @@ jobs:
       - name: Remove CI-only settings, mask secrets
         if: always()
         run: |
+          # A running Ashgate whose test VPS is gone keeps the runner's DNS
+          # in the dead tunnel (strict system DNS), and the upload fails.
+          Get-Process ashgate -ErrorAction SilentlyContinue | Stop-Process -Force
           & "$env:E2E_BIN\ashgate-e2e-servers.exe" debug-off
           & "$env:E2E_BIN\ashgate-e2e-servers.exe" mask -out $env:E2E_OUT -to "$env:RUNNER_TEMP\art"
       - uses: actions/upload-artifact@v4
@@ -277,6 +280,9 @@ jobs:
       - name: Remove CI-only settings, mask secrets
         if: always()
         run: |
+          # A running Ashgate whose test VPS is gone keeps the runner's DNS
+          # in the dead tunnel (strict system DNS), and the upload fails.
+          Get-Process ashgate -ErrorAction SilentlyContinue | Stop-Process -Force
           & "$env:E2E_BIN\ashgate-e2e-servers.exe" debug-off
           & "$env:E2E_BIN\ashgate-e2e-servers.exe" mask -out $env:E2E_OUT -to "$env:RUNNER_TEMP\art"
       - uses: actions/upload-artifact@v4
@@ -330,6 +336,9 @@ jobs:
       - name: Secret scan, remove CI-only settings, mask
         if: always()
         run: |
+          # A running Ashgate whose test VPS is gone keeps the runner's DNS
+          # in the dead tunnel (strict system DNS), and the upload fails.
+          Get-Process ashgate -ErrorAction SilentlyContinue | Stop-Process -Force
           & "$env:E2E_BIN\ashgate-e2e-servers.exe" debug-off
           New-Item -ItemType Directory -Force "$env:E2E_OUT\app" | Out-Null
           Copy-Item "$env:ProgramData\Ashgate\*" "$env:E2E_OUT\app\" -Recurse -ErrorAction SilentlyContinue

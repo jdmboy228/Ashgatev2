@@ -99,12 +99,6 @@ async function typeKept(field: import("@playwright/test").Locator, text: string)
   await expect(field, "the dialog lost typed text when it redrew").toHaveValue(text);
 }
 
-// saveRules presses «Сохранить» on the unsaved-changes bar if it shows up.
-async function saveRules() {
-  const save = page.locator('[data-act="rules-save"]');
-  if (await save.waitFor({ state: "visible", timeout: 3000 }).then(() => true, () => false)) await save.click();
-}
-
 async function toast(re: RegExp) {
   await expect(page.locator("#toast")).toBeVisible();
   await expect(page.locator("#toast")).toHaveText(re);
@@ -235,6 +229,27 @@ test.describe.serial("Ashgate window", () => {
     await expect(page.locator(".prow .main", { hasText: "HTTP тест 2" })).toHaveCount(0);
   });
 
+  // Switching away from «Подписка» left the subscription URL in the draft,
+  // and every save failed with «не удалось прочитать запрос».
+  test("a proxy saves after switching away from «Подписка»", async () => {
+    await nav("proxies");
+    await page.locator('[data-act="proxy-add"]').first().click();
+    await dlg().locator('[data-act="ptype"][data-value="sub"]').click();
+    await dlg().locator("#p-suburl").fill("https://sub.example.invalid/sub/x");
+    await dlg().locator('[data-act="ptype"][data-value="socks5"]').click();
+    await dlg().locator("#p-name").fill("После подписки");
+    await dlg().locator("#p-addr").fill(fx.socks);
+    await dlg().locator('button[type="submit"]').click();
+    await expect(dlg(), "the dialog did not close").toHaveCount(0);
+    await expect(page.locator(".prow .main", { hasText: "После подписки" })).toBeVisible();
+    await expect.poll(() => readConfig().proxies.map((p: any) => p.name), { message: "config.json has no new proxy" }).toContain("После подписки");
+    const row = page.locator(".prow", { hasText: "После подписки" });
+    await row.click();
+    await row.locator('[data-act="proxy-del"]').click();
+    await dlg().locator('button[type="submit"]').click();
+    await expect(page.locator(".prow .main", { hasText: "После подписки" })).toHaveCount(0);
+  });
+
   test("paste a vless:// link and parse it", async () => {
     await nav("proxies");
     await page.locator('[data-act="proxy-add"]').first().click();
@@ -301,13 +316,24 @@ test.describe.serial("Ashgate window", () => {
     await page.locator('[data-act="ap-add"]').first().click();
     await expect(dlg()).toBeVisible();
     await screens("dialog-ap-add");
-    await typeKept(dlg().locator("#ap-add-path"), CLIENT);
+    // The exe found for a typed name and a picked app stay in the path
+    // field: a redraw used to put the old field contents back. Ashgate's
+    // own WebView2 processes are always running.
+    const pathField = dlg().locator("#ap-add-path");
+    await dlg().locator("#ap-add-q").fill("msedgewebview2");
+    await expect(pathField, "the path found for the name was dropped").toHaveValue(/msedgewebview2\.exe$/i);
+    const chip = dlg().locator('[data-act="ap-pick"]').first();
+    await expect(chip).toBeVisible();
+    const chipPath = (await chip.getAttribute("data-path")) || "";
+    await pathField.fill("");
+    await chip.click();
+    await expect(pathField, "a picked app did not fill the path").toHaveValue(chipPath);
+    await typeKept(pathField, CLIENT);
     const route = dlg().locator("#ap-add-route");
     const value = await route.locator("option", { hasText: "Подписка e2e" }).first().getAttribute("value");
     await route.selectOption(value || "");
     await dlg().locator('button[type="submit"]').click();
     await expect(dlg()).toHaveCount(0);
-    await saveRules();
     const card = page.locator(".ap-card", { hasText: "ashgate-e2e-client" });
     await expect(card).toBeVisible();
 
@@ -317,7 +343,6 @@ test.describe.serial("Ashgate window", () => {
     await typeKept(dlg().locator("#ap-add-path"), "C:\\Windows\\System32\\curl.exe");
     await dlg().locator('button[type="submit"]').click();
     await expect(dlg()).toHaveCount(0);
-    await saveRules();
     await expect(page.locator(".ap-card", { hasText: "curl" })).toBeVisible();
 
     // Switch off and on.
@@ -357,28 +382,33 @@ test.describe.serial("Ashgate window", () => {
       await gnew.click();
       await expect(dlg()).toBeVisible();
       await screens("dialog-ap-group");
+      // A preset fills the name (a redraw used to clear it again).
+      await dlg().locator('[data-act="ap-gnew-preset"]', { hasText: "Мессенджеры" }).click();
+      await expect(dlg().locator("#ap-gnew-name"), "a preset did not fill the group name").toHaveValue("Мессенджеры");
       await dlg().locator("#ap-gnew-name").fill("Группа e2e");
       await dlg().locator('button[type="submit"]').click();
       await expect(dlg()).toHaveCount(0);
-      await saveRules();
-      const rename = page.locator('[data-act="ap-grename"]').first();
+        const rename = page.locator('[data-act="ap-grename"]').first();
       if (!(await rename.isVisible())) await page.locator('.ap-card.group [data-act="ap-menu"]').first().click().catch(() => {});
       if (await page.locator('[data-act="ap-grename"]').first().isVisible().catch(() => false)) {
         await page.locator('[data-act="ap-grename"]').first().click();
         await screens("dialog-ap-gname");
         await closeDialog();
       }
+      // Renaming closed the group menu: open it again to ungroup.
+      if (!(await page.locator('[data-act="ap-gsplit"]').first().isVisible().catch(() => false))) {
+        await page.locator('.ap-card.group [data-act="ap-menu"]').first().click().catch(() => {});
+      }
       await page.locator('[data-act="ap-gsplit"]').first().click().catch(() => {});
-      await saveRules();
-    } else {
+      } else {
       findings.push({ kind: "groups", text: "no «group» button after selecting two rules" });
     }
 
     // Delete the curl rule (no confirmation by design).
-    const curl = page.locator(".ap-card", { hasText: "curl" });
+    // Not the group card, which also contains the curl rule if ungrouping failed.
+    const curl = page.locator(".ap-card:not(.group)", { hasText: "curl" });
     await curl.locator('[data-act="ap-menu"]').click();
     await page.locator('[data-act="ap-del"]').first().click();
-    await saveRules();
     await expect(page.locator(".ap-card", { hasText: "curl" })).toHaveCount(0);
     await screens("page-rules-filled");
   });
@@ -405,6 +435,23 @@ test.describe.serial("Ashgate window", () => {
     expect(c.directDomains).toContain("e2e-ui.example");
     expect(c.log.level).toBe("debug");
     await screens("page-settings-changed");
+  });
+
+  // Leaving Settings by a tab click: its mousedown ends the edit, and the
+  // save used to be dropped because the page was no longer Settings.
+  test("settings typed before a tab click are saved", async () => {
+    await nav("settings");
+    const dns = page.locator("#dns-servers");
+    await dns.fill("1.0.0.1:53, 9.9.9.9:53");
+    await page.locator('[data-nav="rules"]').click();
+    await expect.poll(() => readConfig().dns.servers, { timeout: 5000, message: "the DNS servers typed before the tab click were not saved" })
+      .toEqual(["1.0.0.1:53", "9.9.9.9:53"]);
+    await nav("settings");
+    await expect(dns).toHaveValue("1.0.0.1:53, 9.9.9.9:53");
+    // Put back what the restart test expects.
+    await dns.fill("1.1.1.1:53, 9.9.9.9:53");
+    await page.locator('[data-nav="proxies"]').click();
+    await expect.poll(() => readConfig().dns.servers, { timeout: 5000 }).toEqual(["1.1.1.1:53", "9.9.9.9:53"]);
   });
 
   test("log page tools", async () => {

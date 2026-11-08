@@ -4,13 +4,16 @@ package e2e
 
 import (
 	"bufio"
+	"context"
 	"encoding/base64"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -31,19 +34,30 @@ func TestLeaks(t *testing.T) {
 	env := harness.LoadEnv(t)
 	harness.EnsureQuit(env.Exe)
 	tcpOnly := env.ClientExe(t, harness.ClientTCPOnly)
+	rules := map[string]string{tcpOnly: harness.SubName}
+	// Edge stands for Opera and every Chromium browser (see Browser).
+	edge := harness.EdgeExe()
+	if edge != "" {
+		rules[edge] = harness.SubName
+	}
 	s := harness.NewSession(t, harness.SessionOpts{
-		Rules: map[string]string{tcpOnly: harness.SubName},
+		Rules: rules,
 		Opts:  map[string]harness.RuleOpts{tcpOnly: {KillSwitch: harness.Bool(true), TCPOnly: true}},
 	})
 	a := s.App
 	pid := uint32(a.PID)
 	localPass := env.Secrets.Add("local-pass", "lp"+harness.RandHex(10), true)
 	err := a.UpdateConfig(func(c *config.Config) {
+		// Debug logs every DNS packet that goes direct and why, so a leak
+		// in the pcap can be traced in ashgate.log.
+		c.Log.Level = "debug"
 		c.Proxies = append(c.Proxies, config.Proxy{Name: "e2e-plain", Type: "vless", Address: s.Fx.XHTTP.Addr,
 			Link: s.Fx.PlainLink, SOCKSPort: plainSOCKS, LocalUser: "e2elocal", LocalPass: localPass})
 		// Not under .example/.test/.local: Xray sends those "local" suffixes
 		// to the system DNS whenever a direct list exists.
 		c.DirectDomains = append(c.DirectDomains, "e2e-direct.example.com")
+		// The zones are list entries: ru stays, su is deleted (SystemResolver).
+		c.DirectDomains = slices.DeleteFunc(c.DirectDomains, func(d string) bool { return d == "su" })
 	})
 	if err != nil {
 		t.Fatalf("plain proxy and direct domain: %v", err)
@@ -92,7 +106,7 @@ func TestLeaks(t *testing.T) {
 		tun := "t" + harness.RandHex(5) + ".e2e-tunnel.example.com"
 		tun2 := "u" + harness.RandHex(5) + ".e2e-tunnel.example.com"
 		dir := "d" + harness.RandHex(5) + ".e2e-direct.example.com"
-		since := time.Now()
+		doh := s.Fx.DoHBytes()
 		var r1, r2, r3 harness.ClientResult
 		pkts, socks := phase(t, "dns", func() {
 			r1 = harness.RunClient(s.Client, "dns", "-server", "1.1.1.1:53", "-name", tun)
@@ -115,49 +129,190 @@ func TestLeaks(t *testing.T) {
 		if len(harness.Filter(pkts, harness.DNSFor(dir))) == 0 {
 			t.Errorf("%s (a direct domain) was not resolved directly by the system DNS", dir)
 		}
-		var doh int
-		for _, ip := range harness.DoHIPs {
-			doh += len(s.Fx.AccessSince(since, ip+":443"))
-		}
-		if doh == 0 {
-			t.Errorf("no DoH connection reached the test server through the tunnel")
+		if s.Fx.DoHBytes() == doh {
+			t.Errorf("no DoH went through the tunnel to the test server")
 		}
 		if d := ownDirect(socks); len(d) > 0 {
 			t.Errorf("ashgate.exe connected directly to %v during DNS (DoH must go through the tunnel)", d)
 		}
 	})
 
+	// getaddrinfo goes through the Windows DNS client (svchost.exe), which
+	// resolves for every program, and Ashgate cannot tell which one asked:
+	// a routed app's name goes through the tunnel, bypass names (the direct
+	// list, with the zones ru and рф by default, LAN names) to the
+	// provider's DNS. The zone su was deleted from the list above.
 	t.Run("SystemResolver", func(t *testing.T) {
-		g1 := "g" + harness.RandHex(5) + ".e2e-tunnel.example.com"
-		pkts, _ := phase(t, "getaddrinfo-off", func() {
-			harness.RunClient(s.Client, "lookup", "-name", g1)
-			time.Sleep(time.Second)
-		})
-		if len(harness.Filter(pkts, harness.DNSFor(g1))) > 0 {
-			env.Note("info", "getaddrinfo of a proxied app goes through the Windows DNS client (svchost) and leaves directly while includeSystemResolver is off: documented limitation (README, DNS)")
+		if direct := readConfig(t).DirectDomains; !slices.Contains(direct, "ru") || slices.Contains(direct, "su") {
+			t.Errorf("direct list %v: want the zone ru kept and su deleted", direct)
 		}
-		err := a.UpdateConfig(func(c *config.Config) {
-			c.DNS.IncludeSystemResolver = true
-			c.DNS.SystemResolverProxy = harness.SubName
-		})
-		if err != nil {
-			t.Fatalf("includeSystemResolver: %v", err)
-		}
-		defer func() {
-			_ = a.UpdateConfig(func(c *config.Config) {
-				c.DNS.IncludeSystemResolver = false
-				c.DNS.SystemResolverProxy = ""
-			})
-		}()
-		time.Sleep(2 * time.Second)
 		_, _ = harness.Run("ipconfig", "/flushdns")
-		g2 := "h" + harness.RandHex(5) + ".e2e-tunnel.example.com"
-		pkts, _ = phase(t, "getaddrinfo-on", func() {
-			harness.RunClient(s.Client, "lookup", "-name", g2, "-timeout", "8s")
+		tun := "g" + harness.RandHex(5) + ".e2e-tunnel.example.com"
+		dir := "x" + harness.RandHex(5) + ".e2e-direct.example.com"
+		ru := "e2e-" + harness.RandHex(6) + ".ru"
+		su := "e2e-" + harness.RandHex(6) + ".su"
+		ctl := "c" + harness.RandHex(5) + ".e2e-tunnel.example.com"
+		doh := s.Fx.DoHBytes()
+		var rTun, rDir, rRU, rLoop, rCtl harness.ClientResult
+		var loopTook time.Duration
+		pkts, _ := phase(t, "getaddrinfo", func() {
+			rTun = harness.RunClient(s.Client, "lookup", "-name", tun, "-timeout", "15s")
+			rDir = harness.RunClient(s.Client, "lookup", "-name", dir, "-timeout", "15s")
+			rRU = harness.RunClient(s.Client, "lookup", "-name", ru, "-timeout", "15s")
+			harness.RunClient(s.Client, "lookup", "-name", su, "-timeout", "15s")
+			// The app's own query for a bypass name: Xray asks Windows, and
+			// Windows' query must go to the provider, not loop back to Xray.
+			start := time.Now()
+			rLoop = harness.RunClient(s.Client, "dns", "-server", "1.1.1.1:53", "-name", "ya.ru", "-timeout", "8s")
+			loopTook = time.Since(start)
+			// An app without a rule keeps its own DNS.
+			rCtl = harness.RunClient(s.Direct, "dns", "-server", "1.1.1.1:53", "-name", ctl, "-timeout", "4s")
 			time.Sleep(time.Second)
 		})
-		if leak := harness.Filter(pkts, harness.DNSFor(g2)); len(leak) > 0 {
-			t.Errorf("with includeSystemResolver on, getaddrinfo still leaked %s:%s", g2, harness.Brief(leak, 5))
+		t.Logf("getaddrinfo: tunnel %s / direct %s / ru %s; ya.ru via Xray %s in %s; control %s", rTun, rDir, rRU, rLoop, loopTook.Round(time.Millisecond), rCtl)
+		if leak := harness.Filter(pkts, harness.DNSFor(tun)); len(leak) > 0 {
+			t.Errorf("getaddrinfo of a routed app left the machine in plain text (Windows DNS client):%s", harness.Brief(leak, 5))
+		}
+		if len(harness.Filter(pkts, harness.DNSFor(dir))) == 0 {
+			t.Errorf("%s (direct list) did not go to the provider's DNS", dir)
+		}
+		if len(harness.Filter(pkts, harness.DNSFor(ru))) == 0 {
+			t.Errorf("%s (the list entry ru) did not go to the provider's DNS", ru)
+		}
+		if leak := harness.Filter(pkts, harness.DNSFor(su)); len(leak) > 0 {
+			t.Errorf("%s (.su, deleted from the list) left the machine in plain text:%s", su, harness.Brief(leak, 5))
+		}
+		if !rLoop.OK || !strings.Contains(rLoop.Answer, "rcode=0") || strings.Contains(rLoop.Answer, "answers=0") {
+			t.Errorf("ya.ru through Xray's DNS got no address in %s: %s (svchost → Ashgate → Xray → svchost loop?)", loopTook.Round(time.Millisecond), rLoop)
+		}
+		if len(harness.Filter(pkts, harness.DNSFor(ctl))) == 0 {
+			t.Errorf("an app without a rule: its own DNS query did not go direct")
+		}
+		if s.Fx.DoHBytes() == doh {
+			t.Errorf("no DoH through the tunnel during getaddrinfo")
+		}
+	})
+
+	// The case from dnsleaktest: a Chromium browser's own lookups go through
+	// the tunnel, and when they fail it asks Windows instead. Neither may
+	// leave the machine.
+	t.Run("Browser", func(t *testing.T) {
+		if edge == "" {
+			env.Note("skipped", "browser DNS leak test: Microsoft Edge is not on the runner")
+			t.Skip("no msedge.exe")
+		}
+		direct := readConfig(t).DirectDomains
+		load := func(name string) (string, []harness.Packet) {
+			marker := "b" + harness.RandHex(6)
+			names := make([]string, 30)
+			for i := range names {
+				names[i] = fmt.Sprintf("n%d-%s.e2e-tunnel.example.com", i, marker)
+			}
+			page := env.Path("leaks", name+".html")
+			if err := harness.LeakPage(page, names); err != nil {
+				t.Fatal(err)
+			}
+			profile, err := os.MkdirTemp("", "ashgate-e2e-edge-")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer os.RemoveAll(profile)
+			ports := harness.WatchUDPPorts()
+			pkts, _ := phase(t, name, func() {
+				// Long enough for its own lookups to time out and fall back
+				// to Windows, as Opera did.
+				ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+				defer cancel()
+				err := exec.CommandContext(ctx, edge, "--headless=new", "--disable-gpu", "--no-first-run",
+					"--no-default-browser-check", "--user-data-dir="+profile, "file:///"+filepath.ToSlash(page)).Run()
+				t.Logf("%s: msedge stopped after 40 s (killed, as planned): %v", name, err)
+				_, _ = harness.Run("taskkill", "/F", "/T", "/IM", "msedge.exe")
+				time.Sleep(2 * time.Second)
+			})
+			ports.Stop()
+			// Any other plain DNS on the card: whose was it? Routed Edge and
+			// the Windows DNS client may send only bypass names.
+			for _, p := range pkts {
+				if p.Proto != "udp" || p.DstPort != 53 || len(p.DNS) == 0 || harness.BypassAll(p.DNS, direct) {
+					continue
+				}
+				owner := ports.Owner(p.SrcPort)
+				low := strings.ToLower(owner)
+				switch {
+				case strings.Contains(low, strings.ToLower(edge)), strings.Contains(low, `\svchost.exe`):
+					t.Errorf("%s: plain DNS from %s: %s", name, owner, p)
+				default:
+					t.Logf("%s: plain DNS from a program without a rule (%q): %s", name, owner, p)
+				}
+			}
+			return marker, pkts
+		}
+		doh := s.Fx.DoHBytes()
+		marker, pkts := load("browser")
+		if leak := harness.Filter(pkts, harness.DNSFor(marker)); len(leak) > 0 {
+			t.Errorf("Edge's lookups left the machine in plain text:%s", harness.Brief(leak, 5))
+		}
+		if s.Fx.DoHBytes() == doh {
+			t.Errorf("no DoH through the tunnel while Edge loaded the page")
+		}
+		s.Fx.SetDoH(false)
+		defer s.Fx.SetDoH(true)
+		doh = s.Fx.DoHBytes()
+		marker, pkts = load("browser-doh-down")
+		if leak := harness.Filter(pkts, harness.DNSFor(marker)); len(leak) > 0 {
+			t.Errorf("with DoH failing, Edge's lookups left the machine in plain text (fallback to Windows):%s", harness.Brief(leak, 5))
+		}
+		if got := s.Fx.DoHBytes() - doh; got > 0 {
+			t.Errorf("DoH carried %d bytes while it was cut off: the fallback was not tested", got)
+		}
+	})
+
+	// A router that hands out its link-local address as the DNS server.
+	t.Run("LinkLocalDNS", func(t *testing.T) {
+		undo, err := harness.SetupLinkLocalDNS(nic)
+		if err != nil {
+			env.Note("skipped", "link-local DNS leak test: "+err.Error())
+			t.Skip(err)
+		}
+		defer undo()
+		m6 := "v" + harness.RandHex(5) + ".e2e-tunnel.example.com"
+		m4 := "w" + harness.RandHex(5) + ".e2e-tunnel.example.com"
+		ctl := "y" + harness.RandHex(5) + ".e2e-tunnel.example.com"
+		pkts, _ := phase(t, "linklocal-dns", func() {
+			harness.RunClient(s.Client, "dns", "-server", harness.LinkLocalDNS6Addr(nic), "-name", m6, "-timeout", "4s")
+			harness.RunClient(s.Client, "dns", "-server", harness.LinkLocalDNS4+":53", "-name", m4, "-timeout", "4s")
+			harness.RunClient(s.Client, "dns", "-server", harness.LinkLocalDNS4+":53", "-name", m4, "-tcp", "-timeout", "4s")
+			harness.RunClient(s.Direct, "dns", "-server", harness.LinkLocalDNS6Addr(nic), "-name", ctl, "-timeout", "2s")
+			time.Sleep(time.Second)
+		})
+		if len(harness.Filter(pkts, harness.DNSFor(ctl))) == 0 {
+			t.Fatalf("the control app's query to %s was not seen on the card: the setup does not make leaks visible", harness.LinkLocalDNS6)
+		}
+		for _, m := range []string{m6, m4} {
+			if leak := harness.Filter(pkts, harness.DNSFor(m)); len(leak) > 0 {
+				t.Errorf("DNS to a link-local server left the machine in plain text:%s", harness.Brief(leak, 5))
+			}
+		}
+		syn := harness.Filter(pkts, func(p harness.Packet) bool {
+			return p.SYN && p.Dst == harness.LinkLocalDNS4 && p.DstPort == 53
+		})
+		if len(syn) > 0 {
+			t.Errorf("DNS over TCP to a link-local server went direct:%s", harness.Brief(syn, 5))
+		}
+	})
+
+	// Many queries at once, each from a new socket (a browser loading a
+	// page): the owner of some is not known yet when the packet arrives.
+	t.Run("DNSBurst", func(t *testing.T) {
+		m := "burst" + harness.RandHex(5) + ".e2e-tunnel.example.com"
+		var r harness.ClientResult
+		pkts, _ := phase(t, "dns-burst", func() {
+			r = harness.RunClient(s.Client, "dnsburst", "-server", "1.1.1.1:53", "-name", m, "-count", "300", "-timeout", "15s")
+			time.Sleep(time.Second)
+		})
+		t.Logf("burst: %d answered, %d not", r.Count, r.Failed)
+		if leak := harness.Filter(pkts, harness.DNSFor(m)); len(leak) > 0 {
+			t.Errorf("%d burst queries left the machine in plain text:%s", len(leak), harness.Brief(leak, 5))
 		}
 	})
 
@@ -241,6 +396,20 @@ func TestLeaks(t *testing.T) {
 		if d := ownDirect(socks, directIP); len(d) > 0 {
 			t.Errorf("ashgate.exe connected directly to %v", d)
 		}
+		// The request to the black hole never gets an answer. Wait until
+		// the relay has let go of it (it closes an unanswered upstream a
+		// few seconds after the client is gone), so that its dial retries
+		// do not run into the next subtests.
+		if err := harness.Eventually(30*time.Second, 500*time.Millisecond, func() error {
+			for _, sk := range harness.SocketsOf(pid) {
+				if sk.Remote.String() == directIP {
+					return fmt.Errorf("ashgate.exe still has a socket to %s", directIP)
+				}
+			}
+			return nil
+		}); err != nil {
+			t.Errorf("the direct-domain flow did not end: %v", err)
+		}
 	})
 
 	t.Run("KillSwitchServersDown", func(t *testing.T) {
@@ -249,6 +418,7 @@ func TestLeaks(t *testing.T) {
 		defer s.Fx.XHTTP.Set(harness.GatePass)
 		defer s.Fx.RAW.Set(harness.GatePass)
 		var rs []harness.ClientResult
+		mk := "k" + harness.RandHex(5) + ".e2e-tunnel.example.com"
 		pkts, _ := phase(t, "ks-servers-down", func() {
 			// get, not a bare connect: the local relay accepts the TCP
 			// handshake itself before it dials the server.
@@ -256,7 +426,13 @@ func TestLeaks(t *testing.T) {
 				rs = append(rs, harness.RunClient(s.Client, "get", "-url", harness.URL(harness.TargetTCP), "-n", "1000", "-stall", "5s"))
 				rs = append(rs, harness.RunClient(s.Client, "udp", "-addr", harness.TargetUDP, "-timeout", "2s"))
 			}
+			// DNS with no tunnel: it fails, it does not go direct.
+			harness.RunClient(s.Client, "dns", "-server", "1.1.1.1:53", "-name", "a"+mk, "-timeout", "4s")
+			harness.RunClient(s.Client, "lookup", "-name", "b"+mk, "-timeout", "10s")
 		})
+		if leak := harness.Filter(pkts, harness.DNSFor(mk)); len(leak) > 0 {
+			t.Errorf("DNS with the servers down left the machine in plain text:%s", harness.Brief(leak, 5))
+		}
 		for _, r := range rs {
 			if r.OK {
 				t.Errorf("the proxied app got through with both servers refused")
@@ -291,7 +467,11 @@ func TestLeaks(t *testing.T) {
 	})
 
 	t.Run("HealthAndSubscriptionThroughTunnel", func(t *testing.T) {
-		verified := harness.WaitTunnelHealthy(t, s.Fx, s.Started, 150*time.Second).Time
+		// Capture was just restarted, and while the servers were down a
+		// backup may have taken over: wait for a check of this tunnel, not
+		// the first one of the session, then give the app time to note it.
+		verified := harness.WaitTunnelHealthy(t, s.Fx, time.Now(), 150*time.Second).Time
+		time.Sleep(2 * time.Second)
 		since := time.Now()
 		pkts, socks := phase(t, "sub-refresh", func() {
 			if err := a.Post("/api/subscription/refresh", map[string]string{"name": harness.SubName}, nil); err != nil {
@@ -323,6 +503,58 @@ func TestLeaks(t *testing.T) {
 		}
 		if d := ownDirect(socks, directHost()); len(d) > 0 {
 			t.Errorf("ashgate.exe connected directly to %v during the refresh", d)
+		}
+	})
+
+	// A VLESS server given by host name: Ashgate looks it up over DoH
+	// (dns.bootstrap here), never with the provider's DNS.
+	t.Run("ServerHostname", func(t *testing.T) {
+		host := "vps-" + harness.RandHex(5) + ".e2e-server.example.com"
+		boot, err := harness.StartBootDoH(map[string]string{host: "127.0.0.1"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer boot.Close()
+		_, port, _ := net.SplitHostPort(s.Fx.XHTTP.Addr)
+		named := net.JoinHostPort(host, port)
+		link := strings.Replace(s.Fx.PlainLink, s.Fx.XHTTP.Addr, named, 1)
+		var rep struct {
+			OK     bool   `json:"ok"`
+			Detail string `json:"detail"`
+		}
+		pkts, socks := phase(t, "server-hostname", func() {
+			err = a.UpdateConfig(func(c *config.Config) {
+				c.DNS.Bootstrap = []string{boot.URL}
+				c.Proxies = append(c.Proxies, config.Proxy{Name: "e2e-named", Type: "vless", Address: named, Link: link})
+			})
+			if err != nil {
+				t.Errorf("add the named server: %v", err)
+				return
+			}
+			if err := a.Post("/api/probe", map[string]string{"name": "e2e-named"}, &rep); err != nil {
+				t.Errorf("probe: %v", err)
+			}
+		})
+		defer func() {
+			_ = a.UpdateConfig(func(c *config.Config) {
+				c.DNS.Bootstrap = nil
+				c.Proxies = slices.DeleteFunc(c.Proxies, func(p config.Proxy) bool { return p.Name == "e2e-named" })
+			})
+		}()
+		if !rep.OK {
+			t.Errorf("a VLESS server given by host name did not work: %s", rep.Detail)
+		}
+		if !slices.Contains(boot.Asked(), host) {
+			t.Errorf("%s was not looked up over DoH (asked: %v)", host, boot.Asked())
+		}
+		if leak := harness.Filter(pkts, harness.DNSFor("e2e-server")); len(leak) > 0 {
+			t.Errorf("the server name went out in plain DNS:%s", harness.Brief(leak, 5))
+		}
+		// DirectHostIP is direct by design (the Direct domain of
+		// DomainExceptions); a leftover connection of an earlier subtest to
+		// it says nothing about how the VLESS server's name was resolved.
+		if d := ownDirect(socks, directHost()); len(d) > 0 {
+			t.Errorf("ashgate.exe connected directly to %v while resolving its server", d)
 		}
 	})
 

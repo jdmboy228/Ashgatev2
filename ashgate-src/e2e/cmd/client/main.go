@@ -13,6 +13,7 @@
 //	udp    -addr A [-timeout 5s]                         one echo round trip
 //	stun   -addr A                                       STUN binding request
 //	dns    -server A -name N [-tcp]                      own DNS query (not getaddrinfo)
+//	dnsburst -server A -name N -count K                  K queries at once, each from a new socket
 //	lookup -name N                                       getaddrinfo (system resolver)
 //	dpapi  -in F                                         CryptUnprotectData a sealed value
 //	read   -path P                                       try to read a file
@@ -104,6 +105,8 @@ func main() {
 		r = stunBinding(*addr, *timeout)
 	case "dns":
 		r = dnsQuery(*server, *name, *useTCP, *timeout)
+	case "dnsburst":
+		r = dnsBurst(*server, *name, *count, *timeout)
 	case "lookup":
 		r = lookup(*name, *timeout)
 	case "dpapi":
@@ -433,6 +436,28 @@ func dnsQuery(server, name string, useTCP bool, timeout time.Duration) result {
 		return result{Error: err.Error()}
 	}
 	return result{OK: true, Answer: rcode(buf[:k])}
+}
+
+// dnsBurst sends count queries for q<i>.name at once, each from its own
+// new socket, like a browser loading a page. Count is how many got any
+// reply; it is OK when every one did.
+func dnsBurst(server, name string, count int, timeout time.Duration) result {
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	answered := 0
+	for i := 0; i < count; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			if r := dnsQuery(server, fmt.Sprintf("q%d.%s", i, name), false, timeout); r.OK {
+				mu.Lock()
+				answered++
+				mu.Unlock()
+			}
+		}(i)
+	}
+	wg.Wait()
+	return result{OK: answered == count, Count: answered, Failed: count - answered}
 }
 
 func rcode(msg []byte) string {

@@ -312,7 +312,18 @@ func TestPerf(t *testing.T) {
 		if n := churnFail.Load(); n > 0 {
 			t.Errorf("%d rounds of short connections failed during the run", n)
 		}
-		warm := len(samples) / 5
+		// Warm-up: caches, pools and the Go heap settle in the first minute
+		// or so, a step and then a plateau. Skip a fifth of the run and at
+		// least 60 s, so that a short push run does not fit the step as
+		// growth (the 10-minute run still skips 2 minutes).
+		warmAt := max(60.0, d.Seconds()/5)
+		warm := len(samples)
+		for i, s := range samples {
+			if s.At >= warmAt {
+				warm = i
+				break
+			}
+		}
 		if len(samples)-warm < 4 {
 			return
 		}
@@ -366,10 +377,15 @@ func TestPerf(t *testing.T) {
 		if hSlope > 10 && float64(last.Handles)-float64(first.Handles) > 10*mins {
 			t.Errorf("handles keep growing: %.1f/min (%d → %d)", hSlope, first.Handles, last.Handles)
 		}
-		if first.Goroutines >= 0 && gSlope > 5 && float64(last.Goroutines-first.Goroutines) > 5*mins {
+		// Connection churn makes goroutine bursts of a dozen that come back
+		// down; with few samples (the 2-minute push run) one of them reads
+		// as growth. Judge goroutines on the long run only.
+		if first.Goroutines >= 0 && len(rest) >= 10 && gSlope > 5 && float64(last.Goroutines-first.Goroutines) > 5*mins {
 			t.Errorf("goroutines keep growing: %.1f/min (%d → %d)", gSlope, first.Goroutines, last.Goroutines)
 		}
-		if pSlope > 3 && last.PrivateMB-first.PrivateMB > 3*mins {
+		// Like goroutines, memory steps of a megabyte or two read as growth
+		// over a few samples: judge it on the long run only.
+		if len(rest) >= 10 && pSlope > 3 && last.PrivateMB-first.PrivateMB > 3*mins {
 			t.Errorf("private memory keeps growing: %.1f MB/min (%.0f → %.0f MB)", pSlope, first.PrivateMB, last.PrivateMB)
 		}
 	})

@@ -109,7 +109,8 @@ func (c *controller) syncKill() {
 	defer c.ksMu.Unlock()
 	c.mu.Lock()
 	cfg := cloneCfg(c.cfg)
-	running := c.sess != nil && c.sess.Running() && !c.stopping
+	// A failed session still tears down (Running) but captures nothing.
+	running := c.sess != nil && c.sess.Running() && !c.stopping && !closed(c.sess.Failed())
 	c.mu.Unlock()
 
 	var err error
@@ -146,6 +147,41 @@ func (c *controller) syncKill() {
 	c.mu.Unlock()
 }
 
+// blockNow is the kill switch the moment capture fails. The teardown that
+// ends the session takes seconds (handles, workers, the driver), and
+// finding the programs again takes long too: the targets saved for the
+// guard are blocked at once, and the sync after the teardown completes it.
+func (c *controller) blockNow() {
+	fw := c.hooks.firewall
+	if fw == nil {
+		return
+	}
+	c.mu.Lock()
+	cfg := cloneCfg(c.cfg)
+	c.mu.Unlock()
+	if !killWanted(cfg) {
+		return
+	}
+	c.ksMu.Lock()
+	defer c.ksMu.Unlock()
+	err := fw.Block(loadTargets(c.ksState()))
+	c.mu.Lock()
+	if err != nil && !errors.Is(err, killswitch.ErrUnsupported) {
+		c.ksErr = err.Error()
+	}
+	c.mu.Unlock()
+}
+
+// closed reports a closed channel; a nil one never closes.
+func closed(ch <-chan struct{}) bool {
+	select {
+	case <-ch:
+		return true
+	default:
+		return false
+	}
+}
+
 // saveTargetsLocked writes the guard's target list when it changed. The
 // sync runs every 15 seconds while capturing; the list rarely changes.
 // Callers hold ksMu.
@@ -161,8 +197,12 @@ func (c *controller) saveTargetsLocked(paths []string) error {
 	return nil
 }
 
-// saveTargets is killswitch.SaveTargets; tests count the writes.
-var saveTargets = killswitch.SaveTargets
+// saveTargets and loadTargets are killswitch.SaveTargets and LoadTargets;
+// tests replace them.
+var (
+	saveTargets = killswitch.SaveTargets
+	loadTargets = killswitch.LoadTargets
+)
 
 func (c *controller) stopGuardLocked() {
 	if c.guardStop != nil {

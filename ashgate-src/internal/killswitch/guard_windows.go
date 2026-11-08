@@ -61,7 +61,7 @@ func RunGuard(args []string) error {
 	ph, err := windows.OpenProcess(windows.SYNCHRONIZE, false, uint32(*pid))
 	if err != nil {
 		// The parent is already gone: block now.
-		err := New(*state).Block(loadTargets(*state))
+		err := New(*state).Block(LoadTargets(*state))
 		_ = windivert.StopDriver()
 		return err
 	}
@@ -80,7 +80,7 @@ func RunGuard(args []string) error {
 		return nil // clean stop: Ashgate manages the rules itself
 	}
 	// Ashgate died: Windows closed its WinDivert handles, the driver stays.
-	err = New(*state).Block(loadTargets(*state))
+	err = New(*state).Block(LoadTargets(*state))
 	_ = windivert.StopDriver()
 	return err
 }

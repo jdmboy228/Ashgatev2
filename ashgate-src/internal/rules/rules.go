@@ -163,7 +163,7 @@ func (s *Set) first(p Process) (compiled, bool) {
 	path := NormalizePath(p.Path)
 	for _, r := range s.rules {
 		// A mask never takes the Windows service host: svchost carries
-		// system traffic for every program (see dns.includeSystemResolver).
+		// system traffic for every program (see dns.systemResolver).
 		if r.glob && name == "svchost.exe" {
 			continue
 		}

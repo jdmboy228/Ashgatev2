@@ -12,7 +12,9 @@ import (
 	"strings"
 	"time"
 
+	"ashgate/internal/bootstrap"
 	"ashgate/internal/config"
+	"ashgate/internal/engine"
 	"ashgate/internal/failover"
 	"ashgate/internal/logbuf"
 	"ashgate/internal/socks5"
@@ -45,6 +47,31 @@ const browserUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/201
 // subRand is the jitter source; tests replace it.
 var subRand = rand.Float64
 
+// Early health check: the engine's relays through the active server keep
+// ending with nothing downloaded. The check then runs now instead of at
+// the next timer, at most once per earlyEvery. Switching still takes two
+// failed checks; the second comes after the usual 10 s backoff.
+const (
+	earlyDead  = 3
+	earlyEvery = 15 * time.Second
+)
+
+// tunnelSession is what the subscription loop reads from the capture
+// session.
+type tunnelSession interface {
+	Running() bool
+	RelayHealth(proxy string) engine.RelayHealth
+}
+
+// sessionOf is c's capture session or nil; tests replace it. Callers hold
+// c.mu.
+var sessionOf = func(c *controller) tunnelSession {
+	if c.sess == nil {
+		return nil
+	}
+	return c.sess
+}
+
 // subGroup is one subscription at run time: its servers in priority order
 // and the failover state. url is decrypted and never logged or sent to the
 // window.
@@ -58,6 +85,18 @@ type subGroup struct {
 	retried   bool
 	checking  bool
 	probing   bool
+	earlyAt   time.Time // last early health check
+}
+
+// earlyCheck reports whether h shows the active server failing: earlyDead
+// relays through it came back empty since the last one that got an
+// answer, all opened after the last switch and the last early check
+// (older ones may belong to another server, or were already checked).
+func (g *subGroup) earlyCheck(now time.Time, h engine.RelayHealth) bool {
+	if h.Dead < earlyDead || now.Sub(g.earlyAt) < earlyEvery {
+		return false
+	}
+	return h.Since.After(g.fo.SwitchedAt) && h.Since.After(g.earlyAt)
 }
 
 // subView is what the window shows for a subscription besides the stored
@@ -200,9 +239,10 @@ func (c *controller) subsLoop() {
 
 func (c *controller) subsTick(now time.Time) {
 	var fetch string
-	var checks, probes []string
+	var checks, probes, early []string
 	c.mu.Lock()
-	running := c.sess != nil && c.sess.Running()
+	sess := sessionOf(c)
+	running := sess != nil && sess.Running()
 	for name, g := range c.subs {
 		if fetch == "" && !c.subFetching && g.url != "" && !now.Before(g.nextFetch) {
 			fetch = name
@@ -216,6 +256,10 @@ func (c *controller) subsTick(now time.Time) {
 		if !g.checking && g.fo.CheckDue(now) {
 			g.checking = true
 			checks = append(checks, name)
+		} else if !g.checking && g.earlyCheck(now, sess.RelayHealth(name)) {
+			g.checking, g.earlyAt = true, now
+			checks = append(checks, name)
+			early = append(early, name)
 		}
 		if !g.probing && g.fo.ProbeDue(now) {
 			g.probing = true
@@ -225,6 +269,9 @@ func (c *controller) subsTick(now time.Time) {
 	c.mu.Unlock()
 	if fetch != "" {
 		go func() { _ = c.fetchSub(fetch) }()
+	}
+	for _, name := range early {
+		c.subLog(name, "info", "Соединения через сервер остаются без ответа, проверяю его сейчас")
 	}
 	for _, name := range checks {
 		go c.healthCheck(name)
@@ -288,8 +335,10 @@ func (c *controller) fetchSub(name string) error {
 	return c.subApply(name, url, entries, now)
 }
 
+// directClient is the one direct try. The host is looked up with DoH, not
+// the provider's DNS (the TLS name still shows it; the tunnel hides both).
 func directClient() *http.Client {
-	return &http.Client{Transport: &http.Transport{Proxy: nil, ForceAttemptHTTP2: true}}
+	return &http.Client{Transport: &http.Transport{Proxy: nil, ForceAttemptHTTP2: true, DialContext: bootstrap.Dial}}
 }
 
 // tunnelClient sends requests through a bridge's private inbound. Host
@@ -532,12 +581,25 @@ func (c *controller) addSub(name, rawURL string) error {
 		return err
 	}
 	now := time.Now()
+	// Copy the config after the fetch and save it under saveMu: a copy
+	// taken earlier, or a save in between, would undo what the window
+	// saved meanwhile.
+	c.saveMu.Lock()
+	c.mu.Lock()
+	if _, ok := c.cfg.ProxyByName(name); ok {
+		c.mu.Unlock()
+		c.saveMu.Unlock()
+		return errors.New("Имя прокси уже занято.")
+	}
 	cfg := cloneCfg(c.cfg)
+	c.mu.Unlock()
 	cfg.Proxies = append(cfg.Proxies, config.Proxy{
 		Name: name, Type: "vless",
 		Sub: &config.Subscription{Sealed: sealed, Count: len(ordered), Host: subs.Mask(rawURL), UpdatedAt: now, CheckedAt: now},
 	})
-	if err := c.replace(cfg); err != nil {
+	err = c.replaceLocked(cfg)
+	c.saveMu.Unlock()
+	if err != nil {
 		return err
 	}
 	c.subLog(name, "info", "Подписка добавлена: серверов "+strconv.Itoa(len(ordered)))

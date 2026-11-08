@@ -1,7 +1,6 @@
 package vless
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -12,31 +11,7 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	applog "github.com/xtls/xray-core/app/log"
-	xraylog "github.com/xtls/xray-core/common/log"
-	"github.com/xtls/xray-core/core"
-	"github.com/xtls/xray-core/infra/conf/serial"
-
-	_ "github.com/xtls/xray-core/main/distro/all"
 )
-
-func init() {
-	// Xray's console logger is created per instance. Swap that creator for a
-	// ring buffer so dial failures can be turned into Russian log lines.
-	_ = applog.RegisterHandlerCreator(applog.LogType_Console, func(applog.LogType, applog.HandlerCreatorOptions) (xraylog.Handler, error) {
-		return logHook{}, nil
-	})
-}
-
-type logHook struct{}
-
-func (logHook) Handle(msg xraylog.Message) {
-	if msg == nil {
-		return
-	}
-	pushLog(msg.String())
-}
 
 // Inbound is the published localhost SOCKS5 and HTTP listener of a bridge,
 // for other programs. Port 0 publishes nothing. A published port always
@@ -57,6 +32,72 @@ type Routing struct {
 	// servers (DoH) through the tunnel, Direct domains with the system
 	// resolver.
 	DNS []string `json:"dns,omitempty"`
+	// Raw ("1.1.1.1:53") gets the other query types (HTTPS, SRV, TXT, MX)
+	// as they are, over TCP through the tunnel. Empty refuses them.
+	Raw string `json:"raw,omitempty"`
+}
+
+// ResolveServer, when set, looks up a server host name without the system
+// resolver, whose queries the provider sees (see internal/bootstrap). The
+// bridge then dials the address. Unset, Xray resolves the name itself.
+var ResolveServer func(ctx context.Context, host string) ([]net.IP, error)
+
+// byAddress keeps the handshake of a server dialed by host name when it is
+// dialed by IP instead: Xray's TLS and REALITY name, and then the HTTP Host
+// and gRPC authority, fall back to the address it dials.
+func byAddress(p Params, host string) Params {
+	switch p.Security {
+	case "tls", "reality":
+		if p.SNI == "" {
+			p.SNI = host
+		}
+	default:
+		switch p.Network {
+		case "ws", "httpupgrade", "xhttp":
+			if p.Host == "" {
+				p.Host = host
+			}
+		case "grpc":
+			if p.Authority == "" {
+				p.Authority = host
+			}
+		}
+	}
+	return p
+}
+
+// dialTarget is what the bridge dials for a server host: its address from
+// ResolveServer when host is a name, with params that keep the handshake.
+func dialTarget(ctx context.Context, host string, p Params) (string, Params, error) {
+	if ResolveServer == nil || net.ParseIP(host) != nil {
+		return host, p, nil
+	}
+	// The manager waits on this; every resolver blocked must not stall it.
+	ctx, cancel := context.WithTimeout(ctx, 12*time.Second)
+	defer cancel()
+	ips, err := ResolveServer(ctx, host)
+	ip := serverIP(ips)
+	if err != nil || ip == nil {
+		why := "нет адреса"
+		if err != nil {
+			why = err.Error()
+		}
+		return "", p, fmt.Errorf("VLESS: не удалось узнать адрес сервера %s без DNS провайдера (%s). Укажите в ссылке IP-адрес сервера", host, why)
+	}
+	return ip.String(), byAddress(p, host), nil
+}
+
+// serverIP prefers IPv4, the family every network has.
+func serverIP(ips []net.IP) net.IP {
+	for _, ip := range ips {
+		if ip.To4() != nil {
+			return ip
+		}
+	}
+	if len(ips) > 0 {
+		return ips[0]
+	}
+	return nil
 }
 
 // Bridge is one embedded Xray instance with a VLESS outbound. Ashgate uses
@@ -76,7 +117,7 @@ type Bridge struct {
 
 	routing Routing
 	server  string
-	inst    *core.Instance
+	inst    *instance
 	stop    chan struct{}
 	once    sync.Once
 }
@@ -133,7 +174,11 @@ func listen(ctx context.Context, serverAddr string, p Params, in Inbound, rt Rou
 	if err != nil || serverPort < 1 || serverPort > 65535 {
 		return nil, errors.New("VLESS: неверный адрес сервера")
 	}
-	cc := ClientConfig{Server: host, ServerPort: serverPort, Params: p, Published: in, Routing: rt}
+	dialHost, p, err := dialTarget(ctx, host, p)
+	if err != nil {
+		return nil, err
+	}
+	cc := ClientConfig{Server: dialHost, ServerPort: serverPort, Params: p, Published: in, Routing: rt}
 	if in.Port != 0 {
 		if in.User == "" {
 			cc.Published.User, cc.Published.Pass = randomToken(8), randomToken(16)
@@ -379,14 +424,37 @@ func ClientJSON(c ClientConfig) ([]byte, error) {
 	doc := map[string]any{
 		"log":      map[string]any{"loglevel": "info"},
 		"inbounds": inbounds,
+		// Xray closes a connection idle for 300 s by default, which drops
+		// quiet SSH and IMAP sessions: 30 minutes. After one side finishes,
+		// Xray's default gives the other side 1 s of silence, which cuts a
+		// slow answer to a half-closed request: 2 s and 5 s, as V2Ray had.
+		"policy": map[string]any{"levels": map[string]any{"0": map[string]any{
+			"connIdle": 1800, "uplinkOnly": 2, "downlinkOnly": 5,
+		}}},
 	}
 	if len(c.Routing.DNS) > 0 {
-		outbounds = append(outbounds, map[string]any{
-			"tag": tagDNS, "protocol": "dns",
-			// Other query types (HTTPS, SVCB) would otherwise go to the
-			// original server outside Xray's DNS.
-			"settings": map[string]any{"nonIPQuery": "reject"},
-		})
+		dnsOut := map[string]any{"tag": tagDNS, "protocol": "dns"}
+		if host, port, err := net.SplitHostPort(c.Routing.Raw); err == nil && net.ParseIP(host) != nil {
+			// A and AAAA go to Xray's DNS below. Other types (HTTPS, SRV,
+			// TXT, MX) go as they are to Raw, over TCP through the tunnel:
+			// to the original server they would reach the provider, and
+			// refused they break SRV and TXT lookups of every program
+			// once Windows' own DNS goes this way.
+			portNum, _ := net.LookupPort("tcp", port)
+			dnsOut["settings"] = map[string]any{
+				"rewriteNetwork": "tcp", "rewriteAddress": host, "rewritePort": portNum,
+				"rules": []any{
+					map[string]any{"action": "hijack", "qType": "1,28"},
+					map[string]any{"action": "direct"},
+				},
+			}
+			dnsOut["streamSettings"] = map[string]any{"sockopt": map[string]any{"dialerProxy": tagProxy}}
+		} else {
+			// Other query types would otherwise go to the original server
+			// outside Xray's DNS.
+			dnsOut["settings"] = map[string]any{"nonIPQuery": "reject"}
+		}
+		outbounds = append(outbounds, dnsOut)
 		rules = append(rules, map[string]any{"type": "field", "inboundTag": []string{tagAshgate}, "port": "53", "outboundTag": tagDNS})
 		servers := []any{}
 		if len(c.Routing.Direct) > 0 {
@@ -416,22 +484,6 @@ func domainRules(domains []string) []string {
 		out = append(out, "domain:"+d)
 	}
 	return out
-}
-
-func loadAndStart(raw []byte) (*core.Instance, error) {
-	cfg, err := serial.LoadJSONConfig(bytes.NewReader(raw))
-	if err != nil {
-		return nil, err
-	}
-	inst, err := core.New(cfg)
-	if err != nil {
-		return nil, err
-	}
-	if err := inst.Start(); err != nil {
-		_ = inst.Close()
-		return nil, err
-	}
-	return inst, nil
 }
 
 // socksSettings always asks for a login and never offers UDP ASSOCIATE:

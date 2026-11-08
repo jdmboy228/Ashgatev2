@@ -6,12 +6,15 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 	"unicode"
 	"unicode/utf8"
+
+	"golang.org/x/net/idna"
 
 	"ashgate/internal/vless"
 )
@@ -35,8 +38,15 @@ type Config struct {
 	Groups []Group `json:"groups,omitempty"`
 	// DirectDomains go direct even when an app's rule sends it through
 	// VLESS (Xray domain routing), and resolve with the system resolver.
-	// Missing in the file means the starter list; an empty list is kept.
+	// Entries are kept as typed (госуслуги.рф); BypassDomains gives the DNS
+	// spelling. Missing in the file means the starter list; an empty list
+	// is kept.
 	DirectDomains []string `json:"directDomains"`
+	// Revision counts the one-time upgrades applied to the file. 1 (0.9.3):
+	// the zones .ru, .рф and .su, always direct before, became entries of
+	// DirectDomains, so deleting them sticks. The window posts it back
+	// with the rest of the config.
+	Revision int `json:"revision,omitempty"`
 	// Extra keeps JSON keys this version does not understand, such as the
 	// Dolphin block from 0.4.x. Saving the file must not drop them.
 	Extra map[string]json.RawMessage `json:"-"`
@@ -57,11 +67,29 @@ type Relay struct {
 type DNS struct {
 	// Mode is "proxy" (send queries to Servers through the rule's proxy)
 	// or "original" (send them to the destination the application chose).
-	Mode                  string   `json:"mode"`
-	Servers               []string `json:"servers"`
-	IncludeSystemResolver bool     `json:"includeSystemResolver"`
-	SystemResolverProxy   string   `json:"systemResolverProxy"`
+	Mode    string   `json:"mode"`
+	Servers []string `json:"servers"`
+	// SystemResolver decides the lookups of the Windows DNS client
+	// (svchost.exe), which resolves for every program that calls
+	// getaddrinfo, and DNS packets whose program is unknown. Ashgate cannot
+	// tell which program asked, so "tunnel" (also the empty value) sends
+	// them through SystemResolverProxy, except bypass names, which go to
+	// the provider's DNS unchanged. "direct" leaves them alone.
+	// 0.9.1 and older had includeSystemResolver, off by default; it is no
+	// longer read.
+	SystemResolver string `json:"systemResolver,omitempty"`
+	// SystemResolverProxy carries those lookups. Empty picks the proxy of
+	// the first enabled proxy rule, VLESS first.
+	SystemResolverProxy string `json:"systemResolverProxy"`
+	// Bootstrap lists DoH URLs for Ashgate's own lookups (proxy servers,
+	// the subscription host), so the provider's DNS never sees them. Each
+	// URL names an IP. Empty means public resolvers; tests point it at a
+	// fake one on loopback, the only place plain http is allowed.
+	Bootstrap []string `json:"bootstrap,omitempty"`
 }
+
+// SystemTunnel reports whether system lookups go through a proxy.
+func (d DNS) SystemTunnel() bool { return d.SystemResolver != "direct" }
 
 // Log selects the optional JSON-lines connection log.
 type Log struct {
@@ -107,14 +135,82 @@ type Subscription struct {
 	Error     string    `json:"error,omitempty"`
 }
 
-// DefaultDirectDomains is the starter list of domains that go direct:
-// Russian state services, major banks, Yandex, VK and MAX.
+// DefaultDirectDomains is the starter list of domains that go direct: the
+// zones .ru, .рф and .su (Russian sites see the real address and get local
+// CDN answers), Russian state services, major banks, Yandex, VK and MAX.
 var DefaultDirectDomains = []string{
+	"ru", "рф", "su",
 	"gosuslugi.ru", "nalog.gov.ru",
 	"sberbank.ru", "sber.ru", "vtb.ru", "tbank.ru", "tinkoff.ru", "alfabank.ru",
 	"gazprombank.ru", "raiffeisen.ru", "sovcombank.ru", "pochtabank.ru", "psbank.ru",
 	"rshb.ru", "open.ru", "mkb.ru",
 	"yandex.ru", "ya.ru", "vk.com", "max.ru",
+}
+
+// DefaultDNSServers carry proxied DNS when dns.servers is empty.
+var DefaultDNSServers = []string{"1.1.1.1:53", "8.8.8.8:53"}
+
+// ProxyDNSServers is where proxied queries go: dns.servers, or the defaults
+// when "original" mode left it empty (system DNS and VLESS still need one).
+func (d DNS) ProxyDNSServers() []string {
+	if len(d.Servers) == 0 {
+		return append([]string(nil), DefaultDNSServers...)
+	}
+	return append([]string(nil), d.Servers...)
+}
+
+// currentRevision is the newest one-time upgrade; see Config.Revision.
+const currentRevision = 1
+
+// russianZones were always direct before 0.9.3; see upgradeDirect.
+var russianZones = []string{"ru", "рф", "su"}
+
+// BypassDomains is every name that goes direct: DirectDomains, subdomains
+// included, spelled as DNS and Xray see them (рф is xn--p1ai).
+func (c *Config) BypassDomains() []string {
+	out := make([]string, 0, len(c.DirectDomains))
+	for _, d := range c.DirectDomains {
+		if a, ok := asciiDomain(d); ok {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+// asciiDomain is d in lower-case ASCII (punycode for other scripts).
+func asciiDomain(d string) (string, bool) {
+	a, err := idna.Lookup.ToASCII(strings.Trim(d, "."))
+	if err != nil || a == "" {
+		return "", false
+	}
+	return strings.ToLower(a), true
+}
+
+// upgradeDirect is the 0.9.3 upgrade of a list from an older file: the
+// zones that used to be always direct become entries, and xn-- names
+// (which the window used to save) read as typed.
+func upgradeDirect(list []string) []string {
+	out := make([]string, 0, len(list)+len(russianZones))
+	seen := map[string]bool{}
+	for _, d := range list {
+		if u, err := idna.Lookup.ToUnicode(d); err == nil && strings.Contains(d, "xn--") {
+			d = u
+		}
+		if a, ok := asciiDomain(d); ok {
+			if seen[a] {
+				continue
+			}
+			seen[a] = true
+		}
+		out = append(out, d)
+	}
+	var zones []string
+	for _, z := range russianZones {
+		if a, _ := asciiDomain(z); !seen[a] {
+			zones = append(zones, z)
+		}
+	}
+	return append(zones, out...)
 }
 
 // Rule maps one application to a proxy, a direct connection, or a drop.
@@ -208,7 +304,7 @@ func (c *Config) ApplyDefaults() {
 		c.DNS.Mode = "proxy"
 	}
 	if c.DNS.Mode == "proxy" && len(c.DNS.Servers) == 0 {
-		c.DNS.Servers = []string{"1.1.1.1:53", "8.8.8.8:53"}
+		c.DNS.Servers = append([]string(nil), DefaultDNSServers...)
 	}
 	if c.UDPUnsupported == "" {
 		c.UDPUnsupported = "block"
@@ -224,6 +320,18 @@ func (c *Config) ApplyDefaults() {
 	}
 	if c.DirectDomains == nil {
 		c.DirectDomains = append([]string(nil), DefaultDirectDomains...)
+	} else if c.Revision < 1 {
+		c.DirectDomains = upgradeDirect(c.DirectDomains)
+	}
+	if c.Revision < currentRevision {
+		c.Revision = currentRevision
+	}
+	if c.DNS.SystemResolverProxy != "" {
+		// A deleted proxy left behind (0.9.1 kept the name while the
+		// switch was off) means the automatic choice, not a broken file.
+		if _, ok := c.ProxyByName(c.DNS.SystemResolverProxy); !ok {
+			c.DNS.SystemResolverProxy = ""
+		}
 	}
 	for i := range c.Rules {
 		if c.Rules[i].Enabled == nil {
@@ -319,12 +427,19 @@ func (c *Config) Validate() error {
 		}
 	}
 
-	if c.DNS.IncludeSystemResolver {
-		if c.DNS.SystemResolverProxy == "" {
-			return errors.New("dns.systemResolverProxy is required when includeSystemResolver is true")
-		}
+	switch c.DNS.SystemResolver {
+	case "", "tunnel", "direct":
+	default:
+		return fmt.Errorf("dns.systemResolver must be tunnel or direct, got %q", c.DNS.SystemResolver)
+	}
+	if c.DNS.SystemResolverProxy != "" {
 		if _, ok := names[c.DNS.SystemResolverProxy]; !ok {
 			return fmt.Errorf("dns.systemResolverProxy %q is not a configured proxy", c.DNS.SystemResolverProxy)
+		}
+	}
+	for i, u := range c.DNS.Bootstrap {
+		if err := checkBootstrap(u); err != nil {
+			return fmt.Errorf("dns.bootstrap[%d]: %w", i, err)
 		}
 	}
 
@@ -358,7 +473,7 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("rules[%d]: mask %q matches every program", i, r.Process)
 		}
 		if base == "svchost.exe" {
-			return fmt.Errorf("rules[%d]: do not match svchost.exe; use dns.includeSystemResolver for system DNS", i)
+			return fmt.Errorf("rules[%d]: do not match svchost.exe; system DNS follows dns.systemResolver", i)
 		}
 		if r.Group != "" {
 			continue // the group's route applies and is checked above
@@ -402,6 +517,26 @@ func checkRoute(action, proxy string, names map[string]struct{}) error {
 		}
 	default:
 		return fmt.Errorf("action must be proxy, direct or block, got %q", action)
+	}
+	return nil
+}
+
+// checkBootstrap accepts a DoH URL that needs no lookup itself: https to an
+// IP, or plain http to loopback (a test resolver).
+func checkBootstrap(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return err
+	}
+	ip := net.ParseIP(u.Hostname())
+	if ip == nil {
+		return fmt.Errorf("%q must name an IP address", raw)
+	}
+	switch {
+	case u.Scheme == "https":
+	case u.Scheme == "http" && ip.IsLoopback():
+	default:
+		return fmt.Errorf("%q must be https (http only on loopback)", raw)
 	}
 	return nil
 }
@@ -464,7 +599,7 @@ func (c *Config) ProxyByName(name string) (Proxy, bool) {
 var knownConfigKeys = map[string]bool{
 	"version": true, "relay": true, "dns": true, "bypassPrivate": true,
 	"udpUnsupported": true, "killSwitch": true, "log": true, "ui": true, "proxies": true, "rules": true,
-	"groups": true, "directDomains": true,
+	"groups": true, "directDomains": true, "revision": true,
 }
 
 // Load reads a config file, applies defaults, and validates it.
@@ -694,10 +829,15 @@ func splitAddr(addr string) (string, uint16, error) {
 	return host, uint16(port), nil
 }
 
-// validDomain accepts a lower-case host name such as "gosuslugi.ru":
-// letters, digits, '-' and dots between labels, at least two labels.
+// validDomain accepts a lower-case host name or zone such as
+// "gosuslugi.ru", "госуслуги.рф" or "su": in DNS spelling letters, digits,
+// '-' and dots between labels.
 func validDomain(d string) bool {
-	if len(d) > 253 || !strings.Contains(d, ".") {
+	if d != strings.ToLower(d) {
+		return false
+	}
+	d, err := idna.Lookup.ToASCII(d)
+	if err != nil || d == "" || len(d) > 253 {
 		return false
 	}
 	for _, label := range strings.Split(d, ".") {

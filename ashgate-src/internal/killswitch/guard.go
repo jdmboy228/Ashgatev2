@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+
+	"ashgate/internal/atomicfile"
 )
 
 // GuardCommand is the hidden ashgate.exe command that runs the guard.
@@ -18,14 +20,12 @@ func targetsFile(state string) string {
 // capture runs, as rules and running children change.
 func SaveTargets(state string, paths []string) error {
 	data, _ := json.Marshal(paths)
-	tmp := targetsFile(state) + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, targetsFile(state))
+	return atomicfile.Write(targetsFile(state), data)
 }
 
-func loadTargets(state string) []string {
+// LoadTargets is the list SaveTargets wrote last. The window blocks it the
+// moment capture fails, before it has the time to look for programs again.
+func LoadTargets(state string) []string {
 	var list []string
 	if data, err := os.ReadFile(targetsFile(state)); err == nil {
 		_ = json.Unmarshal(data, &list)
