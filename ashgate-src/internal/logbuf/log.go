@@ -15,6 +15,9 @@ import (
 const (
 	maxLogBytes = 5 << 20
 	logKeep     = 2
+	// reopenEvery spaces the tries to open the log again after a rotation
+	// could not (a full disk, a file another program holds).
+	reopenEvery = 5 * time.Second
 )
 
 var utf8BOM = []byte{0xEF, 0xBB, 0xBF}
@@ -147,6 +150,10 @@ type fileWriter struct {
 	// size is the file length plus what buf holds, so writing does not
 	// stat the file for every event.
 	size int64
+	// retryAt is when write may try to open a missing file again; now is the
+	// clock (tests replace it).
+	retryAt time.Time
+	now     func() time.Time
 
 	mu      sync.Mutex
 	cond    sync.Cond
@@ -168,7 +175,7 @@ func (w sizeWriter) Write(p []byte) (int, error) {
 }
 
 func newFileWriter(path string, f *os.File) *fileWriter {
-	w := &fileWriter{path: path, buf: bufio.NewWriterSize(f, 64<<10)}
+	w := &fileWriter{path: path, buf: bufio.NewWriterSize(f, 64<<10), now: time.Now}
 	w.cond.L = &w.mu
 	w.attach(f)
 	return w
@@ -236,7 +243,7 @@ func (w *fileWriter) reportSkipped(skipped *atomic.Int64) {
 }
 
 func (w *fileWriter) write(e Event) {
-	if w.file == nil {
+	if w.file == nil && !w.reopen() {
 		return
 	}
 	if w.size >= maxLogBytes {
@@ -266,6 +273,26 @@ func (w *fileWriter) wait() error {
 	return w.err
 }
 
+// reopen opens the log again after a rotation left it closed, at most once
+// per reopenEvery. Without it one failed rotation would end the file log
+// until restart. It reports that the file is open.
+func (w *fileWriter) reopen() bool {
+	if w.path == "" {
+		return false
+	}
+	now := w.now()
+	if now.Before(w.retryAt) {
+		return false
+	}
+	f, err := os.OpenFile(w.path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		w.retryAt = now.Add(reopenEvery)
+		return false
+	}
+	w.attach(f)
+	return true
+}
+
 func (w *fileWriter) rotate() {
 	if w.path == "" || w.file == nil {
 		return
@@ -283,6 +310,8 @@ func (w *fileWriter) rotate() {
 	renamed := os.Rename(w.path, w.path+".1") == nil
 	f, err := os.OpenFile(w.path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
+		// write tries again in reopenEvery.
+		w.retryAt = w.now().Add(reopenEvery)
 		return
 	}
 	w.attach(f)

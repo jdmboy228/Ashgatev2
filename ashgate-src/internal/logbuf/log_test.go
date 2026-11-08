@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestFileRotatesBySize(t *testing.T) {
@@ -165,4 +166,59 @@ func TestNoFileNoWriter(t *testing.T) {
 	}
 	var nilBuf *Buffer
 	nilBuf.Flush()
+}
+
+// A rotation that cannot open the new file must not end the file log: the
+// writer tries again, but not for every event.
+func TestFileReopensAfterFailedRotation(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "logs")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "ashgate.log")
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock := time.Unix(1000, 0)
+	w := newFileWriter(path, f)
+	w.now = func() time.Time { return clock }
+	if err := os.RemoveAll(dir); err != nil { // the new file cannot be created
+		t.Fatal(err)
+	}
+	w.rotate()
+	if w.file != nil {
+		t.Fatal("rotation opened a file in a missing directory")
+	}
+	w.write(Event{Process: "lost.exe"})
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	clock = clock.Add(reopenEvery - time.Second)
+	w.write(Event{Process: "too-soon.exe"})
+	if w.file != nil {
+		t.Fatal("reopened before reopenEvery")
+	}
+	clock = clock.Add(time.Second)
+	w.write(Event{Process: "back.exe"})
+	if w.file == nil {
+		t.Fatal("log not reopened")
+	}
+	_ = w.buf.Flush()
+	got := readLog(t, path)
+	if len(got) != 1 || got[0].Process != "back.exe" {
+		t.Fatalf("log after reopening: %+v", got)
+	}
+	// A failed try waits another reopenEvery.
+	_ = w.file.Close()
+	w.file = nil
+	_ = os.RemoveAll(dir)
+	w.write(Event{Process: "x"})
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	w.write(Event{Process: "y"})
+	if w.file != nil {
+		t.Fatal("retried at once after a failed try")
+	}
 }
