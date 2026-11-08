@@ -336,6 +336,12 @@ func timeout(op string) error {
 // instead of dropping datagrams like core.DialUDP's 16-slot cache did.
 const udpQueue = 256
 
+// udpSendQueue is how many datagrams may wait for the writer. Dispatch
+// blocks in Xray's size-limited pipe while the server is slow or gone, so
+// Send queues instead and drops when the queue is full, as a UDP socket
+// with a full send buffer would.
+const udpSendQueue = 256
+
 // UDPSession carries one capture flow's UDP through a bridge inside this
 // process. The bridge's SOCKS5 inbound has no UDP ASSOCIATE, so no local
 // UDP port exists that another program could send to.
@@ -344,8 +350,11 @@ type UDPSession struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	in     chan *pudp.Packet
+	out    chan *buf.Buffer
 	done   chan struct{}
 	once   sync.Once
+	// dropped counts datagrams that Send dropped on a full queue.
+	dropped atomic.Uint64
 }
 
 // DialUDP opens a UDP session through the bridge whose private SOCKS5
@@ -358,13 +367,59 @@ func DialUDP(addr string) (*UDPSession, error) {
 	}
 	// The session lives until Close, not as long as one request.
 	ctx, cancel := context.WithCancel(context.Background())
-	s := &UDPSession{cancel: cancel, in: make(chan *pudp.Packet, udpQueue), done: make(chan struct{})}
-	s.ctx = b.inboundContext(ctx, "quic")
+	return newUDPSession(b.inboundContext(ctx, "quic"), cancel, d), nil
+}
+
+// newUDPSession starts a session on d; cancel ends ctx.
+func newUDPSession(ctx context.Context, cancel context.CancelFunc, d routing.Dispatcher) *UDPSession {
+	s := &UDPSession{
+		ctx:    ctx,
+		cancel: cancel,
+		in:     make(chan *pudp.Packet, udpQueue),
+		out:    make(chan *buf.Buffer, udpSendQueue),
+		done:   make(chan struct{}),
+	}
 	// The dispatcher keeps one link for every destination. A session is
 	// one capture flow, so routing by its first destination is right.
 	s.d = iudp.NewDispatcher(d, s.deliver)
-	return s, nil
+	go s.writeLoop()
+	return s
 }
+
+// writeLoop is the only caller of Dispatch, which may block on Xray's pipe.
+// Close interrupts that write.
+func (s *UDPSession) writeLoop() {
+	for {
+		select {
+		case <-s.done:
+			return
+		case b := <-s.out:
+			select {
+			case <-s.done:
+				b.Release()
+				return
+			default:
+			}
+			s.d.Dispatch(s.ctx, *b.UDP, b)
+		}
+	}
+}
+
+// drainOut releases the datagrams nobody will write.
+func (s *UDPSession) drainOut() {
+	for {
+		select {
+		case b := <-s.out:
+			b.Release()
+		default:
+			return
+		}
+	}
+}
+
+// Dropped is how many datagrams Send dropped because the server did not
+// take the earlier ones.
+func (s *UDPSession) Dropped() uint64 { return s.dropped.Load() }
 
 // deliver queues one reply. It runs in Xray's reader and waits while the
 // queue is full.
@@ -382,7 +437,9 @@ func (s *UDPSession) deliver(_ context.Context, p *pudp.Packet) {
 	}
 }
 
-// Send writes one datagram for dst.
+// Send queues one datagram for dst and never waits for Xray. When the queue
+// is full the datagram is dropped and counted; that is not an error, as for
+// any UDP send.
 func (s *UDPSession) Send(_ context.Context, dst *net.UDPAddr, payload []byte) error {
 	select {
 	case <-s.done:
@@ -394,7 +451,18 @@ func (s *UDPSession) Send(_ context.Context, dst *net.UDPAddr, payload []byte) e
 	b.Resize(0, int32(n))
 	dest := xnet.DestinationFromAddr(dst)
 	b.UDP = &dest
-	s.d.Dispatch(s.ctx, dest, b)
+	select {
+	case s.out <- b:
+		select {
+		case <-s.done:
+			// Close drained the queue before this datagram joined it.
+			s.drainOut()
+		default:
+		}
+	default:
+		b.Release()
+		s.dropped.Add(1)
+	}
 	return nil
 }
 
@@ -428,6 +496,7 @@ func (s *UDPSession) Close() error {
 		close(s.done)
 		s.cancel()
 		s.d.RemoveRay()
+		s.drainOut()
 		for {
 			select {
 			case p := <-s.in:

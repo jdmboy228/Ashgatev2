@@ -38,7 +38,10 @@ type udpFlow struct {
 	// within udpRetry of it are dropped instead of each starting a new
 	// association and logging another error.
 	failedAt time.Time
-	mu       sync.Mutex
+	// mu guards closed, sess and failedAt and is never held across I/O.
+	// dialMu serializes the dial and is.
+	mu     sync.Mutex
+	dialMu sync.Mutex
 }
 
 const (
@@ -83,34 +86,63 @@ func (e *Engine) ForwardUDP(ctx context.Context, d UDPDatagram) error {
 }
 
 func (e *Engine) forwardSOCKS(ctx context.Context, flow *udpFlow, d UDPDatagram) error {
-	flow.mu.Lock()
-	defer flow.mu.Unlock()
-	if flow.closed {
-		return nil
+	sess, err := e.udpSession(ctx, flow, d.Payload)
+	if sess == nil {
+		return err
 	}
-	if flow.sess == nil {
-		if !flow.failedAt.IsZero() && e.now().Sub(flow.failedAt) < udpRetry {
-			e.failDNS(flow, d.Payload)
-			return nil
-		}
-		sess, err := e.dial.DialUDP(ctx, flow.proxy)
-		if err != nil {
-			flow.stat.fail(err.Error(), e.now())
-			flow.failedAt = e.now()
-			e.log(logbuf.Event{Process: display(flow.proc), PID: flow.proc.PID, Proto: "UDP", Dest: flow.orig.String(), Via: flow.proxy.Name, Status: "error", Error: err.Error()})
-			e.failDNS(flow, d.Payload)
-			return err
-		}
-		flow.sess = sess
-		go e.readUDP(flow, sess)
-	}
+	// Sent outside flow.mu: the Janitor and Stop take it, and must not wait
+	// for I/O.
 	dst := &net.UDPAddr{IP: flow.relay.NetIP(), Port: int(flow.relay.Port)}
-	if err := flow.sess.Send(ctx, dst, d.Payload); err != nil {
+	if err := sess.Send(ctx, dst, d.Payload); err != nil {
 		e.log(logbuf.Event{Process: display(flow.proc), PID: flow.proc.PID, Proto: "UDP", Dest: flow.orig.String(), Via: flow.proxy.Name, Status: "error", Error: err.Error()})
 		e.failDNS(flow, d.Payload)
 		return err
 	}
 	return nil
+}
+
+// udpSession returns the flow's session and opens it when there is none. It
+// returns nil when the datagram is not to be sent: the flow is closed, or
+// the proxy is down and err says so (nil for a retry-window drop). flow.mu
+// only guards the fields; dialMu keeps two dials of one flow apart, so the
+// dial itself, which does I/O, never holds flow.mu.
+func (e *Engine) udpSession(ctx context.Context, flow *udpFlow, payload []byte) (dialer.Session, error) {
+	flow.dialMu.Lock()
+	defer flow.dialMu.Unlock()
+	flow.mu.Lock()
+	closed, sess, failedAt := flow.closed, flow.sess, flow.failedAt
+	flow.mu.Unlock()
+	if closed {
+		return nil, nil
+	}
+	if sess != nil {
+		return sess, nil
+	}
+	if !failedAt.IsZero() && e.now().Sub(failedAt) < udpRetry {
+		e.failDNS(flow, payload)
+		return nil, nil
+	}
+	sess, err := e.dial.DialUDP(ctx, flow.proxy)
+	if err != nil {
+		flow.mu.Lock()
+		flow.failedAt = e.now()
+		flow.mu.Unlock()
+		flow.stat.fail(err.Error(), e.now())
+		e.log(logbuf.Event{Process: display(flow.proc), PID: flow.proc.PID, Proto: "UDP", Dest: flow.orig.String(), Via: flow.proxy.Name, Status: "error", Error: err.Error()})
+		e.failDNS(flow, payload)
+		return nil, err
+	}
+	flow.mu.Lock()
+	if flow.closed {
+		// Retired while dialing.
+		flow.mu.Unlock()
+		_ = sess.Close()
+		return nil, nil
+	}
+	flow.sess = sess
+	flow.mu.Unlock()
+	go e.readUDP(flow, sess)
+	return sess, nil
 }
 
 func (e *Engine) readUDP(flow *udpFlow, sess dialer.Session) {

@@ -12,7 +12,10 @@ import (
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/policy"
+	"github.com/xtls/xray-core/features/routing"
+	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet"
+	"github.com/xtls/xray-core/transport/pipe"
 )
 
 // pipeDialer hands out in-memory connections and keeps their far ends,
@@ -226,5 +229,64 @@ func TestDNSServers(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("%v, want %v", got, want)
 		}
+	}
+}
+
+// stuckDispatcher gives every dispatch a link whose uplink pipe nobody
+// reads and that holds one buffer, like Xray with a dead server.
+type stuckDispatcher struct{ links chan *transport.Link }
+
+func (stuckDispatcher) Type() interface{} { return routing.DispatcherType() }
+func (stuckDispatcher) Start() error      { return nil }
+func (stuckDispatcher) Close() error      { return nil }
+func (d stuckDispatcher) Dispatch(_ context.Context, _ xnet.Destination) (*transport.Link, error) {
+	_, upW := pipe.New(pipe.WithSizeLimit(1))
+	downR, _ := pipe.New()
+	l := &transport.Link{Reader: downR, Writer: upW}
+	d.links <- l
+	return l, nil
+}
+func (stuckDispatcher) DispatchLink(context.Context, xnet.Destination, *transport.Link) error {
+	return nil
+}
+
+func TestUDPSendDoesNotBlockOnStuckServer(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	s := newUDPSession(ctx, cancel, stuckDispatcher{links: make(chan *transport.Link, 4)})
+	dst := &net.UDPAddr{IP: net.IPv4(1, 1, 1, 1), Port: 53}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		// The pipe takes one datagram, the writer holds a second, the
+		// queue takes udpSendQueue more; the rest is dropped.
+		for i := 0; i < udpSendQueue+50; i++ {
+			if err := s.Send(context.Background(), dst, []byte("q")); err != nil {
+				t.Error(err)
+			}
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Send blocked while the dispatcher is stuck")
+	}
+	if d := s.Dropped(); d == 0 || d > 50 {
+		t.Fatalf("%d datagrams dropped", d)
+	}
+	closed := make(chan struct{})
+	go func() {
+		_ = s.Close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close hangs on a blocked writer")
+	}
+	if err := s.Send(context.Background(), dst, []byte("q")); err == nil {
+		t.Fatal("Send after Close succeeded")
+	}
+	if n := len(s.out); n != 0 {
+		t.Fatalf("%d datagrams left queued after Close", n)
 	}
 }
