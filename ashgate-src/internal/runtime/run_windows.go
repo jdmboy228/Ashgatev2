@@ -302,7 +302,7 @@ func (d *divert) send(pkt []byte, addr *windivert.Address) error {
 	return d.h.Send(pkt, addr)
 }
 
-func (d *divert) sendBatch(b *windivert.Batch) error {
+func (d *divert) sendBatch(b *windivert.Batch) (int, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.h.SendBatch(b.Buf, b.Addrs)

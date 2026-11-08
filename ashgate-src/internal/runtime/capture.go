@@ -24,7 +24,9 @@ type classifier interface {
 // reinjector hands packets back to WinDivert.
 type reinjector interface {
 	send(pkt []byte, addr *windivert.Address) error
-	sendBatch(b *windivert.Batch) error
+	// sendBatch returns the bytes sent before an error, which is the
+	// offset of the packet that failed.
+	sendBatch(b *windivert.Batch) (int, error)
 }
 
 // netBatch is the packets of one WinDivertRecvEx and their addresses.
@@ -179,13 +181,19 @@ func (c *capture) send(pkt []byte, addr *windivert.Address) {
 	}
 }
 
-// flush sends the batch. Errors are ignored as for single packets; a failed
-// batch is not resent packet by packet, which could send some twice.
+// flush sends the batch. When the driver stops at a packet, that packet is
+// lost as a failed single send is, and the rest goes as a new batch: one
+// bad packet must not take the others with it. Every error drops at least
+// one packet, so the loop ends after at most one retry per packet, and
+// nothing is sent twice.
 func (c *capture) flush() {
-	if c.batch.Len() == 0 {
-		return
+	for c.batch.Len() > 0 {
+		sent, err := c.out.sendBatch(&c.batch)
+		if err == nil {
+			break
+		}
+		c.batch.Skip(sent)
 	}
-	_ = c.out.sendBatch(&c.batch)
 	c.batch.Reset()
 }
 

@@ -173,13 +173,15 @@ func (h Handle) RecvBatch(buf []byte, addrs []Address) (n, count int, err error)
 
 // SendBatch injects the packets packed back to back in buf, one per
 // address, with one WinDivertSendEx. The driver splits buf by the IP
-// length fields; Batch.Add only takes packets whose length is right.
-func (h Handle) SendBatch(buf []byte, addrs []Address) error {
+// length fields; Batch.Add only takes packets whose length is right. It
+// returns the bytes the driver took before it stopped: on error that is the
+// offset of the packet that failed (see Batch.Skip).
+func (h Handle) SendBatch(buf []byte, addrs []Address) (int, error) {
 	if h == 0 {
-		return windows.ERROR_INVALID_HANDLE
+		return 0, windows.ERROR_INVALID_HANDLE
 	}
 	if len(buf) == 0 || len(addrs) == 0 || len(addrs) > BatchMax {
-		return windows.ERROR_INVALID_PARAMETER
+		return 0, windows.ERROR_INVALID_PARAMETER
 	}
 	var n uint32
 	r, _, err := procSendEx.Call(
@@ -196,9 +198,9 @@ func (h Handle) SendBatch(buf []byte, addrs []Address) error {
 		if err == nil || err == windows.ERROR_SUCCESS {
 			err = windows.ERROR_INVALID_HANDLE
 		}
-		return err
+		return int(n), err
 	}
-	return nil
+	return int(n), nil
 }
 
 // SetParam sets a WinDivert queue parameter.

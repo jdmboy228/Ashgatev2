@@ -34,7 +34,7 @@ func (f *fakeOut) send(pkt []byte, _ *windivert.Address) error {
 	return nil
 }
 
-func (f *fakeOut) sendBatch(b *windivert.Batch) error {
+func (f *fakeOut) sendBatch(b *windivert.Batch) (int, error) {
 	var ports []string
 	for i, p := range windivert.SplitBatch(b.Buf, b.Len(), nil) {
 		ports = append(ports, portsOf(p))
@@ -43,7 +43,7 @@ func (f *fakeOut) sendBatch(b *windivert.Batch) error {
 		}
 	}
 	f.log = append(f.log, "batch "+strings.Join(ports, ","))
-	return nil
+	return len(b.Buf), nil
 }
 
 func portsOf(pkt []byte) string {
@@ -86,7 +86,7 @@ type fakeClock struct{ t time.Time }
 
 func (c *fakeClock) now() time.Time { return c.t }
 
-func newTestCapture(eng *fakeEngine, out *fakeOut, udp *udpQueue) (*capture, *fakeClock) {
+func newTestCapture(eng *fakeEngine, out reinjector, udp *udpQueue) (*capture, *fakeClock) {
 	clock := &fakeClock{t: time.Unix(1000, 0)}
 	c := newCapture(eng, out, udp)
 	c.now = clock.now
@@ -138,10 +138,10 @@ type recordBatch struct{ b *windivert.Batch }
 
 func (r recordBatch) send([]byte, *windivert.Address) error { return nil }
 
-func (r recordBatch) sendBatch(b *windivert.Batch) error {
+func (r recordBatch) sendBatch(b *windivert.Batch) (int, error) {
 	r.b.Buf = append([]byte(nil), b.Buf...)
 	r.b.Addrs = append([]windivert.Address(nil), b.Addrs...)
-	return nil
+	return len(b.Buf), nil
 }
 
 func TestCaptureHoldsUntilKnown(t *testing.T) {
@@ -236,5 +236,51 @@ func TestCaptureSplitsLongSendBatch(t *testing.T) {
 	}
 	if !strings.HasPrefix(out.log[0], "batch 1000,1001,") {
 		t.Fatalf("first send %.40q", out.log[0])
+	}
+}
+
+// failOut is a driver that stops at the packets whose source port is in bad.
+type failOut struct {
+	fakeOut
+	bad map[string]bool
+}
+
+func (f *failOut) sendBatch(b *windivert.Batch) (int, error) {
+	off := 0
+	for _, p := range windivert.SplitBatch(b.Buf, b.Len(), nil) {
+		if f.bad[portsOf(p)] {
+			f.log = append(f.log, "fail "+portsOf(p)+" after "+fmt.Sprint(off))
+			return off, fmt.Errorf("send failed")
+		}
+		f.log = append(f.log, "sent "+portsOf(p))
+		off += len(p)
+	}
+	return off, nil
+}
+
+func TestCaptureFlushSkipsFailedPacket(t *testing.T) {
+	eng := &fakeEngine{decide: func(uint16, bool) engine.Result { return engine.Result{Action: engine.ActionPass} }}
+	out := &failOut{bad: map[string]bool{"2": true, "4": true, "5": true}}
+	c, _ := newTestCapture(eng, out, nil)
+	c.handle(batchOf(t, 1, 2, 3, 4, 5, 6))
+	// Each failed packet is skipped once; the rest is sent as a new batch.
+	want := "sent 1,fail 2 after " + fmt.Sprint(len(pktFrom(t, 1))) +
+		",sent 3,fail 4 after " + fmt.Sprint(len(pktFrom(t, 1))) +
+		",fail 5 after 0,sent 6"
+	if got := strings.Join(out.log, ","); got != want {
+		t.Fatalf("got  %s\nwant %s", got, want)
+	}
+	if c.batch.Len() != 0 {
+		t.Fatal("batch not reset")
+	}
+}
+
+func TestCaptureFlushAllFailEnds(t *testing.T) {
+	eng := &fakeEngine{decide: func(uint16, bool) engine.Result { return engine.Result{Action: engine.ActionPass} }}
+	out := &failOut{bad: map[string]bool{"1": true, "2": true, "3": true}}
+	c, _ := newTestCapture(eng, out, nil)
+	c.handle(batchOf(t, 1, 2, 3))
+	if len(out.log) != 3 {
+		t.Fatalf("%d sends: %v", len(out.log), out.log)
 	}
 }

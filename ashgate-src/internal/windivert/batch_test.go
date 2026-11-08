@@ -177,3 +177,58 @@ func TestBatchBoundsBytes(t *testing.T) {
 		t.Fatal("empty batch refused a packet")
 	}
 }
+
+func TestBatchSkip(t *testing.T) {
+	mk := func() (*Batch, [][]byte) {
+		var b Batch
+		var pkts [][]byte
+		for i := 0; i < 4; i++ {
+			p := make([]byte, 24+i)
+			p[0] = 0x45
+			binary.BigEndian.PutUint16(p[2:4], uint16(len(p)))
+			p[8] = byte(i) // marks the packet
+			var a Address
+			a.SetOutbound(i%2 == 0)
+			if !b.Add(p, &a) {
+				t.Fatal("Add refused")
+			}
+			pkts = append(pkts, p)
+		}
+		return &b, pkts
+	}
+	for _, c := range []struct {
+		sent int
+		left int // packets left; the first of them has mark 4-left
+	}{
+		{0, 3},            // the first packet failed
+		{24, 2},           // the second failed
+		{30, 2},           // the send stopped inside the second
+		{24 + 25 + 26, 0}, // the last failed
+		{1 << 20, 0},
+		{-5, 3},
+	} {
+		b, _ := mk()
+		b.Skip(c.sent)
+		if b.Len() != c.left {
+			t.Fatalf("sent %d: %d left, want %d", c.sent, b.Len(), c.left)
+		}
+		if c.left > 0 && b.Buf[8] != byte(4-c.left) {
+			t.Fatalf("sent %d: first left is %d", c.sent, b.Buf[8])
+		}
+		if c.left > 0 && b.Addrs[0].Outbound() != ((4-c.left)%2 == 0) {
+			t.Fatalf("sent %d: addresses out of step", c.sent)
+		}
+		if len(b.Buf) != sumLen(c.left) {
+			t.Fatalf("sent %d: %d bytes left", c.sent, len(b.Buf))
+		}
+	}
+}
+
+// sumLen is the size of the last n packets that TestBatchSkip builds.
+func sumLen(n int) int {
+	t := 0
+	for i := 4 - n; i < 4; i++ {
+		t += 24 + i
+	}
+	return t
+}

@@ -99,3 +99,26 @@ func (b *Batch) Reset() {
 	b.Buf = b.Buf[:0]
 	b.Addrs = b.Addrs[:0]
 }
+
+// Skip drops from the front the packets that SendBatch has dealt with:
+// those sent whole, and the one the send stopped in. sent is the byte count
+// SendBatch returned with its error. The packets left are the ones never
+// tried; the caller sends them as a new batch, so no packet goes out twice.
+func (b *Batch) Skip(sent int) {
+	if sent < 0 {
+		sent = 0
+	}
+	off, n := 0, 0
+	for n < len(b.Addrs) && off <= sent {
+		l := ipLen(b.Buf[off:])
+		if l == 0 || off+l > len(b.Buf) {
+			// Cannot happen for packets that Add took; give up on the rest.
+			off, n = len(b.Buf), len(b.Addrs)
+			break
+		}
+		off += l
+		n++
+	}
+	b.Buf = b.Buf[:copy(b.Buf, b.Buf[off:])]
+	b.Addrs = b.Addrs[:copy(b.Addrs, b.Addrs[n:])]
+}
