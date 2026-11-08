@@ -234,6 +234,56 @@ func (e *Engine) systemDNS(pkt []byte, h *packet.Header, meta Meta, proc rules.P
 	return e.startUDP(pkt, h, meta, proc, p, snap, "", nil, false, true)
 }
 
+// dohServers are public resolvers Windows can use with DNS over HTTPS
+// (its built-in templates, AdGuard and Yandex). Their port 443 carries
+// only DNS.
+var dohServers = func() map[packet.Addr]struct{} {
+	m := map[packet.Addr]struct{}{}
+	for _, ip := range []string{
+		"1.1.1.1", "1.0.0.1", "8.8.8.8", "8.8.4.4", "9.9.9.9", "149.112.112.112",
+		"94.140.14.14", "94.140.15.15", "77.88.8.8", "77.88.8.1",
+		"2606:4700:4700::1111", "2606:4700:4700::1001", "2001:4860:4860::8888",
+		"2001:4860:4860::8844", "2620:fe::fe", "2620:fe::9",
+	} {
+		m[packet.FromIP(net.ParseIP(ip), 443)] = struct{}{}
+	}
+	return m
+}()
+
+// encryptedDNS reports DNS over TLS (TCP 853) or over HTTPS (443, TCP or
+// QUIC, to a resolver in dohServers).
+func encryptedDNS(h *packet.Header) bool {
+	if h.Dst.Port == 853 {
+		return h.Proto == packet.ProtoTCP
+	}
+	_, ok := dohServers[h.Dst]
+	return ok
+}
+
+// systemEncryptedDNS sends the Windows DNS client's DoT and DoH through
+// the system DNS proxy, to the resolver Windows chose. The names inside
+// are not visible, so none can be let through for the provider's DNS;
+// sent direct, the provider would still see every lookup's time and size
+// next to a routed program's traffic.
+func (e *Engine) systemEncryptedDNS(pkt []byte, h *packet.Header, meta Meta, proc rules.Process, snap *snapshot) Result {
+	if snap.sysProxy == nil {
+		e.rememberDirect(h)
+		return Result{Action: ActionPass}
+	}
+	p := *snap.sysProxy
+	if h.Proto == packet.ProtoTCP {
+		if !(h.SYN && !h.ACK) {
+			// Opened before capture: reset, Windows reconnects through the tunnel.
+			e.reset(h, meta)
+			return Result{Action: ActionDrop}
+		}
+		return e.startTCP(pkt, h, meta, proc, p, snap, "", nil, false)
+	}
+	// QUIC that the proxy cannot carry is dropped, never sent direct:
+	// Windows then uses DoH over TCP.
+	return e.startUDP(pkt, h, meta, proc, p, snap, "", nil, true, false)
+}
+
 // forwardDNSTCP sends one query as DNS over TCP through the flow's proxy:
 // HTTP proxies have no UDP, and system DNS through SOCKS5 must not depend
 // on UDP ASSOCIATE, which many servers lack.

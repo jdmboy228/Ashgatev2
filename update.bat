@@ -95,17 +95,19 @@ Step 2 "Скачиваю свежий код"
 $repo = $null
 $commit = ''
 if ($hasGit) {
-  $repo = (& git -C $src rev-parse --show-toplevel 2>$null | Select-Object -First 1)
+  $repo = (& git -c core.hooksPath=NUL -c core.fsmonitor=false -C $src rev-parse --show-toplevel 2>$null | Select-Object -First 1)
 }
 if ($repo) {
   # The window runs elevated; let git trust a clone made by the same user.
+  # The clone is writable without admin rights: no hooks and no fsmonitor
+  # program from it may run with ours.
   $safe = 'safe.directory=' + ($repo -replace '\\', '/')
-  & git -c $safe -C $repo pull --ff-only
+  & git -c core.hooksPath=NUL -c core.fsmonitor=false -c $safe -C $repo pull --ff-only
   if ($LASTEXITCODE -ne 0) {
     Warn "Не удалось получить обновления (нет сети или в папке есть свои правки). Соберу код, который уже есть."
   }
-  $commit = (& git -c $safe -C $repo log -1 --format='%h' 2>$null | Select-Object -First 1)
-  Info ("Код: " + (& git -c $safe -C $repo log -1 --format='%h · %s · %cr' 2>$null | Select-Object -First 1))
+  $commit = (& git -c core.hooksPath=NUL -c core.fsmonitor=false -c $safe -C $repo log -1 --format='%h' 2>$null | Select-Object -First 1)
+  Info ("Код: " + (& git -c core.hooksPath=NUL -c core.fsmonitor=false -c $safe -C $repo log -1 --format='%h · %s · %cr' 2>$null | Select-Object -First 1))
 } elseif ($hasGit) {
   Warn "Папка — не клон репозитория: соберу код, который уже есть."
 }

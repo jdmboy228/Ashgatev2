@@ -37,7 +37,8 @@ func udpDNS(t *testing.T, src, dst packet.Addr, name string) []byte {
 }
 
 func TestBypassNames(t *testing.T) {
-	s := newNameSet(append(append([]string(nil), config.RussianZones...), "vk.com", "gosuslugi.ru"))
+	// The starter list: the zones, vk.com and gosuslugi.ru among others.
+	s := newNameSet(config.Default().BypassDomains())
 	for name, want := range map[string]bool{
 		"gosuslugi.ru":             true,
 		"WWW.Gosuslugi.RU.":        true,
@@ -229,10 +230,20 @@ func TestDNSIgnoresClosedSocketOwner(t *testing.T) {
 	if r := e.HandlePacket(pkt, Meta{}, true); r.Action != ActionUDP {
 		t.Fatalf("query on a reused port went %v, want the tunnel", r.Action)
 	}
-	// Other traffic still uses the closed socket's owner (its last packets).
+	// Any new flow ignores the closed socket: other UDP, a TCP SYN. With
+	// a proxy rule the unknown owner's packet is dropped, not sent direct.
 	other, _ := packet.BuildUDP(packet.V4(10, 0, 0, 6, 50091), packet.V4(198, 51, 100, 1, 5000), []byte{1})
-	if r := e.HandlePacket(other, Meta{}, true); r.Action != ActionPass {
-		t.Fatalf("non-DNS of direct.exe went %v", r.Action)
+	if r := e.HandlePacket(other, Meta{}, true); r.Action != ActionDrop {
+		t.Fatalf("UDP on a reused port went %v", r.Action)
+	}
+	syn, _ := packet.BuildTCP(packet.V4(10, 0, 0, 6, 50092), packet.V4(198, 51, 100, 1, 443), 0x02)
+	if r := e.HandlePacket(syn, Meta{}, true); r.Action != ActionDrop {
+		t.Fatalf("SYN on a reused port went %v", r.Action)
+	}
+	// The last packets of a connection keep the closed socket's owner.
+	ack, _ := packet.BuildTCP(packet.V4(10, 0, 0, 6, 50093), packet.V4(198, 51, 100, 1, 443), 0x11)
+	if r := e.HandlePacket(ack, Meta{}, true); r.Action != ActionPass {
+		t.Fatalf("FIN of direct.exe went %v", r.Action)
 	}
 }
 

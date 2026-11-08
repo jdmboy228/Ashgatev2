@@ -5,8 +5,10 @@ package engine
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -76,9 +78,15 @@ type Resolver interface {
 }
 
 // liveResolver also answers without sockets that already closed; see
-// process.Resolver.LookupLive. DNS uses it.
+// process.Resolver.LookupLive. A packet that starts a flow uses it.
 type liveResolver interface {
 	LookupLive(proto uint8, src packet.Addr) (rules.Process, bool)
+}
+
+// ownerResolver is process.Resolver: live as for liveResolver, and before
+// the last try (final) it never waits for the IP Helper tables.
+type ownerResolver interface {
+	Owner(proto uint8, src packet.Addr, live, final bool) (rules.Process, bool)
 }
 
 // Allocator reserves a local port used as the source of a redirected TCP handshake.
@@ -114,9 +122,13 @@ type Engine struct {
 	verbose  bool
 
 	snap atomic.Pointer[snapshot]
-	// bypass holds the proxies' own IPs (ports zero); see RefreshBypass.
-	bypass atomic.Pointer[map[packet.Addr]struct{}]
-	inj    atomic.Pointer[Injector]
+	// servers holds the proxies' own IP:port; see RefreshBypass.
+	servers atomic.Pointer[map[packet.Addr]struct{}]
+	inj     atomic.Pointer[Injector]
+	// noRelay6 is set when the IPv6 relay could not listen; see
+	// DisableIPv6Relay. relay6Logged keeps its log to one line.
+	noRelay6     atomic.Bool
+	relay6Logged atomic.Bool
 
 	mu        sync.Mutex
 	byClient  map[packet.Addr]*tcpFlow
@@ -135,7 +147,20 @@ type Engine struct {
 	// their later fragments (which carry no ports) are dropped too instead
 	// of reaching the destination directly.
 	fragDrop ageSet[fragKey]
+	// fragHeld remembers datagrams whose first fragment is held for the
+	// owner lookup: their later fragments wait for its decision.
+	fragHeld ageSet[fragKey]
 	udp      map[udpKey]*udpFlow
+	// unknownUDP remembers UDP flows dropped for want of a program. Their
+	// next packets skip the hold (a stream of them would fill the capture
+	// loop's queue) but are still looked up, so once the owner is known
+	// they follow its rule. unknownRot is when it last aged.
+	unknownUDP ageSet[udpKey]
+	unknownRot time.Time
+	// unknownDrops counts packets of no known program dropped since the
+	// last log line about them, written at unknownLogAt.
+	unknownDrops int
+	unknownLogAt time.Time
 	// stats are per-rule counters keyed by RuleKey.
 	stats map[string]*ruleStat
 	// rotatedAt is when the direct/block caches last aged; see sweep.
@@ -188,6 +213,10 @@ type snapshot struct {
 	sysProxy *config.Proxy
 	// bypassNames resolve with the provider's DNS even in system DNS.
 	bypassNames nameSet
+	// strict is set when an enabled rule sends a program through a proxy.
+	// A packet whose program stays unknown may then be that program's, and
+	// is dropped instead of sent direct.
+	strict bool
 }
 
 // New compiles cfg and returns an engine. The relay addresses come from cfg.
@@ -200,22 +229,24 @@ func New(cfg *config.Config, opt Options) (*Engine, error) {
 		return nil, err
 	}
 	e := &Engine{
-		logs:      opt.Logs,
-		alloc:     opt.Alloc,
-		dial:      opt.Dialer,
-		resolver:  opt.Resolver,
-		now:       opt.Now,
-		byClient:  map[packet.Addr]*tcpFlow{},
-		byAlloc:   map[allocKey]*tcpFlow{},
-		directTCP: newAgeSet[packet.Addr](),
-		directUDP: newAgeSet[udpKey](),
-		blockTCP:  newAgeSet[packet.Addr](),
-		blockUDP:  newAgeSet[udpKey](),
-		closedTCP: newAgeSet[packet.Addr](),
-		fragDrop:  newAgeSet[fragKey](),
-		udp:       map[udpKey]*udpFlow{},
-		dnsSem:    make(chan struct{}, httpDNSParallel),
-		stats:     map[string]*ruleStat{},
+		logs:       opt.Logs,
+		alloc:      opt.Alloc,
+		dial:       opt.Dialer,
+		resolver:   opt.Resolver,
+		now:        opt.Now,
+		byClient:   map[packet.Addr]*tcpFlow{},
+		byAlloc:    map[allocKey]*tcpFlow{},
+		directTCP:  newAgeSet[packet.Addr](),
+		directUDP:  newAgeSet[udpKey](),
+		blockTCP:   newAgeSet[packet.Addr](),
+		blockUDP:   newAgeSet[udpKey](),
+		closedTCP:  newAgeSet[packet.Addr](),
+		fragDrop:   newAgeSet[fragKey](),
+		fragHeld:   newAgeSet[fragKey](),
+		unknownUDP: newAgeSet[udpKey](),
+		udp:        map[udpKey]*udpFlow{},
+		dnsSem:     make(chan struct{}, httpDNSParallel),
+		stats:      map[string]*ruleStat{},
 	}
 	if e.alloc == nil {
 		e.alloc = OSAllocator{}
@@ -269,6 +300,7 @@ func (e *Engine) Apply(cfg *config.Config) error {
 	e.directUDP = newAgeSet[udpKey]()
 	e.blockTCP = newAgeSet[packet.Addr]()
 	e.blockUDP = newAgeSet[udpKey]()
+	e.unknownUDP = newAgeSet[udpKey]()
 	e.mu.Unlock()
 	return nil
 }
@@ -310,7 +342,12 @@ var lookupIP = func(ctx context.Context, _, host string) ([]net.IP, error) {
 	return bootstrap.Default.LookupIP(ctx, host)
 }
 
-// RefreshBypass resolves proxy hostnames so traffic to the proxy itself stays direct.
+// RefreshBypass resolves the proxies' host names. A connection to a proxy
+// server's IP:port whose program is unknown passes direct: it is almost
+// surely Ashgate's own, whose socket event was missed (a known Ashgate
+// socket passes by its PID). Only IP:port, and only for an unknown
+// program: a VLESS server behind a CDN shares its IP with other sites, and
+// a routed program's connection to them follows its rule.
 func (e *Engine) RefreshBypass(ctx context.Context) {
 	snap := e.snap.Load()
 	if snap == nil {
@@ -318,12 +355,16 @@ func (e *Engine) RefreshBypass(ctx context.Context) {
 	}
 	m := map[packet.Addr]struct{}{}
 	for _, p := range snap.proxies {
-		host, _, err := net.SplitHostPort(p.Address)
+		host, portStr, err := net.SplitHostPort(p.Address)
 		if err != nil {
 			continue
 		}
+		port, err := strconv.Atoi(portStr)
+		if err != nil || port < 1 || port > 65535 {
+			continue
+		}
 		if ip := net.ParseIP(host); ip != nil {
-			m[packet.FromIP(ip, 0)] = struct{}{}
+			m[packet.FromIP(ip, uint16(port))] = struct{}{}
 			continue
 		}
 		ctx2, cancel := context.WithTimeout(ctx, 5*time.Second)
@@ -333,11 +374,26 @@ func (e *Engine) RefreshBypass(ctx context.Context) {
 			continue
 		}
 		for _, ip := range ips {
-			m[packet.FromIP(ip, 0)] = struct{}{}
+			m[packet.FromIP(ip, uint16(port))] = struct{}{}
 		}
 	}
-	e.bypass.Store(&m)
+	e.servers.Store(&m)
 }
+
+// proxyServer reports dst as a proxy server's IP:port; see RefreshBypass.
+func (e *Engine) proxyServer(dst packet.Addr) bool {
+	m := e.servers.Load()
+	if m == nil {
+		return false
+	}
+	_, ok := (*m)[dst]
+	return ok
+}
+
+// DisableIPv6Relay is for when the IPv6 relay could not listen: another
+// program may hold its port, and routed IPv6 TCP would be handed to it.
+// Such connections are dropped instead; programs then use IPv4.
+func (e *Engine) DisableIPv6Relay() { e.noRelay6.Store(true) }
 
 func compile(cfg *config.Config) (*snapshot, error) {
 	r4, err := parseRelay(cfg.Relay.TCP4, 4)
@@ -356,6 +412,12 @@ func compile(cfg *config.Config) (*snapshot, error) {
 	for _, p := range cfg.Proxies {
 		proxies[p.Name] = p
 	}
+	strict := false
+	for _, r := range cfg.EffectiveRules() {
+		if r.IsEnabled() && r.Action == "proxy" {
+			strict = true
+		}
+	}
 	snap := &snapshot{
 		rules:          rules.Compile(cfg.EffectiveRules()),
 		proxies:        proxies,
@@ -367,6 +429,7 @@ func compile(cfg *config.Config) (*snapshot, error) {
 		ruleKeys:       keys,
 		dnsServers:     cfg.DNS.ProxyDNSServers(),
 		bypassNames:    newNameSet(cfg.BypassDomains()),
+		strict:         strict,
 	}
 	if p, ok := systemProxy(cfg, proxies); ok {
 		snap.sysProxy = &p
@@ -402,44 +465,96 @@ func parseRelay(addr string, ver int) (packet.Addr, error) {
 func (e *Engine) HandlePacket(pkt []byte, meta Meta, final bool) Result {
 	var h packet.Header
 	if err := packet.Parse(pkt, &h); err != nil {
-		return Result{Action: ActionPass}
-	}
-	if h.L4Off == 0 {
-		// A later fragment carries no ports. Drop it when its first
-		// fragment was dropped, or it would reach the destination directly.
-		if h.Frag {
-			e.mu.Lock()
-			drop := e.fragDrop.has(fragOf(&h))
-			e.mu.Unlock()
-			if drop {
-				return Result{Action: ActionDrop}
-			}
+		// Nothing tells whose it is. With a routed program it may be its.
+		if snap := e.snap.Load(); snap != nil && snap.strict {
+			return Result{Action: ActionDrop}
 		}
 		return Result{Action: ActionPass}
 	}
+	if h.L4Off == 0 {
+		return e.laterFragment(&h, final)
+	}
 	e.mu.Lock()
 	if res, done := e.fastPath(pkt, &h); done {
+		e.firstFragmentLocked(&h, res.Action)
 		e.mu.Unlock()
 		return res
 	}
+	again := !final && h.Proto == packet.ProtoUDP && e.unknownUDP.has(udpKey{Src: h.Src, Dst: h.Dst})
 	e.mu.Unlock()
 
 	var proc rules.Process
 	found := false
-	if lr, ok := e.resolver.(liveResolver); ok && h.Proto == packet.ProtoUDP && h.Dst.Port == 53 {
-		// A DNS socket's port is soon reused: never credit a query to the
-		// program whose socket on it just closed.
-		proc, found = lr.LookupLive(h.Proto, h.Src)
-	} else if e.resolver != nil {
-		proc, found = e.resolver.Lookup(h.Proto, h.Src)
+	if e.resolver != nil {
+		proc, found = e.lookup(&h, final)
 	}
 
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if res, done := e.fastPath(pkt, &h); done {
-		return res
+	res, done := e.fastPath(pkt, &h)
+	if !done {
+		res = e.decide(pkt, &h, meta, proc, found, final || again)
 	}
-	return e.decide(pkt, &h, meta, proc, found, final)
+	e.firstFragmentLocked(&h, res.Action)
+	return res
+}
+
+// lookup finds the program of the packet's socket. A packet that starts a
+// flow (a TCP SYN, any UDP) is never credited to a socket that already
+// closed: its port may be another program's by now, whose event is still
+// on the way. The last packets of a connection keep the closed socket's
+// owner for a while.
+func (e *Engine) lookup(h *packet.Header, final bool) (rules.Process, bool) {
+	live := h.Proto == packet.ProtoUDP || h.SYN && !h.ACK
+	switch r := e.resolver.(type) {
+	case ownerResolver:
+		return r.Owner(h.Proto, h.Src, live, final)
+	case liveResolver:
+		if live {
+			return r.LookupLive(h.Proto, h.Src)
+		}
+	}
+	return e.resolver.Lookup(h.Proto, h.Src)
+}
+
+// laterFragment decides a fragment without ports. It is dropped when its
+// first fragment was, or it would reach the destination directly, and it
+// waits while the first one is held.
+func (e *Engine) laterFragment(h *packet.Header, final bool) Result {
+	if !h.Frag {
+		return Result{Action: ActionPass}
+	}
+	k := fragOf(h)
+	e.mu.Lock()
+	drop := e.fragDrop.has(k)
+	held := !drop && e.fragHeld.has(k)
+	e.mu.Unlock()
+	switch {
+	case drop:
+		return Result{Action: ActionDrop}
+	case held && !final:
+		return Result{Action: ActionUnknown}
+	case held:
+		if snap := e.snap.Load(); snap != nil && snap.strict {
+			return Result{Action: ActionDrop}
+		}
+	}
+	return Result{Action: ActionPass}
+}
+
+// firstFragmentLocked notes whether h, when a first fragment, is held.
+func (e *Engine) firstFragmentLocked(h *packet.Header, a Action) {
+	if !h.Frag {
+		return
+	}
+	if a == ActionUnknown {
+		if e.fragHeld.len() >= maxFragHeld {
+			e.fragHeld.rotate()
+		}
+		e.fragHeld.add(fragOf(h))
+	} else {
+		e.fragHeld.del(fragOf(h))
+	}
 }
 
 func (e *Engine) fastPath(pkt []byte, h *packet.Header) (Result, bool) {
@@ -517,13 +632,17 @@ func (e *Engine) decide(pkt []byte, h *packet.Header, meta Meta, proc rules.Proc
 	// port another program used a moment ago must not pass a routed
 	// program's query.
 	dns := h.Dst.Port == 53
-	if e.destinationBypass(h.Dst, snap.bypassPrivate && !dns, dns) {
+	if destinationBypass(h.Dst, snap.bypassPrivate && !dns, dns) {
 		e.rememberDirectExceptDNS(h)
 		return Result{Action: ActionPass}
 	}
 	if !found {
 		if !final && (h.Proto == packet.ProtoUDP || h.Proto == packet.ProtoTCP) {
 			return Result{Action: ActionUnknown}
+		}
+		if e.proxyServer(h.Dst) {
+			e.rememberDirectExceptDNS(h)
+			return Result{Action: ActionPass}
 		}
 		if dns {
 			// Any program may have sent it, a routed one included.
@@ -536,6 +655,21 @@ func (e *Engine) decide(pkt []byte, h *packet.Header, meta Meta, proc rules.Proc
 			// of capture, passing it would put the app's own address on the
 			// wire. A dead socket loses nothing by being dropped.
 			e.rememberBlock(h)
+			return Result{Action: ActionDrop}
+		}
+		if snap.strict {
+			// A new connection or UDP of a program still unknown after the
+			// hold may be a routed program's. It is not remembered: a
+			// retransmit is decided again, by then often with its owner.
+			e.dropFragment(h)
+			if h.Proto == packet.ProtoUDP {
+				if now := e.now(); now.Sub(e.unknownRot) >= unknownKeep {
+					e.unknownUDP.rotate()
+					e.unknownRot = now
+				}
+				e.unknownUDP.add(udpKey{Src: h.Src, Dst: h.Dst})
+			}
+			e.unknownDropLocked()
 			return Result{Action: ActionDrop}
 		}
 		e.rememberDirect(h)
@@ -554,8 +688,13 @@ func (e *Engine) decide(pkt []byte, h *packet.Header, meta Meta, proc rules.Proc
 	}
 	proxyName := dec.Proxy
 	action := dec.Action
-	if action == "" && dns && rules.IsSystemDNS(proc.Name) {
-		return e.systemDNS(pkt, h, meta, proc, snap)
+	if action == "" && rules.IsSystemDNS(proc.Name) {
+		if dns {
+			return e.systemDNS(pkt, h, meta, proc, snap)
+		}
+		if encryptedDNS(h) {
+			return e.systemEncryptedDNS(pkt, h, meta, proc, snap)
+		}
 	}
 	switch action {
 	case "direct":
@@ -616,6 +755,13 @@ func (e *Engine) decide(pkt []byte, h *packet.Header, meta Meta, proc rules.Proc
 
 // startTCP maps a new connection to the relay. sys marks system DNS.
 func (e *Engine) startTCP(pkt []byte, h *packet.Header, meta Meta, proc rules.Process, p config.Proxy, snap *snapshot, parent string, stat *ruleStat, sys bool) Result {
+	if h.Ver == 6 && e.noRelay6.Load() {
+		if !e.relay6Logged.Swap(true) {
+			e.log(logbuf.Event{Process: display(proc), PID: proc.PID, Proto: "TCP", Dest: h.Dst.String(), Via: p.Name, Status: "blocked",
+				Error: "IPv6-приёмник не открыт: IPv6-соединения программ с правилом отброшены, они пойдут по IPv4"})
+		}
+		return Result{Action: ActionDrop}
+	}
 	if h.Frag {
 		e.dropFragment(h)
 		e.log(logbuf.Event{Process: display(proc), PID: proc.PID, Proto: "TCP", Dest: h.Dst.String(), Via: p.Name, Status: "blocked", Error: "fragmented tcp dropped"})
@@ -662,15 +808,43 @@ func (e *Engine) startTCP(pkt []byte, h *packet.Header, meta Meta, proc rules.Pr
 // kill switch it is dropped and the application gets a reset, which makes
 // it reconnect through the proxy instead of staying direct.
 func (e *Engine) resetExisting(h *packet.Header, meta Meta, proc rules.Process, p config.Proxy, parent string) Result {
+	e.reset(h, meta)
+	e.log(logbuf.Event{Process: display(proc), PID: proc.PID, Proto: "TCP", Dest: h.Dst.String(), Via: p.Name, Status: "blocked",
+		Error: "kill switch: соединение открыто до запуска перехвата, сброшено", Parent: parent})
+	return Result{Action: ActionDrop}
+}
+
+// reset drops a connection that cannot be moved to the proxy and sends the
+// program a reset, so it reconnects (through the proxy) at once.
+func (e *Engine) reset(h *packet.Header, meta Meta) {
 	e.rememberBlock(h)
 	if inj := e.injector(); inj != nil && !h.RST {
 		if rst, err := packet.BuildRST(h.Dst, h.Src, h.Ack); err == nil {
 			_ = inj.InjectInbound(rst, meta.IfIdx, meta.SubIfIdx)
 		}
 	}
-	e.log(logbuf.Event{Process: display(proc), PID: proc.PID, Proto: "TCP", Dest: h.Dst.String(), Via: p.Name, Status: "blocked",
-		Error: "kill switch: соединение открыто до запуска перехвата, сброшено", Parent: parent})
-	return Result{Action: ActionDrop}
+}
+
+const (
+	// unknownLogEvery bounds the log lines about packets of no known program.
+	unknownLogEvery = 10 * time.Second
+	// unknownKeep is how long unknownUDP remembers a flow without packets.
+	unknownKeep = 30 * time.Second
+	// maxFragHeld bounds fragHeld; a full set ages at once.
+	maxFragHeld = 4096
+)
+
+// unknownDropLocked counts a dropped packet of no known program and logs
+// the count at most once per unknownLogEvery.
+func (e *Engine) unknownDropLocked() {
+	e.unknownDrops++
+	now := e.now()
+	if !e.unknownLogAt.IsZero() && now.Sub(e.unknownLogAt) < unknownLogEvery {
+		return
+	}
+	e.unknownLogAt = now
+	e.log(logbuf.Event{Status: "blocked", Error: fmt.Sprintf("программа не определена: пакеты отброшены (%d)", e.unknownDrops)})
+	e.unknownDrops = 0
 }
 
 // startUDP opens a proxied UDP flow. sys marks system DNS (see dns.go).
@@ -774,6 +948,12 @@ func (e *Engine) tcpReturn(pkt []byte, h *packet.Header, snap *snapshot) (Result
 var loopback6 = packet.FromIP(net.IPv6loopback, 0)
 
 func (e *Engine) rewriteForward(pkt []byte, h *packet.Header, flow *tcpFlow, snap *snapshot) Result {
+	if h.Frag {
+		// Only the first fragment has ports to rewrite; the rest would
+		// reach the site with the app's own address. TCP resends.
+		e.dropFragment(h)
+		return Result{Action: ActionDrop}
+	}
 	var src, dst packet.Addr
 	if h.Ver == 4 {
 		src = packet.V4(127, 0, 0, 1, flow.alloc)
@@ -814,23 +994,17 @@ func (e *Engine) rememberBlock(h *packet.Header) {
 	e.blockUDP.add(udpKey{Src: h.Src, Dst: h.Dst})
 }
 
-func (e *Engine) destinationBypass(dst packet.Addr, private, dns bool) bool {
+// destinationBypass reports a destination that never leaves the machine or
+// the LAN this way: loopback, multicast, link-local (not DNS) and, when
+// private is set, private networks.
+func destinationBypass(dst packet.Addr, private, dns bool) bool {
 	if packet.Loopback(dst) || packet.MulticastOrBroadcast(dst) {
 		return true
 	}
 	if packet.LinkLocal(dst) && !dns {
 		return true
 	}
-	if private && packet.Private(dst) {
-		return true
-	}
-	m := e.bypass.Load()
-	if m == nil {
-		return false
-	}
-	dst.Port = 0
-	_, ok := (*m)[dst]
-	return ok
+	return private && packet.Private(dst)
 }
 
 func (e *Engine) log(ev logbuf.Event) {
@@ -852,6 +1026,10 @@ func display(p rules.Process) string {
 	}
 	if p.Path != "" {
 		return rules.Base(p.Path)
+	}
+	if p.PID != 0 {
+		// Known, but its image cannot be read (a protected process).
+		return "PID " + strconv.FormatUint(uint64(p.PID), 10)
 	}
 	return ""
 }

@@ -14,6 +14,8 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"golang.org/x/net/idna"
+
 	"ashgate/internal/vless"
 )
 
@@ -36,8 +38,15 @@ type Config struct {
 	Groups []Group `json:"groups,omitempty"`
 	// DirectDomains go direct even when an app's rule sends it through
 	// VLESS (Xray domain routing), and resolve with the system resolver.
-	// Missing in the file means the starter list; an empty list is kept.
+	// Entries are kept as typed (госуслуги.рф); BypassDomains gives the DNS
+	// spelling. Missing in the file means the starter list; an empty list
+	// is kept.
 	DirectDomains []string `json:"directDomains"`
+	// Revision counts the one-time upgrades applied to the file. 1 (0.9.3):
+	// the zones .ru, .рф and .su, always direct before, became entries of
+	// DirectDomains, so deleting them sticks. The window posts it back
+	// with the rest of the config.
+	Revision int `json:"revision,omitempty"`
 	// Extra keeps JSON keys this version does not understand, such as the
 	// Dolphin block from 0.4.x. Saving the file must not drop them.
 	Extra map[string]json.RawMessage `json:"-"`
@@ -126,9 +135,11 @@ type Subscription struct {
 	Error     string    `json:"error,omitempty"`
 }
 
-// DefaultDirectDomains is the starter list of domains that go direct:
-// Russian state services, major banks, Yandex, VK and MAX.
+// DefaultDirectDomains is the starter list of domains that go direct: the
+// zones .ru, .рф and .su (Russian sites see the real address and get local
+// CDN answers), Russian state services, major banks, Yandex, VK and MAX.
 var DefaultDirectDomains = []string{
+	"ru", "рф", "su",
 	"gosuslugi.ru", "nalog.gov.ru",
 	"sberbank.ru", "sber.ru", "vtb.ru", "tbank.ru", "tinkoff.ru", "alfabank.ru",
 	"gazprombank.ru", "raiffeisen.ru", "sovcombank.ru", "pochtabank.ru", "psbank.ru",
@@ -148,17 +159,58 @@ func (d DNS) ProxyDNSServers() []string {
 	return append([]string(nil), d.Servers...)
 }
 
-// RussianZones always go direct and resolve with the provider's DNS, like
-// DirectDomains: .ru, .рф (xn--p1ai in DNS) and .su. Russian sites then see
-// the real address and get local CDN answers.
-var RussianZones = []string{"ru", "xn--p1ai", "su"}
+// currentRevision is the newest one-time upgrade; see Config.Revision.
+const currentRevision = 1
 
-// BypassDomains is every name that goes direct: the Russian zones and
-// DirectDomains, subdomains included.
+// russianZones were always direct before 0.9.3; see upgradeDirect.
+var russianZones = []string{"ru", "рф", "su"}
+
+// BypassDomains is every name that goes direct: DirectDomains, subdomains
+// included, spelled as DNS and Xray see them (рф is xn--p1ai).
 func (c *Config) BypassDomains() []string {
-	out := make([]string, 0, len(RussianZones)+len(c.DirectDomains))
-	out = append(out, RussianZones...)
-	return append(out, c.DirectDomains...)
+	out := make([]string, 0, len(c.DirectDomains))
+	for _, d := range c.DirectDomains {
+		if a, ok := asciiDomain(d); ok {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+// asciiDomain is d in lower-case ASCII (punycode for other scripts).
+func asciiDomain(d string) (string, bool) {
+	a, err := idna.Lookup.ToASCII(strings.Trim(d, "."))
+	if err != nil || a == "" {
+		return "", false
+	}
+	return strings.ToLower(a), true
+}
+
+// upgradeDirect is the 0.9.3 upgrade of a list from an older file: the
+// zones that used to be always direct become entries, and xn-- names
+// (which the window used to save) read as typed.
+func upgradeDirect(list []string) []string {
+	out := make([]string, 0, len(list)+len(russianZones))
+	seen := map[string]bool{}
+	for _, d := range list {
+		if u, err := idna.Lookup.ToUnicode(d); err == nil && strings.Contains(d, "xn--") {
+			d = u
+		}
+		if a, ok := asciiDomain(d); ok {
+			if seen[a] {
+				continue
+			}
+			seen[a] = true
+		}
+		out = append(out, d)
+	}
+	var zones []string
+	for _, z := range russianZones {
+		if a, _ := asciiDomain(z); !seen[a] {
+			zones = append(zones, z)
+		}
+	}
+	return append(zones, out...)
 }
 
 // Rule maps one application to a proxy, a direct connection, or a drop.
@@ -268,6 +320,11 @@ func (c *Config) ApplyDefaults() {
 	}
 	if c.DirectDomains == nil {
 		c.DirectDomains = append([]string(nil), DefaultDirectDomains...)
+	} else if c.Revision < 1 {
+		c.DirectDomains = upgradeDirect(c.DirectDomains)
+	}
+	if c.Revision < currentRevision {
+		c.Revision = currentRevision
 	}
 	if c.DNS.SystemResolverProxy != "" {
 		// A deleted proxy left behind (0.9.1 kept the name while the
@@ -542,7 +599,7 @@ func (c *Config) ProxyByName(name string) (Proxy, bool) {
 var knownConfigKeys = map[string]bool{
 	"version": true, "relay": true, "dns": true, "bypassPrivate": true,
 	"udpUnsupported": true, "killSwitch": true, "log": true, "ui": true, "proxies": true, "rules": true,
-	"groups": true, "directDomains": true,
+	"groups": true, "directDomains": true, "revision": true,
 }
 
 // Load reads a config file, applies defaults, and validates it.
@@ -772,10 +829,15 @@ func splitAddr(addr string) (string, uint16, error) {
 	return host, uint16(port), nil
 }
 
-// validDomain accepts a lower-case host name such as "gosuslugi.ru":
-// letters, digits, '-' and dots between labels, at least two labels.
+// validDomain accepts a lower-case host name or zone such as
+// "gosuslugi.ru", "госуслуги.рф" or "su": in DNS spelling letters, digits,
+// '-' and dots between labels.
 func validDomain(d string) bool {
-	if len(d) > 253 || !strings.Contains(d, ".") {
+	if d != strings.ToLower(d) {
+		return false
+	}
+	d, err := idna.Lookup.ToASCII(d)
+	if err != nil || d == "" || len(d) > 253 {
 		return false
 	}
 	for _, label := range strings.Split(d, ".") {

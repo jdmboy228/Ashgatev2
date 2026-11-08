@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"golang.org/x/net/dns/dnsmessage"
+	"golang.org/x/net/idna"
 )
 
 // BootDoH is a fake DoH resolver on loopback for dns.bootstrap: it answers
@@ -184,14 +185,18 @@ func (w *PortWatch) Owner(port int) string {
 }
 
 // BypassName reports names Ashgate lets go to the provider's DNS: the
-// Russian zones, the direct list, LAN names and private reverse lookups
-// (the engine's own list, internal/engine/dns.go).
+// direct list (the zones ru, рф and su are entries of it), LAN names and
+// private reverse lookups (the engine's own list, internal/engine/dns.go).
+// List entries are as typed; DNS spells рф as xn--p1ai.
 func BypassName(name string, direct []string) bool {
 	name = strings.TrimSuffix(strings.ToLower(name), ".")
 	if !strings.Contains(name, ".") || strings.HasSuffix(name, ".arpa") {
 		return true
 	}
-	for _, d := range append([]string{"ru", "xn--p1ai", "su", "local", "localdomain", "localhost", "lan", "home.arpa", "example", "invalid", "test"}, direct...) {
+	for _, d := range append([]string{"local", "localdomain", "localhost", "lan", "home.arpa", "example", "invalid", "test"}, direct...) {
+		if a, err := idna.Lookup.ToASCII(d); err == nil {
+			d = strings.ToLower(a)
+		}
 		if name == d || strings.HasSuffix(name, "."+d) {
 			return true
 		}

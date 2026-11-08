@@ -4,6 +4,7 @@ package autostart
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -12,6 +13,8 @@ import (
 	"strings"
 	"syscall"
 	"unicode/utf16"
+
+	"ashgate/internal/config"
 )
 
 const taskName = `\Ashgate`
@@ -37,11 +40,21 @@ func Enable(exe, configPath string) error {
 		return fmt.Errorf("не удалось определить текущего пользователя")
 	}
 	xml := taskXML(u.Username, exe, configPath)
-	f, err := os.CreateTemp("", "ashgate-task-*.xml")
+	// The task runs elevated at every logon. In %TEMP% another program of
+	// the user could swap the file before schtasks reads it; standard
+	// users cannot write to the protected folder.
+	dir, err := config.ProtectedDir()
 	if err != nil {
 		return err
 	}
-	path := f.Name()
+	path := filepath.Join(dir, "autostart-task.xml")
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
 	defer os.Remove(path)
 	if _, err := f.Write(encodeUTF16(xml)); err != nil {
 		f.Close()

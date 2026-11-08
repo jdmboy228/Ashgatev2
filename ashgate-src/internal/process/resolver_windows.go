@@ -23,6 +23,23 @@ func configure(r *Resolver) {
 	r.exited = t.exited
 	r.release = t.closeAll
 	r.loadHelper = loadTables
+	r.present = processPresent
+}
+
+// processPresent reports that pid runs. A protected process may refuse to
+// be opened; the refusal still says it exists.
+func processPresent(pid uint32) bool {
+	h, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+	if err != nil {
+		return err == windows.ERROR_ACCESS_DENIED
+	}
+	defer windows.CloseHandle(h)
+	var code uint32
+	if windows.GetExitCodeProcess(h, &code) != nil {
+		return true
+	}
+	const stillActive = 259
+	return code == stillActive
 }
 
 // handleTable keeps one open handle per PID a resolver has cached. While a

@@ -3,6 +3,8 @@ package gui
 import (
 	"os"
 	"path/filepath"
+
+	"ashgate/internal/atomicfile"
 )
 
 // resumeFile marks that capture was on when the window was asked to quit
@@ -16,7 +18,7 @@ func resumePath(configPath string) string {
 
 // markResume records that the next start should turn capture on.
 func markResume(configPath string) error {
-	return os.WriteFile(resumePath(configPath), []byte("1\n"), 0o600)
+	return atomicfile.Write(resumePath(configPath), []byte("1\n"))
 }
 
 // consumeResume reports whether a resume mark was left, and removes it.
