@@ -45,6 +45,9 @@ type host struct {
 	normalW, normalH int32
 	normalDPI        int32
 	maximized        bool
+	// shown is whether the page was last told the window is on screen; the
+	// page stops polling while hidden. UI thread only.
+	shown bool
 }
 
 // windowState is window.json beside the config. W/H are DIP; X/Y are screen pixels.
@@ -94,14 +97,7 @@ func Run(configPath string, startCapture bool) error {
 		setAutostart: h.setAutostart,
 		firewall:     killswitch.New(killswitch.StatePath(configPath)),
 		guard:        killswitch.StartGuard,
-		visible: func() bool {
-			if h.hwnd == 0 {
-				return true
-			}
-			on, _, _ := pIsWindowVisible.Call(h.hwnd)
-			iconic, _, _ := pIsIconic.Call(h.hwnd)
-			return on != 0 && iconic == 0
-		},
+		visible:      h.onScreen,
 	})
 	// Registered before anything below can fail, so an early return still
 	// stops capture and the VLESS bridges and closes the log.
@@ -180,10 +176,12 @@ func Run(configPath string, startCapture bool) error {
 			pPostMessage.Call(h.hwnd, wmResize, ht, 0)
 		}
 	})
-	// Hand the API token to the page before it loads. json.Marshal yields a
-	// safe JavaScript string literal.
+	// Hand the API token to the page before it loads, and only to it: the
+	// script runs in every document the WebView opens, and a dropped file or
+	// link would be another one. json.Marshal yields safe string literals.
 	tok, _ := json.Marshal(h.ctrl.token)
-	w.Init("window.__ashgateToken=" + string(tok) + ";")
+	origin, _ := json.Marshal("http://" + ln.Addr().String())
+	w.Init("if(location.origin===" + string(origin) + ")window.__ashgateToken=" + string(tok) + ";")
 	if err := trayAdd(h.hwnd); err != nil {
 		h.ctrl.mu.Lock()
 		if h.ctrl.errText == "" {
@@ -329,7 +327,9 @@ func hostProc(hwnd, msg, wp, lp uintptr) uintptr {
 	}
 	switch msg {
 	case wmShow:
-		showMain()
+		if !h.quitting {
+			showMain()
+		}
 		return 0
 	case wmQuitReq:
 		// An update is replacing this exe. If capture is on, leave a mark so
@@ -389,6 +389,7 @@ func hostProc(hwnd, msg, wp, lp uintptr) uintptr {
 		return 0
 	case wmSize, wmExitSizeMove:
 		h.noteNormal()
+		h.wakePage()
 	case trayMsg:
 		switch lp {
 		case wmLButtonUp, wmLButtonDblClk:
@@ -417,6 +418,7 @@ func hostProc(hwnd, msg, wp, lp uintptr) uintptr {
 			on, n, errText := h.ctrl.running()
 			trayUpdate(on, n, errText)
 		}
+		h.wakePage()
 		return 0
 	}
 	r, _, _ := pCallWindowProc.Call(h.orig, hwnd, msg, wp, lp)
@@ -448,6 +450,27 @@ func showMain() {
 		pShowWindow.Call(h.hwnd, swShow)
 	}
 	pSetForeground.Call(h.hwnd)
+	h.wakePage()
+}
+
+// onScreen tells whether the window is visible and not minimized.
+func (h *host) onScreen() bool {
+	if h.hwnd == 0 {
+		return true
+	}
+	on, _, _ := pIsWindowVisible.Call(h.hwnd)
+	iconic, _, _ := pIsIconic.Call(h.hwnd)
+	return on != 0 && iconic == 0
+}
+
+// wakePage tells the page the window is back on screen. The page stops
+// polling while it is hidden or minimized and refreshes at once on this.
+func (h *host) wakePage() {
+	vis := h.onScreen()
+	if vis && !h.shown && h.w != nil && !h.quitting {
+		h.w.Eval("window.ashgateShown && window.ashgateShown()")
+	}
+	h.shown = vis
 }
 
 func hostQuit() {
@@ -458,17 +481,36 @@ func hostQuit() {
 	h.noteNormal()
 	h.saveWindow()
 	h.quitting = true
-	if h.ctrl != nil {
-		_ = h.ctrl.stop()
-		h.ctrl.shutdown()
-	}
+	// Stopping capture can take up to 8 seconds. Do it off the UI thread so
+	// the window does not freeze; it exits only after capture stopped and
+	// the kill switch blocked proxied apps.
 	trayRemove()
-	if h.w != nil {
-		h.w.Terminate()
-	}
 	if h.hwnd != 0 {
-		pPostMessage.Call(h.hwnd, wmClose, 0, 0)
+		pShowWindow.Call(h.hwnd, swHide)
 	}
+	exit := func() {
+		if h.w != nil {
+			h.w.Terminate()
+		}
+		if h.hwnd != 0 {
+			pPostMessage.Call(h.hwnd, wmClose, 0, 0)
+		}
+	}
+	if h.w == nil {
+		if h.ctrl != nil {
+			_ = h.ctrl.stop()
+			h.ctrl.shutdown()
+		}
+		exit()
+		return
+	}
+	go func() {
+		if h.ctrl != nil {
+			_ = h.ctrl.stop()
+			h.ctrl.shutdown()
+		}
+		h.w.Dispatch(exit)
+	}()
 }
 
 func styleWindow(hwnd uintptr) {

@@ -3,11 +3,13 @@ package gui
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -107,6 +109,7 @@ func TestParseVLESSAPI(t *testing.T) {
 	const link = "vless://b7e2c1a0-4f3a-4c2b-9a11-111111111111@203.0.113.10:443?encryption=none&security=reality&type=xhttp&path=%2Fxhttp&mode=auto&sni=www.microsoft.com&fp=chrome&pbk=AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8&sid=ab12#aeza-se"
 	req := httptest.NewRequest(http.MethodPost, "/api/vless/parse", strings.NewReader(`{"link":"`+link+`"}`))
 	req.Header.Set(tokenHeader, c.token)
+	req.Header.Set("Content-Type", "application/json")
 	req.Host = "127.0.0.1:5000"
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, req)
@@ -115,6 +118,7 @@ func TestParseVLESSAPI(t *testing.T) {
 	}
 	bad := httptest.NewRequest(http.MethodPost, "/api/vless/parse", strings.NewReader(`{"link":"https://example"}`))
 	bad.Header.Set(tokenHeader, c.token)
+	bad.Header.Set("Content-Type", "application/json")
 	bad.Host = "127.0.0.1:5000"
 	rr = httptest.NewRecorder()
 	h.ServeHTTP(rr, bad)
@@ -137,7 +141,8 @@ func TestAPIRequiresToken(t *testing.T) {
 		{"wrong token", "127.0.0.1:5000", "nope", "", http.StatusForbidden},
 		{"rebinding host", "evil.example:5000", c.token, "", http.StatusForbidden},
 		{"header", "127.0.0.1:5000", c.token, "", http.StatusOK},
-		{"query", "127.0.0.1:5000", "", "?t=" + c.token, http.StatusOK},
+		// Only the icon, an <img>, may carry the token in the URL.
+		{"query", "127.0.0.1:5000", "", "?t=" + c.token, http.StatusForbidden},
 	} {
 		req := httptest.NewRequest(http.MethodGet, "/api/state"+tc.query, nil)
 		req.Host = tc.host
@@ -149,6 +154,187 @@ func TestAPIRequiresToken(t *testing.T) {
 		if rr.Code != tc.want {
 			t.Fatalf("%s: got %d want %d", tc.name, rr.Code, tc.want)
 		}
+	}
+}
+
+// The token in the URL, the Origin and the body type: what a page from
+// elsewhere, holding the token or not, cannot get past.
+func TestAPIAuthRules(t *testing.T) {
+	oldPNG, oldRun, oldInst := iconPNG, listRunning, listInstalled
+	defer func() { iconPNG, listRunning, listInstalled = oldPNG, oldRun, oldInst }()
+	iconPNG = func(string) ([]byte, error) { return []byte("png"), nil }
+	listRunning = func() ([]process.App, error) { return nil, nil }
+	listInstalled = func() []process.Installed { return nil }
+	icons = &iconCache{m: map[string]iconEntry{}}
+	c := newController(filepath.Join(t.TempDir(), "config.json"), config.Default(), nil, hooks{})
+	h := c.Handler()
+	const host = "127.0.0.1:5000"
+	for _, tc := range []struct {
+		name, method, path, token, origin, ctype, body string
+		want                                           int
+	}{
+		{"icon with the token in the URL", "GET", `/api/icon?path=C:\a.exe&t=` + c.token, "", "", "", "", http.StatusOK},
+		{"icon without a token", "GET", `/api/icon?path=C:\a.exe`, "", "", "", "", http.StatusForbidden},
+		{"icon by POST with the token in the URL", "POST", "/api/icon?t=" + c.token, "", "", "application/json", "{}", http.StatusForbidden},
+		{"start with the token in the URL", "POST", "/api/start?t=" + c.token, "", "", "application/json", "{}", http.StatusForbidden},
+		{"log clear with the token in the URL", "POST", "/api/log/clear?t=" + c.token, "", "", "application/json", "{}", http.StatusForbidden},
+		{"POST without a body type", "POST", "/api/log/clear", c.token, "", "", "{}", http.StatusUnsupportedMediaType},
+		{"POST as a form", "POST", "/api/log/clear", c.token, "", "application/x-www-form-urlencoded", "a=b", http.StatusUnsupportedMediaType},
+		{"POST as text", "POST", "/api/log/clear", c.token, "", "text/plain", "{}", http.StatusUnsupportedMediaType},
+		{"POST as JSON", "POST", "/api/log/clear", c.token, "", "application/json; charset=utf-8", "{}", http.StatusOK},
+		{"own origin", "POST", "/api/log/clear", c.token, "http://" + host, "application/json", "{}", http.StatusOK},
+		{"foreign origin", "POST", "/api/log/clear", c.token, "https://evil.example", "application/json", "{}", http.StatusForbidden},
+		{"null origin", "GET", "/api/state", c.token, "null", "", "", http.StatusForbidden},
+		{"other port", "GET", "/api/state", c.token, "http://127.0.0.1:5001", "", "", http.StatusForbidden},
+		{"GET needs no body type", "GET", "/api/state", c.token, "", "", "", http.StatusOK},
+	} {
+		var body io.Reader
+		if tc.body != "" {
+			body = strings.NewReader(tc.body)
+		}
+		req := httptest.NewRequest(tc.method, tc.path, body)
+		req.Host = host
+		if tc.token != "" {
+			req.Header.Set(tokenHeader, tc.token)
+		}
+		if tc.origin != "" {
+			req.Header.Set("Origin", tc.origin)
+		}
+		if tc.ctype != "" {
+			req.Header.Set("Content-Type", tc.ctype)
+		}
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, req)
+		if rr.Code != tc.want {
+			t.Errorf("%s: got %d want %d (%s)", tc.name, rr.Code, tc.want, strings.TrimSpace(rr.Body.String()))
+		}
+	}
+}
+
+// apiPost calls a POST endpoint as the window does.
+func apiPost(t *testing.T, c *controller, path, body string) (int, string) {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+	req.Host = "127.0.0.1:5000"
+	req.Header.Set(tokenHeader, c.token)
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	c.Handler().ServeHTTP(rr, req)
+	return rr.Code, rr.Body.String()
+}
+
+// A draft from the proxy dialog is checked as typed and not stored under
+// the saved proxy's name; an empty address is an error, not the saved one.
+func TestProbeDraftIsNotStored(t *testing.T) {
+	old := probeCheck
+	defer func() { probeCheck = old }()
+	var checked []string
+	probeCheck = func(_ context.Context, p config.Proxy) probe.Report {
+		checked = append(checked, p.Address)
+		return probe.Report{OK: true, Label: p.Address}
+	}
+	cfg := config.Default()
+	cfg.Proxies = []config.Proxy{{Name: "local", Type: "socks5", Address: "127.0.0.1:1080"}}
+	c := newController(filepath.Join(t.TempDir(), "config.json"), cfg, nil, hooks{})
+	code, body := apiPost(t, c, "/api/probe", `{"proxy":{"name":"local","type":"socks5","address":"127.0.0.1:9999"}}`)
+	if code != http.StatusOK || !strings.Contains(body, "127.0.0.1:9999") {
+		t.Fatalf("draft probe: %d %s", code, body)
+	}
+	if _, ok := c.checks["local"]; ok {
+		t.Fatal("a draft's result was stored under the saved proxy's name")
+	}
+	code, body = apiPost(t, c, "/api/probe", `{"proxy":{"name":"local","type":"socks5","address":""}}`)
+	if code == http.StatusOK || !strings.Contains(body, "Укажите адрес") {
+		t.Fatalf("empty draft: %d %s", code, body)
+	}
+	code, _ = apiPost(t, c, "/api/probe", `{"name":"local"}`)
+	if code != http.StatusOK || c.checks["local"].Label != "127.0.0.1:1080" {
+		t.Fatalf("named probe: %d %+v", code, c.checks["local"])
+	}
+	if len(checked) != 2 || checked[0] != "127.0.0.1:9999" || checked[1] != "127.0.0.1:1080" {
+		t.Fatalf("checked %v", checked)
+	}
+}
+
+// Results of deleted or renamed proxies go with the save.
+func TestChecksPrunedOnSave(t *testing.T) {
+	cfg := config.Default()
+	cfg.Proxies = []config.Proxy{{Name: "a", Type: "socks5", Address: "127.0.0.1:1080"}, {Name: "b", Type: "socks5", Address: "127.0.0.1:1081"}}
+	c := newController(filepath.Join(t.TempDir(), "config.json"), cfg, nil, hooks{})
+	c.checks["a"] = probe.Report{OK: true}
+	c.checks["b"] = probe.Report{OK: true}
+	next := config.Default()
+	next.Proxies = []config.Proxy{{Name: "a", Type: "socks5", Address: "127.0.0.1:1080"}, {Name: "c", Type: "socks5", Address: "127.0.0.1:1081"}}
+	if err := c.replace(next); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := c.checks["b"]; ok || len(c.checks) != 1 {
+		t.Fatalf("checks %v", c.checks)
+	}
+}
+
+// Check all answers with the checks and leaves the one-shot notice alone.
+func TestProbeAllKeepsNotice(t *testing.T) {
+	old := probeCheck
+	defer func() { probeCheck = old }()
+	probeCheck = func(_ context.Context, p config.Proxy) probe.Report { return probe.Report{OK: true, Label: p.Name} }
+	cfg := config.Default()
+	cfg.Proxies = []config.Proxy{{Name: "a", Type: "socks5", Address: "127.0.0.1:1080"}}
+	c := newController(filepath.Join(t.TempDir(), "config.json"), cfg, nil, hooks{})
+	c.setNotice("старая служба удалена")
+	code, body := apiPost(t, c, "/api/probe-all", `{}`)
+	if code != http.StatusOK || !strings.Contains(body, `"a":`) {
+		t.Fatalf("%d %s", code, body)
+	}
+	if st := c.snapshot(); st.Notice != "старая служба удалена" {
+		t.Fatalf("notice %q", st.Notice)
+	}
+}
+
+// A save the bridges or the engine did not fully take is still a save.
+func TestSavedAnswer(t *testing.T) {
+	got, err := savedAnswer(&applyWarning{msg: "порт занят"})
+	m, ok := got.(map[string]any)
+	if err != nil || !ok || m["warning"] != "порт занят" || m["ok"] != true {
+		t.Fatalf("%v %v", got, err)
+	}
+	if got, err := savedAnswer(errors.New("bad")); got != nil || err == nil {
+		t.Fatalf("%v %v", got, err)
+	}
+	if got, err := savedAnswer(nil); got != nil || err != nil {
+		t.Fatalf("%v %v", got, err)
+	}
+}
+
+// Autostart is read at the first state request and when the Settings page
+// asks, never on a timer.
+func TestAutostartReadOnDemand(t *testing.T) {
+	var mu sync.Mutex
+	reads := 0
+	c := newController(filepath.Join(t.TempDir(), "config.json"), config.Default(), nil, hooks{autostart: func() (bool, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		reads++
+		return reads > 1, nil
+	}})
+	count := func() int { mu.Lock(); defer mu.Unlock(); return reads }
+	if st := c.snapshot(); st.Autostart || count() != 1 {
+		t.Fatalf("first read: %v %d", st.Autostart, count())
+	}
+	c.mu.Lock()
+	c.autoAt = time.Now().Add(-time.Hour)
+	c.mu.Unlock()
+	c.snapshot()
+	if count() != 1 {
+		t.Fatal("autostart re-read by a plain poll")
+	}
+	c.askAuto()
+	deadline := time.Now().Add(3 * time.Second)
+	for !c.snapshot().Autostart && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !c.snapshot().Autostart || count() != 2 {
+		t.Fatalf("asked read: %d", count())
 	}
 }
 

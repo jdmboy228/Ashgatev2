@@ -8,12 +8,10 @@ let apQuery = "";
 let apSelected = new Set(); // rule indices chosen for grouping
 let apOpen = ""; // open popover: "route:r3", "menu:r3", "route:g:Name", "menu:g:Name"
 let apDrag = null; // unit key being dragged
-let apSaveChain = Promise.resolve();
 // apTele holds each row's live telemetry markup. Rows carry an empty cell
 // that is filled in place, so traffic updating every second does not
 // rebuild the list (that used to swallow clicks).
 let apTele = {};
-let apSaving = 0;
 
 function apGroups() {
   const c = cfg();
@@ -82,16 +80,15 @@ function apPruneGroups() {
   cfg().groups = apGroups().filter((g) => used.has(g.name));
 }
 
+// apSave saves at once. saveConfig queues saves and keeps the local rules
+// while one is in flight, so a poll cannot show an older list meanwhile.
 function apSave(message) {
   apPruneGroups();
   if (DEMO) { if (message) showToast(message); render(); return Promise.resolve(); }
-  apSaving++;
   render();
-  apSaveChain = apSaveChain.then(() => saveConfig({ rules: true, quiet: true }))
-    .then(() => { if (message) showToast(message); })
-    .catch((err) => { showToast(err.message); return refresh(); })
-    .finally(() => { apSaving--; });
-  return apSaveChain;
+  return saveConfig({ quiet: true })
+    .then((res) => { if (message && !(res && res.shown)) showToast(message); })
+    .catch((err) => { showToast(err.message); return refresh(); });
 }
 
 // ---------- routes ----------
@@ -217,6 +214,11 @@ function apMatches(r) {
   if (!q) return true;
   return String(r.process || "").toLowerCase().includes(q) || apLabel(r.process).toLowerCase().includes(q);
 }
+// apSelectable: a rule that «Выбрать все активные» picks. Grouped rules
+// take their group's place and cannot be picked.
+function apSelectable(r) {
+  return !(r.group && apGroup(r.group)) && apOn(r.enabled) && apMatches(r);
+}
 
 function fillApps() {
   const host = document.getElementById("ap-body");
@@ -240,7 +242,7 @@ function fillApps() {
   const activeCount = active.reduce((n, u) => n + (u.group ? u.members.filter((j) => apOn(rules[j].enabled)).length : 1), 0);
   const inactiveCount = rules.filter((r) => apMatches(r)).length - activeCount;
   const groupsOn = active.filter((u) => u.group).length;
-  const sel = apSelected.size ? apSelectionBar(activeCount) : "";
+  const sel = apSelected.size ? apSelectionBar(rules.filter(apSelectable).length) : "";
   const body = `${ksNotice()}${apKillBanner()}${sel}
     <div class="ap-sec"><div class="ap-sec-h"><span class="t">Активные правила</span><span class="c">${activeCount}</span>${groupsOn ? `<span class="g">(${groupsOn} ${groupWord(groupsOn)})</span>` : ""}</div>
     ${active.length ? `<div class="ap-list">${active.map((u) => apUnitHTML(u)).join("")}</div>` : `<div class="ap-none">${apQuery ? "Ничего не найдено." : "Нет активных правил. Включите правило ниже или добавьте приложение."}</div>`}</div>
@@ -289,8 +291,8 @@ function apKillBanner() {
   return `<div class="ap-alert">${icon("alert", 16)}<div class="txt"><b>Прокси не отвечает</b><span>${esc(names)}: ${ks ? "трафик заблокирован kill switch, напрямую не выпущен." : "соединения не устанавливаются."}</span><span class="err">${esc(err)}</span></div><button class="btn sm" type="button" data-act="goto" data-page="proxies">К прокси</button></div>`;
 }
 
-function apSelectionBar(activeCount) {
-  return `<div class="ap-selbar">${icon("folder", 16)}<div class="txt"><div><b>Выбрано правил: ${apSelected.size}</b> · <button type="button" class="link" data-act="ap-sel-all">Выбрать все активные (${activeCount})</button> · <button type="button" class="link dim" data-act="ap-sel-none">Снять выбор</button></div><p>Сгруппируйте их: общий тумблер и один маршрут для всех.</p></div>
+function apSelectionBar(selectable) {
+  return `<div class="ap-selbar">${icon("folder", 16)}<div class="txt"><div><b>Выбрано правил: ${apSelected.size}</b> · <button type="button" class="link" data-act="ap-sel-all">Выбрать все активные (${selectable})</button> · <button type="button" class="link dim" data-act="ap-sel-none">Снять выбор</button></div><p>Сгруппируйте их: общий тумблер и один маршрут для всех.</p></div>
   <button class="btn" type="button" data-act="ap-sel-none">Отмена</button><button class="btn pri" type="button" data-act="ap-group-new">${icon("folder", 14)}Сгруппировать (${apSelected.size})</button></div>`;
 }
 
@@ -533,7 +535,8 @@ function appsClick(id, act) {
       return fillApps();
     case "ap-gup":
     case "ap-gdown":
-      if (apMoveUnit("g:" + gname, id === "ap-gup" ? -1 : 1)) return apSave();
+      // The selection is by position: any reorder clears it.
+      if (apMoveUnit("g:" + gname, id === "ap-gup" ? -1 : 1)) { apSelected.clear(); return apSave(); }
       return fillApps();
     case "ap-edit": return apOpenEdit(i);
     case "ap-del": {
@@ -551,12 +554,14 @@ function appsClick(id, act) {
       rules.splice(i, 1);
       rules.splice(last, 0, r);
       if (!rules.some((x) => x.group === name)) cfg().groups = apGroups().filter((g) => g.name !== name);
+      apSelected.clear();
       return apSave(`«${apLabel(r.process)}» вынесено из группы`);
     }
     case "ap-gsplit": {
       const n = rules.filter((r) => r.group === gname).length;
       rules.forEach((r) => { if (r.group === gname) delete r.group; });
       cfg().groups = apGroups().filter((g) => g.name !== gname);
+      apSelected.clear();
       return apSave(`Группа «${gname}» разделена: ${n} ${appWord(n)} снова отдельно`);
     }
     case "ap-gdel":
@@ -571,7 +576,7 @@ function appsClick(id, act) {
       if (apSelected.has(i)) apSelected.delete(i); else apSelected.add(i);
       return fillApps();
     case "ap-sel-all":
-      rules.forEach((r, j) => { if (!r.group && apOn(r.enabled) && apMatches(r)) apSelected.add(j); });
+      rules.forEach((r, j) => { if (apSelectable(r)) apSelected.add(j); });
       return fillApps();
     case "ap-sel-none":
       apSelected.clear();
@@ -624,14 +629,16 @@ function apLoadApps(m) {
     ];
     return;
   }
-  apiFetch("/api/processes").then((r) => r.json()).then((list) => {
+  // An error answer is {error}, not a list: it must not end up in m.apps.
+  getJSON("/api/processes").then((list) => {
     if (modal !== m) return;
-    m.apps = list;
+    m.apps = Array.isArray(list) ? list : [];
+    apAutoPath(m);
     renderModal();
-  }).catch(() => {});
-  apiFetch("/api/installed").then((r) => r.json()).then((list) => {
+  }).catch(() => { if (modal === m) { m.apps = []; renderModal(); } });
+  getJSON("/api/installed").then((list) => {
     if (modal !== m) return;
-    m.installed = list;
+    m.installed = Array.isArray(list) ? list : [];
     apAutoPath(m);
     renderModal();
   }).catch(() => { if (modal === m) { m.installed = []; renderModal(); } });
@@ -648,8 +655,8 @@ function apOpenWindows() {
   if (DEMO) { apLoadApps(modal); renderModal(); return; }
   renderModal();
   const m = modal;
-  apiFetch("/api/processes").then((r) => r.json()).then((list) => { if (modal === m) { m.apps = list; renderModal(); } })
-    .catch(() => { if (modal === m) { m.apps = []; renderModal(); } });
+  getJSON("/api/processes").then((list) => { if (modal === m) { m.apps = Array.isArray(list) ? list : []; renderModal(); } })
+    .catch((err) => { if (modal === m) { m.apps = []; m.error = err.message; renderModal(); } });
 }
 function apOpenEdit(i) {
   const r = cfg().rules[i];
@@ -731,7 +738,8 @@ function apWindowsHTML() {
     return `<div class="ap-win">${appIconHTML(a.path, "width:28px;height:28px;border-radius:7px;font-size:12px")}<span class="txt"><span class="nm">${esc(a.title || a.name)}</span><span class="sub">${esc(a.name)} · PID ${a.pid} · ${esc(a.path)}</span></span>
       ${added ? `<span class="done">${icon("check", 14)}Уже в правилах</span>` : `<button class="btn sm pri" type="button" data-act="ap-win-add" data-name="${esc(a.name)}" data-path="${esc(a.path)}">Добавить</button>`}</div>`;
   }).join("");
-  const body = m.apps === null ? `<div class="ap-none">Загружаю окна…</div>` : rows || `<div class="ap-none">Открытых окон не найдено.</div>`;
+  const none = m.error ? "Не удалось получить список окон: " + m.error : "Открытых окон не найдено.";
+  const body = m.apps === null ? `<div class="ap-none">Загружаю окна…</div>` : rows || `<div class="ap-none">${esc(none)}</div>`;
   return `<div class="scrim"><form class="dialog ap-dlg" id="dlg">
     <div class="ap-dlg-h"><span class="ic">${icon("window", 16)}</span><div><h2>Запущенные окна Windows</h2><div class="dsub">Выберите программу, чтобы сразу добавить её в правила</div></div></div>
     <div class="body"><div class="ap-wins">${body}</div></div>
@@ -778,7 +786,29 @@ function apGroupNameHTML() {
 
 const AP_MODALS = { "ap-add": apAddHTML, "ap-windows": apWindowsHTML, "ap-edit": apEditHTML, "ap-group": apGroupNewHTML, "ap-gname": apGroupNameHTML };
 
-// apReadModal copies inputs into the modal before it is redrawn.
+// apInput copies a typed or chosen value into the open dialog's model at
+// once, so a redraw (lists arriving, a chip picked) never brings back older
+// text and values set by code (a chip, «Обзор…», a preset, the path found
+// for a name) are not overwritten by stale field contents. True when the
+// dialog should redraw.
+function apInput(el) {
+  const m = modal;
+  if (!m || !AP_MODALS[m.kind] || !el.id) return false;
+  switch (el.id) {
+    case "ap-add-q": m.q = el.value; apAutoPath(m); return true;
+    case "ap-add-path":
+      if (el.value !== m.path) { m.path = el.value; m.auto = false; }
+      return true;
+    case "ap-add-route":
+    case "ap-gnew-route": { const r = apReadRoute(el.id); m.action = r.action; m.proxy = r.proxy; return false; }
+    case "ap-gnew-name": m.name = el.value; return false;
+    case "ap-edit-v": m.value = el.value; return false;
+    case "ap-gname-v": m.name = el.value; return false;
+    default: return false;
+  }
+}
+
+// apReadModal copies all fields into the model on submit.
 function apReadModal() {
   if (!modal) return;
   const v = (id) => { const n = document.getElementById(id); return n ? n.value : null; };
@@ -803,7 +833,6 @@ function apReadModal() {
 
 function appsModalClick(id, act) {
   if (!modal) return;
-  apReadModal();
   switch (id) {
     case "ap-pick":
       modal.q = act.dataset.name;
@@ -813,17 +842,18 @@ function appsModalClick(id, act) {
     case "ap-add-children": modal.children = !modal.children; return renderModal();
     case "ap-add-ks": modal.ks = !modal.ks; return renderModal();
     case "ap-add-proto": modal.tcpOnly = act.dataset.value === "tcp"; return renderModal();
-    case "ap-browse":
+    case "ap-browse": {
       if (DEMO) return;
+      const m = modal;
+      // Cancel answers an empty path: nothing to say.
       return post("/api/browse").then((res) => {
-        if (res.path && modal && modal.kind === "ap-add") {
-          apReadModal();
-          modal.path = res.path;
-          modal.auto = false;
-          if (!modal.q.trim()) modal.q = apLabel(res.path);
-          renderModal();
-        }
-      }).catch((err) => { if (err.message && err.message !== "отменено") showToast(err.message); });
+        if (!res || !res.path || modal !== m) return;
+        m.path = res.path;
+        m.auto = false;
+        if (!m.q.trim()) m.q = apLabel(res.path);
+        renderModal();
+      }).catch((err) => showToast(err.message));
+    }
     case "ap-win-add": {
       const route = apDefaultRoute();
       const process = act.dataset.path || act.dataset.name;
@@ -934,16 +964,8 @@ function appsInput(e) {
     fillApps();
     return true;
   }
-  if (modal && modal.kind === "ap-add" && (e.target.id === "ap-add-q" || e.target.id === "ap-add-path")) {
-    apReadModal();
-    if (e.target.id === "ap-add-q") apAutoPath(modal);
-    // Redraw without losing the caret.
-    const id = e.target.id;
-    const pos = e.target.selectionStart;
-    renderModal();
-    const again = document.getElementById(id);
-    if (again) { again.focus(); try { again.setSelectionRange(pos, pos); } catch (err) { /* ignore */ } }
-    return true;
-  }
-  return false;
+  if (!modal || !AP_MODALS[modal.kind] || !e.target.closest("#modal")) return false;
+  // renderModal keeps the field, caret and scroll.
+  if (apInput(e.target)) renderModal();
+  return true;
 }

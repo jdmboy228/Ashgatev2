@@ -44,17 +44,15 @@ let frozen = null;
 let logFilter = "";
 let logProto = "all";
 let sel = { proxy: 0, rule: -1, log: "" };
-let dragging = false;
 let built = "";
-let lastErr = "";
 let lastBridge = "";
-let tipEl = null;
-let rulesDirty = false;
-let rulesSnapshot = "";
 let errorsOnly = false;
 let openErr = "";
+// probing counts the checks in flight per proxy name.
 let probing = {};
-let clipboardTried = false;
+let probeAllBusy = false;
+// powerBusy is set while a Start or Stop request runs.
+let powerBusy = false;
 let settingsTimer = null;
 
 function icon(name, size) {
@@ -107,7 +105,7 @@ function demoState() {
     theme: "dark",
     autostart: false,
     bridges: {
-      aeza: { socks: "127.0.0.1:10808", http: "127.0.0.1:10809", up: true },
+      aeza: { published: "127.0.0.1:10808", http: "127.0.0.1:10809", up: true },
     },
     checks: {
       aeza: { ok: true, udp: true, ms: 38, label: "38 мс", detail: "TCP и UDP" },
@@ -189,12 +187,11 @@ function paintChrome() {
   side.className = "side-card" + (running ? " run" : "");
   // The button is rebuilt only when the state flips; the live details go
   // into its tooltip in place, so clicks on it are not lost.
-  setHTML(side, `<button class="side-power" id="side-power" type="button" aria-label="${powerLabel}">${icon("power", 20)}</button>
+  setHTML(side, `<button class="side-power" id="side-power" type="button" aria-label="${powerLabel}"${powerBusy ? " disabled" : ""}>${icon("power", 20)}</button>
     <div class="side-state"><i class="dot"></i><span>${powerLabel}</span></div>`);
   const btn = document.getElementById("side-power");
   const tip = sideName + " · " + sideSub;
   if (btn && btn.title !== tip) btn.title = tip;
-  renderDirty();
 }
 
 function pageHTML() {
@@ -219,7 +216,7 @@ function logHTML() {
   <div class="head-actions"><button class="btn secondary" id="pause-btn" data-act="pause" type="button">${icon("pause")}Пауза</button><button class="btn ghost secondary" data-act="clear" type="button">${icon("trash")}Очистить экран</button>${headMore()}</div></div>
   <div class="tools"><label class="field search" style="width:268px">${icon("search")}<input id="log-filter" placeholder="Процесс, адрес или прокси" value="${esc(logFilter)}"></label>
   <div class="seg" id="log-seg">${["Все", "TCP", "UDP"].map((n, i) => `<button type="button" data-act="proto" data-value="${["all", "TCP", "UDP"][i]}" class="${logProto === ["all", "TCP", "UDP"][i] ? "on" : ""}">${n}</button>`).join("")}</div>
-  <span class="onlyerr">Только ошибки <button class="toggle${onlyOn}" type="button" data-act="errors-only" aria-pressed="${errorsOnly ? "true" : "false"}"><i></i></button></span>
+  <span class="onlyerr">Только ошибки <button class="toggle${onlyOn}" type="button" data-act="errors-only" aria-pressed="${errorsOnly ? "true" : "false"}" aria-label="Только ошибки"><i></i></button></span>
   <div class="live" id="live"><i></i><span></span></div></div>
   <div class="pause-banner" id="pause-banner" hidden></div>
   <div id="log-table"></div>`;
@@ -234,23 +231,23 @@ function settingsHTML() {
   return `<div class="head"><div><h1>Настройки</h1><p class="sub">Применяются сразу · ${esc(state.path || "config.json")}</p></div>
   <div class="head-actions"><button class="btn ghost" data-act="open-folder" type="button">${icon("folder")}Открыть папку</button></div></div>
   ${group("DNS", [
-    row("globe", "DNS приложений через прокси", "Порт 53 выбранных приложений уходит через прокси их правила", toggle("dns", dnsOn)),
-    row("server", "DNS-серверы", "Куда отправлять эти запросы", `<input class="mono" id="dns-servers" value="${esc((c.dns.servers || []).join(", "))}" ${dnsOn ? "" : "disabled"}>`),
-    row("sliders", "DNS Windows через туннель", "Имена, которые программы спрашивают у Windows (svchost.exe), идут через прокси, кроме исключений и .ru, .рф, .su. Пока туннель не работает, они не разрешаются", `${select("sys-proxy", names, selProxy, !sys, "Авто")}${toggle("sys", sys)}`),
+    row("globe", "DNS приложений через прокси", "Порт 53 выбранных приложений уходит через прокси их правила", toggle("dns", dnsOn, "DNS приложений через прокси")),
+    row("server", "DNS-серверы", "Куда отправлять эти запросы", `<input class="mono" id="dns-servers" aria-label="DNS-серверы" value="${esc((c.dns.servers || []).join(", "))}" ${dnsOn ? "" : "disabled"}>`),
+    row("sliders", "DNS Windows через туннель", "Имена, которые программы спрашивают у Windows (svchost.exe), идут через прокси, кроме исключений. Пока туннель не работает, они не разрешаются", `${select("sys-proxy", names, selProxy, !sys, "Авто", "Прокси для DNS Windows")}${toggle("sys", sys, "DNS Windows через туннель")}`),
   ])}
   ${group("Защита от утечек", [
-    row("shield", "Kill switch", "Приложения с правилом «прокси» и их дочерние процессы никогда не выходят в сеть напрямую. Пока перехват выключен или Ashgate закрыт, Брандмауэр Windows отключает их от сети", toggle("kill", !!c.killSwitch), true),
+    row("shield", "Kill switch", "Приложения с правилом «прокси» и их дочерние процессы никогда не выходят в сеть напрямую. Пока перехват выключен или Ashgate закрыт, Брандмауэр Windows отключает их от сети", toggle("kill", !!c.killSwitch, "Kill switch"), true),
   ])}
   ${group("UDP и сеть", [
     row("swap", "UDP, который прокси не умеет", "Для HTTP-прокси: QUIC и игры. «Блокировать» не даёт обойти прокси", segCtrl("udp", ["Блокировать", "Напрямую"], ["block", "direct"], udp)),
-    row("link", "Не проксировать частные сети", "10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, fc00::/7 — напрямую", toggle("bypass", !!c.bypassPrivate)),
+    row("link", "Не проксировать частные сети", "10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, fc00::/7 — напрямую", toggle("bypass", !!c.bypassPrivate, "Не проксировать частные сети")),
   ])}
   ${group("Исключения", [
-    row("link", "Напрямую, без VLESS", "По одному домену в строке, поддомены тоже. Эти сайты открываются напрямую, даже если правило приложения ведёт через VLESS, и их имена разрешает DNS провайдера. .ru, .рф и .su — всегда напрямую", `<div class="field" style="width:240px"><textarea class="mono" id="direct-domains" rows="6" spellcheck="false">${esc((c.directDomains || []).join("\n"))}</textarea></div>`),
+    row("link", "Напрямую, без VLESS", "По одному домену в строке, поддомены тоже. Эти сайты открываются напрямую, даже если правило приложения ведёт через VLESS, и их имена разрешает DNS провайдера", `<div class="field" style="width:240px"><textarea class="mono" id="direct-domains" aria-label="Домены напрямую" rows="6" spellcheck="false">${esc((c.directDomains || []).join("\n"))}</textarea></div>`),
   ])}
   ${group("Запуск и журнал", [
-    row("rocket", "Запускать с Windows", "При входе в систему открывается окно и включается перехват", toggle("auto", !!state.autostart)),
-    row("doc", "Подробный журнал", "Уровень debug вместо info в ashgate.log", toggle("verbose", c.log && c.log.level === "debug")),
+    row("rocket", "Запускать с Windows", "При входе в систему открывается окно и включается перехват", toggle("auto", !!state.autostart, "Запускать с Windows")),
+    row("doc", "Подробный журнал", "Уровень debug вместо info в ashgate.log", toggle("verbose", c.log && c.log.level === "debug", "Подробный журнал")),
   ])}
   ${group("О программе", [aboutRow(), updateRow()])}`;
 }
@@ -317,18 +314,18 @@ const SET_COLORS = { globe: "blue", server: "teal", sliders: "violet", shield: "
 function row(ic, title, desc, ctl, warn, id) {
   return `<div class="set"${id ? ` id="${id}"` : ""}><span class="sico c-${SET_COLORS[ic] || "blue"}">${icon(ic, 20)}</span><div class="txt"><div class="t">${esc(title)}</div><div class="d${warn ? " warn" : ""}">${esc(desc)}</div></div><div class="ctl">${ctl}</div></div>`;
 }
-function toggle(key, on) {
-  return `<button class="toggle${on ? " on" : ""}" type="button" data-act="toggle" data-key="${key}" aria-pressed="${on ? "true" : "false"}"><i></i></button>`;
+function toggle(key, on, label) {
+  return `<button class="toggle${on ? " on" : ""}" type="button" data-act="toggle" data-key="${key}" aria-pressed="${on ? "true" : "false"}" aria-label="${esc(label)}"><i></i></button>`;
 }
 function segCtrl(key, labels, values, active) {
   return `<div class="seg">${labels.map((l, i) => `<button type="button" data-act="seg" data-key="${key}" data-value="${values[i]}" class="${i === active ? "on" : ""}">${l}</button>`).join("")}</div>`;
 }
 // select lists proxy names; auto, when given, is a first option with an
 // empty value.
-function select(id, names, value, disabled, auto) {
+function select(id, names, value, disabled, auto, label) {
   let opts = names.map((n) => `<option value="${esc(n)}" ${n === value ? "selected" : ""}>${esc(n)}</option>`).join("");
   if (auto) opts = `<option value="" ${value ? "" : "selected"}>${esc(auto)}</option>` + opts;
-  return `<select id="${id}" ${disabled ? "disabled" : ""}>${opts || `<option value="">нет прокси</option>`}</select>`;
+  return `<select id="${id}"${label ? ` aria-label="${esc(label)}"` : ""} ${disabled ? "disabled" : ""}>${opts || `<option value="">нет прокси</option>`}</select>`;
 }
 
 function fillPage() {
@@ -336,6 +333,37 @@ function fillPage() {
   if (page === "proxies") fillProxies();
   if (page === "rules") fillApps();
   if (page === "log") fillLog();
+  if (page === "settings") fillSettings();
+}
+// fillSettings redraws Settings from the server's config, so a rejected
+// save does not leave its values on screen. Never under the user's hands:
+// not while an edit waits to be saved or is saving, nor while a field is
+// being typed in.
+function fillSettings() {
+  const host = document.getElementById("page");
+  if (!host || built !== "settings" || settingsPending || settingsSaving > 0) return;
+  const a = document.activeElement;
+  const inside = a && a !== document.body && host.contains(a);
+  if (inside && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName)) return;
+  const html = settingsHTML();
+  if (host._html === html) return;
+  const key = inside ? focusKey(a) : "";
+  host.innerHTML = html;
+  host._html = html;
+  const back = key && host.querySelector(key);
+  if (back) back.focus({ preventScroll: true });
+}
+// focusKey is a selector that finds an element again after a redraw: its
+// id, or its action and data attributes.
+function focusKey(el) {
+  if (!el || el === document.body) return "";
+  if (el.id) return "#" + CSS.escape(el.id);
+  if (!el.dataset || !el.dataset.act) return "";
+  let s = `[data-act="${CSS.escape(el.dataset.act)}"]`;
+  for (const k of ["key", "value", "i", "name", "path", "target", "group"]) {
+    if (el.dataset[k] !== undefined) s += `[data-${k}="${CSS.escape(el.dataset[k])}"]`;
+  }
+  return s;
 }
 
 // ksNotice is the kill switch notice at the top of the Apps tab. It shows
@@ -368,7 +396,7 @@ function killBanner(ks) {
   }
   const miss = missing.length ? `<p class="miss">Не найден exe: ${esc(missing.join(", "))}. Пока перехват выключен, эти программы не блокируются — запустите их или укажите полный путь в правиле.</p>` : "";
   const err = ks.error ? `<p class="miss">Брандмауэр: ${esc(ks.error)}</p>` : "";
-  const btn = !state.running ? `<button class="btn pri sm" type="button" data-act="ks-start">${icon("power", 14)}Старт</button>` : "";
+  const btn = !state.running ? `<button class="btn pri sm" type="button" data-act="ks-start"${powerBusy ? " disabled" : ""}>${icon("power", 14)}Старт</button>` : "";
   return `<div class="${cls}">${icon("shield", 18)}<div class="txt"><strong>${esc(title)}</strong><p>${esc(text)}</p>${miss}${err}</div>${btn}</div>`;
 }
 function progWord(n) {
@@ -381,6 +409,8 @@ function progWord(n) {
 function fillProxies() {
   const host = document.getElementById("proxy-table");
   if (!host) return;
+  const all = document.querySelector('[data-act="probe-all"]');
+  if (all) all.disabled = probeAllBusy;
   const list = cfg().proxies || [];
   if (!list.length) {
     setHTML(host, `<div class="empty-card"><h3>Прокси ещё нет</h3><p>Добавьте SOCKS5, HTTP, ссылку vless:// или подписку 3x-ui.</p><button class="btn pri" type="button" data-act="proxy-add">${icon("plus")}Добавить прокси</button></div>`);
@@ -397,7 +427,7 @@ function fillProxies() {
       : "";
     return `<div class="prow${selected ? " sel" : ""}" data-act="sel-proxy" data-i="${i}">
       <span class="ptype k-${esc(p.type || "socks5")}" title="${esc(p.subscription ? "Подписка" : proxyTypeLabel(p.type))}">${icon(p.subscription ? "link" : typeIconName(p.type), 16)}</span>
-      <div class="stack"><span class="main">${esc(p.name)}</span><span class="sub">${esc((p.subscription ? "Подписка" : proxyTypeLabel(p.type)) + " · " + proxySub(p))}</span></div>
+      <div class="stack"><span class="main">${esc(p.name)}</span><span class="sub">${esc((p.subscription ? "Подписка" : proxyTypeLabel(p.type)) + " · " + proxySub(p))}</span>${p.subscription ? subNarrow(p) : ""}</div>
       <div class="paddr mono">${proxyAddrCell(p)}</div>
       <div class="checkcell">${badge(view.label, view.kind, true, view.detail || view.label)}${why}</div>
       <div class="row-actions">${acts}<button class="iconbtn" data-act="menu-proxy" data-i="${i}" type="button" aria-label="Ещё" title="Ещё">${icon("more")}</button></div>
@@ -436,7 +466,8 @@ function appIconHTML(process, style) {
   // Names without an icon are remembered, so a redraw does not ask again.
   if (iconMisses.has(path.toLowerCase())) return `<span class="appicon"${st}>${letter}</span>`;
   const src = "/api/icon?path=" + encodeURIComponent(path) + "&t=" + encodeURIComponent(TOKEN);
-  return `<span class="appicon"${st}><img alt="" src="${esc(src)}" data-key="${esc(path.toLowerCase())}" onload="this.parentNode.classList.add('hasimg')" onerror="iconMiss(this)">${letter}</span>`;
+  // draggable=false: a dragged icon would carry its URL, token included.
+  return `<span class="appicon"${st}><img alt="" draggable="false" src="${esc(src)}" data-key="${esc(path.toLowerCase())}" onload="this.parentNode.classList.add('hasimg')" onerror="iconMiss(this)">${letter}</span>`;
 }
 
 function eventKey(e) {
@@ -509,7 +540,9 @@ function render() {
     const tray = document.getElementById("tray");
     tray.hidden = false;
     if (tray.dataset.built !== "1") { tray.innerHTML = trayHTML(); tray.dataset.built = "1"; }
-    document.getElementById("modal").innerHTML = "";
+    const root = document.getElementById("modal");
+    root.innerHTML = "";
+    root.drawnFor = null;
     return;
   }
   document.getElementById("app").hidden = false;
@@ -517,44 +550,64 @@ function render() {
   paintChrome();
   const host = document.getElementById("page");
   if (built !== page) {
-    host.innerHTML = pageHTML();
+    const html = pageHTML();
+    host.innerHTML = html;
+    host._html = html;
     host.dataset.page = page;
+    // The autostart task is read again when Settings opens, not on a timer.
+    if (page === "settings") askAuto = true;
     built = page;
   }
-  if (!modal && !dragging) fillPage();
-  renderModal();
+  // The page behind an open dialog stays current. The dialog itself is
+  // drawn when it opens or closes, never by a poll: that used to drop what
+  // was typed. Only its live SOCKS status is updated in place.
+  fillPage();
+  if (document.getElementById("modal").drawnFor !== modal) renderModal();
+  else paintSocksPreview();
   if (state.error) showToast(state.error);
 }
 
 function renderModal() {
   const root = document.getElementById("modal");
   if (!modal) { root.innerHTML = ""; root.drawnFor = null; return; }
-  // A redraw of the same dialog (its app lists arrived, a save finished)
-  // keeps what was typed and the field and caret the user is in.
+  // Typed text is in the model already (see the input handlers), so a
+  // redraw never reads the fields back and values set by code win. A redraw
+  // of the same dialog keeps the focused control, caret and scroll and does
+  // not replay the opening animation.
   const again = root.drawnFor === modal;
   const el = again && root.contains(document.activeElement) ? document.activeElement : null;
-  const id = el && el.id;
-  let sel = null;
-  try { sel = el ? [el.selectionStart, el.selectionEnd] : null; } catch (e) { sel = null; }
-  if (again && AP_MODALS[modal.kind]) apReadModal();
+  const key = focusKey(el);
+  let range = null;
+  try { range = el && typeof el.selectionStart === "number" ? [el.selectionStart, el.selectionEnd] : null; } catch (e) { range = null; }
+  const oldBody = again ? root.querySelector(".dialog .body") : null;
+  const scroll = oldBody ? oldBody.scrollTop : 0;
   if (modal.kind === "proxy") root.innerHTML = proxyDialog();
   else if (AP_MODALS[modal.kind]) root.innerHTML = AP_MODALS[modal.kind]();
   else if (modal.kind === "confirm" || modal.kind === "alert") root.innerHTML = confirmDialog();
   root.drawnFor = modal;
-  const back = id && document.getElementById(id);
+  if (!again) {
+    const first = root.querySelector("[autofocus]");
+    if (first) first.focus();
+    return;
+  }
+  const dlg = root.querySelector(".dialog");
+  if (dlg) dlg.classList.add("steady");
+  const body = root.querySelector(".dialog .body");
+  if (body) body.scrollTop = scroll;
+  const back = key && root.querySelector(key);
   if (back) {
-    back.focus();
-    if (sel && sel[0] !== null && sel[0] !== undefined) { try { back.setSelectionRange(sel[0], sel[1]); } catch (e) { /* not a text field */ } }
+    back.focus({ preventScroll: true });
+    if (range) { try { back.setSelectionRange(range[0], range[1]); } catch (e) { /* not a text field */ } }
   }
 }
 function confirmDialog() {
   const alert = modal.kind === "alert";
   const okCls = modal.danger ? "btn danger" : "btn pri";
   const buttons = alert
-    ? `<button class="btn pri" type="submit">Понятно</button>`
+    ? `<button class="btn pri" type="submit" autofocus>Понятно</button>`
     : `<button class="${okCls}" type="submit">${esc(modal.ok || "Удалить")}</button><button class="btn" type="button" data-act="cancel">Отмена</button>`;
   return `<div class="scrim"><form class="dialog narrow" id="dlg"><h2>${esc(modal.title || "")}</h2>
-    <div class="body"><p class="confirm-text">${esc(modal.text || "")}</p></div>
+    <div class="body"><p class="confirm-text selectable">${esc(modal.text || "")}</p></div>
     <div class="footer">${buttons}</div></form></div>`;
 }
 
@@ -566,7 +619,8 @@ function proxyTypeLabel(t) {
 function proxyDialog() {
   const p = modal.draft;
   const type = p.subscription ? "sub" : p.type || "socks5";
-  // A saved subscription stays one; the type of other proxies can change.
+  // A saved subscription stays one (its button does nothing); the type of
+  // other proxies can change.
   const types = p.subscription ? [["sub", "Подписка"]] : [["socks5", "SOCKS5"], ["http", "HTTP"], ["vless", "VLESS"], ["sub", "Подписка"]];
   const vless = type === "vless";
   const sub = type === "sub";
@@ -608,8 +662,9 @@ function serverWord(n) {
   return n + " серверов";
 }
 function subUpdated(s) {
-  if (!s.updatedAt) return "ещё не обновлялась";
-  const d = new Date(s.updatedAt);
+  // Go writes a zero time as 0001-01-01: never updated.
+  const d = new Date(s.updatedAt || 0);
+  if (!s.updatedAt || Number.isNaN(d.getTime()) || d.getFullYear() < 2000) return "ещё не обновлялась";
   return "обновлена " + d.toLocaleString("ru-RU", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" });
 }
 function refreshSub(name) {
@@ -653,7 +708,7 @@ function vlessFields(p) {
       </div>`;
 }
 function vlessLocal(p) {
-  const port = p.socksPort ? String(p.socksPort) : "";
+  const port = modal.socksText !== undefined ? modal.socksText : p.socksPort ? String(p.socksPort) : "";
   return `<div class="socks-box">
       <label class="lbl">Локальный SOCKS5-порт</label>
       <div class="field${modal.portError ? " bad" : ""}"><input class="mono" id="p-socks" inputmode="numeric" placeholder="10808" value="${esc(port)}"></div>
@@ -667,8 +722,18 @@ function vlessLocal(p) {
     </div>`;
 }
 function socksPreviewHTML(p) {
+  return `<div id="socks-preview" class="socks-pub">${socksPreviewInner(p)}</div>`;
+}
+// paintSocksPreview updates the open proxy dialog's SOCKS status in place.
+function paintSocksPreview() {
+  if (!modal || modal.kind !== "proxy") return;
+  setHTML(document.getElementById("socks-preview"), socksPreviewInner(modal.draft));
+}
+// socksPreviewInner shows the published port and its login. The password
+// is masked like its field; «Копировать» still copies it.
+function socksPreviewInner(p) {
   const port = Number(p.socksPort) || 0;
-  if (!port || port < 1 || port > 65535) return `<div id="socks-preview"></div>`;
+  if (!port || port < 1 || port > 65535) return "";
   const socks = "127.0.0.1:" + port;
   const http = port < 65535 ? "127.0.0.1:" + (port + 1) : "";
   const live = (state && state.bridges && state.bridges[p.name]) || {};
@@ -678,13 +743,12 @@ function socksPreviewHTML(p) {
   else if (live.error) { mark = "bad"; text = live.error; }
   const user = p.localUser || live.user || "";
   const pass = p.localUser ? p.localPass || "" : live.pass || "";
-  const loginRow = user ? `<div class="row"><span class="addr">${esc(user)} / ${esc(pass)}</span><button class="btn sm" type="button" data-act="copy-text" data-text="${esc(user + ":" + pass + "@" + socks)}">Копировать</button><span class="sub">логин / пароль</span></div>` : "";
+  const masked = pass ? "••••••••" : "";
+  const loginRow = user ? `<div class="row"><span class="addr">${esc(user)} / ${masked || "—"}</span><button class="btn sm" type="button" data-act="copy-text" data-text="${esc(user + ":" + pass + "@" + socks)}" data-shown="${esc(user + ":" + masked + "@" + socks)}">Копировать</button><span class="sub">логин / пароль</span></div>` : "";
   const httpRow = http ? `<div class="row"><span class="addr">${esc(http)}</span><button class="btn sm" type="button" data-act="copy-text" data-text="${esc(http)}">Копировать</button><span class="sub">HTTP</span></div>` : "";
-  return `<div id="socks-preview" class="socks-pub">
-      <div class="row"><span class="addr">${esc(socks)}</span><button class="btn sm" type="button" data-act="copy-text" data-text="${esc(socks)}">Копировать</button><span class="sockline"><i class="${mark}"></i><span class="sub">${esc(text)}</span></span></div>
+  return `<div class="row"><span class="addr">${esc(socks)}</span><button class="btn sm" type="button" data-act="copy-text" data-text="${esc(socks)}">Копировать</button><span class="sockline"><i class="${mark}"></i><span class="sub">${esc(text)}</span></span></div>
       ${httpRow}
-      ${loginRow}
-    </div>`;
+      ${loginRow}`;
 }
 function proxyAddrText(p) {
   if (p.subscription) {
@@ -705,6 +769,15 @@ function subAddrCell(p) {
   return `<div class="sockline" title="${esc(status)}"><i class="${err ? "bad" : v.active ? "ok" : "wait"}"></i><span>${esc(v.active || "нет серверов")}</span>
       <button class="btn sm" type="button" data-act="sub-refresh" data-name="${esc(p.name)}"${v.fetching ? " disabled" : ""}>${icon("refresh", 14)}Обновить</button></div>
     ${why}<div class="sub${err ? " warn" : ""}">${esc(status)}</div>`;
+}
+// subNarrow repeats a subscription's active server or update error under
+// its name when the window is too narrow for the address column.
+function subNarrow(p) {
+  const s = p.subscription || {};
+  const v = (state && state.subs && state.subs[p.name]) || {};
+  const err = v.error || s.error || "";
+  const text = v.fetching ? "обновляется…" : err ? "Ошибка обновления: " + err : v.active || "нет серверов";
+  return `<span class="sub only-narrow${err ? " warn" : ""}">${esc(text)}</span>`;
 }
 function proxyAddrCell(p) {
   if (p.subscription) return subAddrCell(p);
@@ -754,7 +827,9 @@ function probeView(p) {
   if ((check.ms || 0) >= 300) return { kind: "warn", label: "медленно", detail: check.label || "" };
   return { kind: "ok", label: check.label || "ок", detail: "" };
 }
-async function copyText(text) {
+// copyText copies text; shown, when given, is what the toast says instead
+// (a login with its password masked).
+async function copyText(text, shown) {
   if (!text) return;
   try {
     await navigator.clipboard.writeText(text);
@@ -769,7 +844,7 @@ async function copyText(text) {
     document.execCommand("copy");
     ta.remove();
   }
-  showToast("Скопировано: " + text);
+  showToast("Скопировано: " + (shown || text));
 }
 function vinput(id, label, value, span) {
   return `<div class="${span ? "span2" : ""}"><label class="lbl">${label}</label><div class="field"><input class="mono" id="${id}" value="${esc(value || "")}"></div></div>`;
@@ -821,86 +896,80 @@ async function post(path, body) {
   if (!r.ok) throw new Error(data.error || "ошибка");
   return data;
 }
-function rulesJSON() {
-  return JSON.stringify(cfg().rules || []);
-}
-function rememberRules() {
-  rulesSnapshot = rulesJSON();
-  rulesDirty = false;
-  renderDirty();
-}
-function unsavedLabel(n) {
-  const m10 = n % 10;
-  const m100 = n % 100;
-  let word = "несохранённых изменений";
-  if (m10 === 1 && m100 !== 11) word = "несохранённое изменение";
-  else if (m10 >= 2 && m10 <= 4 && (m100 < 12 || m100 > 14)) word = "несохранённых изменения";
-  return n + " " + word;
-}
-function dirtyHint() {
-  let prev = [];
-  try { prev = JSON.parse(rulesSnapshot || "[]"); } catch (e) { prev = []; }
-  const cur = cfg().rules || [];
-  const bits = [];
-  if (prev.map((r) => r.process).join("|") !== cur.map((r) => r.process).join("|")) bits.push("порядок изменён");
-  cur.forEach((r) => {
-    const was = prev.find((p) => p.process === r.process);
-    if (was && (was.enabled === false) !== (r.enabled === false)) bits.push((r.enabled === false ? "выключено " : "включено ") + appLabel(r.process));
-  });
-  const had = new Set(prev.map((r) => r.process));
-  cur.forEach((r) => { if (!had.has(r.process)) bits.push("добавлено " + appLabel(r.process)); });
-  prev.forEach((r) => { if (!cur.some((c) => c.process === r.process)) bits.push("убрано " + appLabel(r.process)); });
-  return bits.slice(0, 3).join(", ") || "Есть несохранённые правки";
-}
-function renderDirty() {
-  const bar = document.getElementById("dirtybar");
-  if (!bar) return;
-  if (page !== "rules" || !rulesDirty) { bar.hidden = true; return; }
-  let n = 1;
-  try {
-    const prev = JSON.parse(rulesSnapshot || "[]");
-    n = Math.max(1, Math.abs((cfg().rules || []).length - prev.length) || 1);
-    const changed = (cfg().rules || []).filter((r, i) => JSON.stringify(r) !== JSON.stringify(prev[i])).length;
-    if (changed) n = changed;
-  } catch (e) { /* keep 1 */ }
-  bar.hidden = false;
-  setHTML(bar, `<div><div class="t">${esc(unsavedLabel(n))}</div><div class="d">${esc(dirtyHint())} · Ctrl+S</div></div><div class="actions"><button class="btn" type="button" data-act="rules-revert">Отменить</button><button class="btn pri" type="button" data-act="rules-save">Сохранить</button></div>`);
+// getJSON reads a GET endpoint; an error answer throws with its text.
+async function getJSON(path) {
+  const r = await apiFetch(path);
+  const data = await r.json().catch(() => null);
+  if (!r.ok) throw new Error((data && data.error) || "ошибка");
+  return data;
 }
 let reqSeq = 0;
 let shownSeq = 0;
+// cfgSaving counts config saves queued or in flight; cfgSeq is the last
+// request asked before the newest save landed. Answers to those may
+// predate the save, so they keep the local config.
+let cfgSaving = 0;
+let cfgSeq = 0;
+let failedPolls = 0;
+// shownErr is the server error last shown (or dismissed) as an alert.
+let shownErr = "";
+// askAuto makes the next state request read the autostart task again.
+let askAuto = false;
 async function refresh() {
   if (DEMO) { render(); return; }
   const seq = ++reqSeq;
+  const auto = askAuto;
+  askAuto = false;
+  let next;
   try {
     // With the last generation the server skips the event list when no
     // connection was logged since.
     const gen = state && state.events ? state.generation || 0 : 0;
-    const r = await apiFetch("/api/state?gen=" + gen);
-    if (!r.ok) return;
-    const next = await r.json();
-    // Requests can overlap (poll plus a save); never show an older answer
-    // over a newer one.
-    if (seq < shownSeq) return;
-    shownSeq = seq;
-    if (next.eventsSame) next.events = (state && state.events) || [];
-    const err = next.error;
-    next.error = "";
-    // While an Apps-tab save is in flight, keep the local rules and groups:
-    // this answer may predate it.
-    const keep = (rulesDirty || apSaving > 0) && state ? cfg().rules : null;
-    const keepGroups = apSaving > 0 && state ? cfg().groups : undefined;
-    state = next;
-    if (keep) state.config.rules = keep;
-    if (keepGroups !== undefined) state.config.groups = keepGroups;
-    else rememberRules();
-    if (!paused) frozen = null;
-    render();
-    if (next.notice && err && err !== lastErr) showToast(next.notice + "\n" + err);
-    else if (next.notice) showToast(next.notice);
-    else if (err && err !== lastErr) showToast(err);
-    lastErr = err || "";
-    noteBridge();
-  } catch (e) { /* keep the last frame */ }
+    const signal = AbortSignal.timeout ? AbortSignal.timeout(5000) : undefined;
+    const r = await apiFetch("/api/state?gen=" + gen + (auto ? "&auto=1" : ""), { signal });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    next = await r.json();
+  } catch (e) {
+    // A dead or hung backend: after a few misses say so, instead of
+    // showing the last frame as if it were live.
+    if (auto) askAuto = true;
+    failedPolls++;
+    setOffline(failedPolls >= 3);
+    return;
+  }
+  failedPolls = 0;
+  setOffline(false);
+  // Requests can overlap (poll plus a save); never show an older answer
+  // over a newer one.
+  if (seq < shownSeq) return;
+  shownSeq = seq;
+  if (next.eventsSame) next.events = (state && state.events) || [];
+  const err = next.error || "";
+  next.error = "";
+  const keep = state && (cfgSaving > 0 || seq <= cfgSeq) ? state.config : null;
+  state = next;
+  if (keep) state.config = keep;
+  if (!paused) frozen = null;
+  render();
+  if (next.notice) showToast(next.notice);
+  noteError(err);
+  noteBridge();
+}
+function setOffline(on) {
+  const el = document.getElementById("offline");
+  if (el && el.hidden === on) el.hidden = !on;
+}
+// noteError shows a start or capture error (Start from the tray or at
+// logon, a session that failed) until it is dismissed or capture starts.
+function noteError(err) {
+  if (!err) {
+    shownErr = "";
+    if (modal && modal.errAlert) { modal = null; renderModal(); }
+    return;
+  }
+  if (err === shownErr || modal || state.hidden) return;
+  shownErr = err;
+  showStartError(err, "Ошибка");
 }
 function bridgeNote() {
   const bridges = (state && state.bridges) || {};
@@ -911,6 +980,9 @@ function bridgeNote() {
   });
   return msgs.join("\n");
 }
+// quietBridge is set while a save that already warned refreshes, so the
+// same bridge error does not pop up again as an alert.
+let quietBridge = false;
 function noteBridge() {
   const note = bridgeNote();
   if (!note) {
@@ -919,72 +991,111 @@ function noteBridge() {
   }
   if (note === lastBridge || modal) return;
   lastBridge = note;
+  if (quietBridge) return;
   showAlert(/занят/.test(note) ? "Порт занят" : "Локальный мост VLESS", note);
 }
-async function saveConfig(extra) {
+// Saves run one at a time, each sending the config as it is when its turn
+// comes, so a later save carries the earlier edits too.
+let saveChain = Promise.resolve();
+let lastWarning = "";
+function saveConfig(extra) {
   extra = extra || {};
-  const bodyCfg = JSON.parse(JSON.stringify(cfg()));
-  if (rulesDirty && !extra.rules && rulesSnapshot) {
-    try { bodyCfg.rules = JSON.parse(rulesSnapshot); } catch (e) { /* send current */ }
+  cfgSaving++;
+  const run = () => saveNow(extra);
+  const p = saveChain.then(run, run);
+  saveChain = p.catch(() => {});
+  return p;
+}
+async function saveNow(extra) {
+  let res;
+  try {
+    if (DEMO) {
+      showToast("Демонстрация: сохранение выключено");
+      return {};
+    }
+    const body = { config: JSON.parse(JSON.stringify(cfg())) };
+    if ("autostart" in extra) body.autostart = extra.autostart;
+    res = await post("/api/config", body);
+  } finally {
+    cfgSaving--;
+    cfgSeq = reqSeq;
   }
-  const body = { config: bodyCfg };
-  if ("autostart" in extra) body.autostart = extra.autostart;
-  if (DEMO) {
-    if (extra.rules) rememberRules();
-    showToast("Демонстрация: сохранение выключено");
-    return;
-  }
-  const dirtyRules = rulesDirty && !extra.rules ? cfg().rules : null;
-  await post("/api/config", body);
-  if (!extra.quiet) showToast("Сохранено");
-  await refresh();
-  if (dirtyRules && state) {
-    state.config.rules = dirtyRules;
-    rulesDirty = true;
-    render();
-  } else if (extra.rules) rememberRules();
+  // Saved, but a bridge or the engine did not take it all (a busy port):
+  // a warning, not a failure, and not repeated on every later save.
+  const warn = (res && res.warning) || "";
+  if (warn && warn !== lastWarning) { showToast("Сохранено. " + warn); res.shown = true; }
+  else if (!extra.quiet) showToast("Сохранено");
+  lastWarning = warn;
+  quietBridge = !!warn;
+  try { await refresh(); } finally { quietBridge = false; }
+  return res;
 }
 function showToast(text) {
-  if (text && /порт/i.test(text) && /занят/i.test(text)) {
-    showAlert("Порт занят", text);
-    return;
-  }
   const t = document.getElementById("toast");
   t.hidden = false;
   t.textContent = text;
   clearTimeout(showToast._t);
-  showToast._t = setTimeout(() => { t.hidden = true; }, 3200);
+  // Long messages (an error with a path in it) stay longer.
+  showToast._t = setTimeout(() => { t.hidden = true; }, Math.min(8000, 3200 + String(text || "").length * 30));
 }
 function closeMenu() { document.getElementById("menu").hidden = true; }
-function openMenu(x, y, items) {
+// openMenu opens a menu under its button, also when opened from the
+// keyboard (a click without a mouse position used to put it at 0,0).
+function openMenu(anchor, items, keyboard) {
   const m = document.getElementById("menu");
   m.innerHTML = items.map((it) => `<button type="button" class="${it.danger ? "danger" : ""}" data-menu="${it.id}">${esc(it.label)}</button>`).join("");
   m.hidden = false;
-  m.style.left = Math.min(x, window.innerWidth - 200) + "px";
-  m.style.top = Math.min(y, window.innerHeight - 40 * items.length) + "px";
+  const r = anchor.getBoundingClientRect();
+  const w = m.offsetWidth;
+  const h = m.offsetHeight;
+  const left = Math.max(8, Math.min(r.right - w, window.innerWidth - w - 8));
+  let top = r.bottom + 4;
+  if (top + h > window.innerHeight - 8) top = Math.max(8, r.top - h - 4);
+  m.style.left = left + "px";
+  m.style.top = top + "px";
   m.onclick = (e) => {
     const b = e.target.closest("[data-menu]");
     if (!b) return;
     closeMenu();
     items.find((it) => it.id === b.dataset.menu).run();
   };
+  if (keyboard) {
+    const first = m.querySelector("button");
+    if (first) first.focus();
+  }
 }
-function showTip(text, x, y) {
-  hideTip();
-  tipEl = document.createElement("div");
-  tipEl.className = "tip";
-  tipEl.innerHTML = `<b>Ошибка</b><span>${esc(text)}</span>`;
-  document.body.appendChild(tipEl);
-  tipEl.style.left = Math.min(x, window.innerWidth - 340) + "px";
-  tipEl.style.top = (y + 12) + "px";
-}
-function hideTip() { if (tipEl) { tipEl.remove(); tipEl = null; } }
 
 function openProxy(index) {
   const src = index >= 0 ? cfg().proxies[index] : { name: "", type: "socks5", address: "", username: "", password: "" };
   const draft = JSON.parse(JSON.stringify(src));
-  modal = { kind: "proxy", index, draft, showPass: false, report: null, parsedLink: draft.link || "", parseError: "" };
+  modal = { kind: "proxy", index, draft, showPass: false, report: null, parsedLink: draft.link || "", parseError: "", socksText: undefined };
   renderModal();
+}
+// VLESS_INPUTS maps the VLESS fields of the proxy dialog to draft.vless.
+const VLESS_INPUTS = {
+  "v-uuid": "uuid", "v-net": "network", "v-sec": "security", "v-sni": "sni", "v-fp": "fp", "v-pbk": "pbk",
+  "v-sid": "sid", "v-flow": "flow", "v-path": "path", "v-host": "host", "v-svc": "serviceName", "v-mode": "mode",
+};
+const PROXY_INPUTS = {
+  "p-name": "name", "p-addr": "address", "p-link": "link", "p-suburl": "subUrl", "p-user": "username",
+  "p-pass": "password", "p-luser": "localUser", "p-lpass": "localPass",
+};
+// proxyInput keeps the draft in step with every keystroke, as typed, so a
+// redraw after a check or a parse never brings back older text. Values are
+// trimmed when they are used (readProxyDraft).
+function proxyInput(el) {
+  if (!modal || modal.kind !== "proxy" || !el.id) return;
+  const d = modal.draft;
+  if (PROXY_INPUTS[el.id]) d[PROXY_INPUTS[el.id]] = el.value;
+  else if (VLESS_INPUTS[el.id]) { d.vless = d.vless || {}; d.vless[VLESS_INPUTS[el.id]] = el.value; }
+  else if (el.id === "p-socks") { modal.socksText = el.value; d.socksPort = portValue(el.value); }
+  else return;
+  paintSocksPreview();
+}
+function portValue(raw) {
+  raw = String(raw || "").trim();
+  if (!raw) return 0;
+  return /^\d+$/.test(raw) ? Number(raw) : -1;
 }
 function readProxyDraft() {
   if (!modal || !document.getElementById("p-name")) return;
@@ -1001,10 +1112,8 @@ function readProxyDraft() {
   if (pass) modal.draft.password = pass.value;
   const socks = document.getElementById("p-socks");
   if (socks) {
-    const raw = socks.value.trim();
-    if (!raw) modal.draft.socksPort = 0;
-    else if (/^\d+$/.test(raw)) modal.draft.socksPort = Number(raw);
-    else modal.draft.socksPort = -1;
+    modal.socksText = socks.value;
+    modal.draft.socksPort = portValue(socks.value);
   }
   const luser = document.getElementById("p-luser");
   if (luser) modal.draft.localUser = luser.value.trim();
@@ -1032,20 +1141,39 @@ function readVLESSFields() {
   take("v-mode", "mode");
   modal.draft.vless = v;
 }
-function applyParsed(draft, parsed) {
+function applyParsed(m, parsed) {
+  const draft = m.draft;
   draft.address = parsed.address || draft.address;
   draft.vless = parsed.vless || {};
-  if (!draft.name && parsed.name) draft.name = uniqueProxyName(parsed.name, modal ? modal.index : -1);
+  if (!String(draft.name || "").trim() && parsed.name) draft.name = uniqueProxyName(parsed.name, m.index);
 }
-async function ensureVLESS(draft) {
+// ensureVLESS parses the link of dialog m when it changed since the last
+// parse. m is the dialog that asked; it may be closed by the time it ends.
+async function ensureVLESS(m) {
+  const draft = m.draft;
   const link = (draft.link || "").trim();
-  const stale = link && link !== modal.parsedLink;
+  const stale = link && link !== m.parsedLink;
   if (!stale && draft.vless && draft.vless.uuid) return;
   if (!link) throw new Error("Вставьте ссылку VLESS");
   const parsed = await parseVLESS(link);
-  applyParsed(draft, parsed);
-  modal.parsedLink = link;
-  modal.parseError = "";
+  applyParsed(m, parsed);
+  m.parsedLink = link;
+  m.parseError = "";
+}
+// proxyPayload is the draft as the server's proxy: only its fields, and
+// only those of its type. The server refuses unknown fields; a subscription
+// URL left from the «Подписка» type used to fail every save.
+const PROXY_KEYS = ["name", "type", "address", "username", "password", "link", "vless", "socksPort", "localUser", "localPass", "subscription"];
+function proxyPayload(p) {
+  const out = {};
+  for (const k of PROXY_KEYS) if (p[k] !== undefined) out[k] = JSON.parse(JSON.stringify(p[k]));
+  if (out.type === "vless") {
+    delete out.username;
+    delete out.password;
+  } else if (!out.subscription) {
+    for (const k of ["link", "vless", "socksPort", "localUser", "localPass"]) delete out[k];
+  }
+  return out;
 }
 async function parseVLESS(link) {
   if (DEMO) return parseVLESSJS(link);
@@ -1149,16 +1277,23 @@ function defaultProxyName(p) {
   return validProxyName(label + " " + host) ? label + " " + host : label;
 }
 async function commitProxy() {
+  const m = modal;
   readProxyDraft();
-  modal.nameError = "";
-  modal.addrError = "";
-  modal.subError = "";
-  const p = modal.draft;
-  if (p.type === "sub" && !p.subscription) return commitSub(p);
+  m.nameError = "";
+  m.addrError = "";
+  m.subError = "";
+  m.portError = "";
+  const p = m.draft;
+  if (p.type === "sub" && !p.subscription) return commitSub(m);
+  delete p.subUrl;
   if (p.subscription) {
     // Only the name of a saved subscription changes here.
   } else if (p.type === "vless") {
-    try { await ensureVLESS(p); } catch (e) { modal.parseError = linkFail(e.message); renderModal(); return; }
+    try { await ensureVLESS(m); } catch (e) {
+      if (modal === m) { m.parseError = linkFail(e.message); renderModal(); }
+      return;
+    }
+    if (modal !== m) return; // cancelled while the link was parsed
     if (p.socksPort < 0 || p.socksPort > 65535) { showToast("Локальный SOCKS5-порт: число от 1 до 65535 или пусто"); return; }
     delete p.username;
     delete p.password;
@@ -1170,7 +1305,7 @@ async function commitProxy() {
     if (!p.localPass) delete p.localPass;
     if (DEMO) {
       state.bridges = state.bridges || {};
-      if (p.socksPort) state.bridges[p.name] = { socks: "127.0.0.1:" + p.socksPort, http: p.socksPort < 65535 ? "127.0.0.1:" + (p.socksPort + 1) : "", up: true };
+      if (p.socksPort) state.bridges[p.name] = { published: "127.0.0.1:" + p.socksPort, http: p.socksPort < 65535 ? "127.0.0.1:" + (p.socksPort + 1) : "", up: true };
       else delete state.bridges[p.name];
     }
   } else {
@@ -1182,61 +1317,66 @@ async function commitProxy() {
   }
   if (!p.address && !p.subscription) {
     if (p.type === "vless") showToast("Вставьте ссылку VLESS");
-    else { modal.addrError = "Укажите адрес: хост:порт, например 127.0.0.1:1080"; renderModal(); }
+    else { m.addrError = "Укажите адрес: хост:порт, например 127.0.0.1:1080"; renderModal(); }
     return;
   }
-  if (!p.name) p.name = uniqueProxyName(defaultProxyName(p), modal.index);
-  if (!validProxyName(p.name)) { modal.nameError = NAME_RULE; renderModal(); return; }
-  if (uniqueProxyName(p.name, modal.index) !== p.name) { modal.nameError = "Прокси с таким именем уже есть."; renderModal(); return; }
+  if (!p.name) p.name = uniqueProxyName(defaultProxyName(p), m.index);
+  if (!validProxyName(p.name)) { m.nameError = NAME_RULE; renderModal(); return; }
+  if (uniqueProxyName(p.name, m.index) !== p.name) { m.nameError = "Прокси с таким именем уже есть."; renderModal(); return; }
   // Work on the live config, but keep a copy: a rejected save must not
   // leave the new proxy in the list (a retry would add it twice).
   const before = JSON.parse(JSON.stringify(cfg()));
   const list = cfg().proxies;
-  const oldName = modal.index >= 0 ? list[modal.index].name : "";
-  if (modal.index < 0) list.push(JSON.parse(JSON.stringify(p)));
-  else list[modal.index] = JSON.parse(JSON.stringify(p));
+  const oldName = m.index >= 0 ? list[m.index].name : "";
+  if (m.index < 0) list.push(proxyPayload(p));
+  else list[m.index] = proxyPayload(p);
   if (oldName && oldName !== p.name) renameProxyRefs(oldName, p.name);
-  const done = modal;
   modal = null;
   built = "";
   render();
-  saveConfig().then(() => { sel.proxy = done.index < 0 ? list.length - 1 : done.index; }).catch((e) => {
+  // A save that applied with a warning (a busy port) is still saved: the
+  // dialog stays closed and saveConfig shows the warning.
+  saveConfig().then(() => { sel.proxy = m.index < 0 ? list.length - 1 : m.index; }).catch((e) => {
     const msg = e.message || "";
     if (state) state.config = before;
-    modal = done;
-    if (/^Имя прокси/i.test(msg)) modal.nameError = msg;
-    else if (/^Адрес прокси/i.test(msg) && done.draft.type !== "vless") modal.addrError = msg;
-    else if (/порт/i.test(msg)) modal.portError = /занят|совпадает/i.test(msg) ? "Порт занят. " + msg : msg;
-    else if (/разобрать ссылку/i.test(msg)) modal.parseError = linkFail(msg);
+    built = "";
+    render();
+    if (modal) { showToast(msg); return; }
+    modal = m;
+    if (/^Имя прокси/i.test(msg)) m.nameError = msg;
+    else if (/^Адрес прокси/i.test(msg) && m.draft.type !== "vless") m.addrError = msg;
+    else if (/порт/i.test(msg)) m.portError = /занят|совпадает/i.test(msg) ? "Порт занят. " + msg : msg;
+    else if (/разобрать ссылку/i.test(msg)) m.parseError = linkFail(msg);
     else showToast(msg);
     renderModal();
   });
 }
 // commitSub adds a subscription: the server downloads it first (up to
-// 15 s) and adds nothing when that fails.
-async function commitSub(p) {
-  if (!p.subUrl) { modal.subError = "Вставьте ссылку подписки"; renderModal(); return; }
-  if (!/^https?:\/\//i.test(p.subUrl)) { modal.subError = "Ссылка должна начинаться с https:// или http://"; renderModal(); return; }
+// 15 s) and adds nothing when that fails. Its outcome shows even when the
+// dialog was cancelled meanwhile.
+async function commitSub(m) {
+  const p = m.draft;
+  if (!p.subUrl) { m.subError = "Вставьте ссылку подписки"; renderModal(); return; }
+  if (!/^https?:\/\//i.test(p.subUrl)) { m.subError = "Ссылка должна начинаться с https:// или http://"; renderModal(); return; }
   if (!p.name) p.name = uniqueProxyName("Подписка", -1);
-  if (!validProxyName(p.name)) { modal.nameError = NAME_RULE; renderModal(); return; }
-  if (uniqueProxyName(p.name, -1) !== p.name) { modal.nameError = "Прокси с таким именем уже есть."; renderModal(); return; }
+  if (!validProxyName(p.name)) { m.nameError = NAME_RULE; renderModal(); return; }
+  if (uniqueProxyName(p.name, -1) !== p.name) { m.nameError = "Прокси с таким именем уже есть."; renderModal(); return; }
   if (DEMO) { showToast("Демонстрация: подписки не загружаются"); return; }
-  modal.busy = true;
+  m.busy = true;
   renderModal();
-  const done = modal;
   try {
-    await post("/api/subscription", { name: p.name, url: p.subUrl });
-    if (modal === done) modal = null;
+    const res = await post("/api/subscription", { name: p.name, url: p.subUrl });
+    if (modal === m) modal = null;
     built = "";
     await refresh();
     sel.proxy = (cfg().proxies || []).findIndex((x) => x.name === p.name);
-    showToast("Подписка добавлена");
+    showToast(res && res.warning ? "Подписка добавлена. " + res.warning : "Подписка добавлена");
   } catch (e) {
-    if (modal !== done) return;
-    modal.busy = false;
     const msg = e.message || "";
-    if (/^Имя прокси/i.test(msg)) modal.nameError = msg;
-    else modal.subError = msg;
+    if (modal !== m) { showToast(msg); return; }
+    m.busy = false;
+    if (/^Имя прокси/i.test(msg)) m.nameError = msg;
+    else m.subError = msg;
     renderModal();
   }
 }
@@ -1276,45 +1416,62 @@ function cleanDomains(text) {
   for (let d of String(text || "").split(/[\s,;]+/)) {
     d = d.trim().toLowerCase().replace(/^[a-z]+:\/\//, "").replace(/[\/?#].*$/, "").replace(/:\d+$/, "");
     d = d.replace(/^\*?\.+/, "").replace(/\.+$/, "");
-    // Cyrillic names (госуслуги.рф) as DNS spells them: xn--….xn--p1ai.
-    if (/[^\x00-\x7f]/.test(d)) { try { d = new URL("http://" + d).hostname; } catch { /* left for the server to reject */ } }
+    // Cyrillic names (госуслуги.рф) stay as typed; the server checks and
+    // converts them.
     if (d && !out.includes(d)) out.push(d);
   }
   return out;
 }
+// readSettings takes the Settings controls as they are on the page.
 function readSettings() {
-  const c = cfg();
-  c.dns = c.dns || {};
-  c.dns.mode = document.querySelector('[data-key="dns"]').classList.contains("on") ? "proxy" : "original";
+  const on = (k) => document.querySelector(`[data-key="${k}"]`).classList.contains("on");
+  const s = {};
+  s.dnsMode = on("dns") ? "proxy" : "original";
   const dnsInput = document.getElementById("dns-servers");
-  c.dns.servers = dnsInput.value.split(/[,\s]+/).map(dnsServer).filter(Boolean);
-  if (c.dns.servers.length) dnsInput.value = c.dns.servers.join(", ");
-  c.dns.systemResolver = document.querySelector('[data-key="sys"]').classList.contains("on") ? "tunnel" : "direct";
+  s.servers = dnsInput.value.split(/[,\s]+/).map(dnsServer).filter(Boolean);
+  if (s.servers.length) dnsInput.value = s.servers.join(", ");
+  s.systemResolver = on("sys") ? "tunnel" : "direct";
   const sp = document.getElementById("sys-proxy");
-  c.dns.systemResolverProxy = sp ? sp.value : "";
+  s.systemResolverProxy = sp ? sp.value : "";
   const udp = document.querySelector('[data-key="udp"].on');
-  c.udpUnsupported = udp ? udp.dataset.value : "block";
-  c.bypassPrivate = document.querySelector('[data-key="bypass"]').classList.contains("on");
+  s.udpUnsupported = udp ? udp.dataset.value : "block";
+  s.bypassPrivate = on("bypass");
   const dd = document.getElementById("direct-domains");
   if (dd) {
-    c.directDomains = cleanDomains(dd.value);
-    dd.value = c.directDomains.join("\n");
+    s.directDomains = cleanDomains(dd.value);
+    dd.value = s.directDomains.join("\n");
   }
-  c.killSwitch = document.querySelector('[data-key="kill"]').classList.contains("on");
+  s.killSwitch = on("kill");
+  s.logLevel = on("verbose") ? "debug" : "info";
+  s.auto = on("auto");
+  return s;
+}
+function applySettings(c, s) {
+  c.dns = c.dns || {};
+  c.dns.mode = s.dnsMode;
+  c.dns.servers = s.servers;
+  c.dns.systemResolver = s.systemResolver;
+  c.dns.systemResolverProxy = s.systemResolverProxy;
+  c.udpUnsupported = s.udpUnsupported;
+  c.bypassPrivate = s.bypassPrivate;
+  if (s.directDomains) c.directDomains = s.directDomains;
+  c.killSwitch = s.killSwitch;
   c.log = c.log || {};
-  c.log.level = document.querySelector('[data-key="verbose"]').classList.contains("on") ? "debug" : "info";
-  const auto = document.querySelector('[data-key="auto"]').classList.contains("on");
-  return auto;
+  c.log.level = s.logLevel;
 }
 
 function onClick(e) {
   const nav = e.target.closest("[data-nav]");
-  if (nav) { page = nav.dataset.nav; built = ""; modal = null; closeMenu(); render(); return; }
+  if (nav) {
+    // Settings edits are saved whatever page comes next.
+    if (settingsPending) flushSettings();
+    page = nav.dataset.nav; built = ""; modal = null; closeMenu(); render(); return;
+  }
   const act = e.target.closest("[data-act]");
   if (!act) return;
   const id = act.dataset.act;
   const i = Number(act.dataset.i);
-  if (id === "copy-text") { copyText(act.dataset.text || ""); return; }
+  if (id === "copy-text") { copyText(act.dataset.text || "", act.dataset.shown); return; }
   if (id.startsWith("ap-")) { appsClick(id, act); return; }
   if (id === "goto") { page = act.dataset.page; built = ""; render(); return; }
   if (id === "sel-proxy") { sel.proxy = i; fillProxies(); return; }
@@ -1336,14 +1493,6 @@ function onClick(e) {
   }
   if (id === "paste-vless") { pasteVLESS(); return; }
   if (id === "ks-start") { if (!state.running) startStop(); return; }
-  if (id === "rules-save") { saveConfig({ rules: true }).catch((err) => showToast(err.message)); return; }
-  if (id === "rules-revert") {
-    try { cfg().rules = JSON.parse(rulesSnapshot || "[]"); } catch (err) { /* keep */ }
-    rulesDirty = false;
-    built = "";
-    render();
-    return;
-  }
   if (id === "errors-only") {
     errorsOnly = !errorsOnly;
     built = "";
@@ -1373,21 +1522,21 @@ function onClick(e) {
       { id: "del", label: "Удалить", danger: true, run: () => deleteProxy(i) },
     ];
     if (cfg().proxies[i].subscription) items.splice(1, 0, { id: "sub-refresh", label: "Обновить подписку", run: () => refreshSub(name) });
-    openMenu(e.clientX, e.clientY, items);
+    openMenu(act, items, e.detail === 0);
     return;
   }
   if (id === "probe-all") {
-    (cfg().proxies || []).forEach((p) => { probing[p.name] = true; });
+    if (probeAllBusy) return;
+    probeAllBusy = true;
+    const names = (cfg().proxies || []).map((p) => p.name);
+    names.forEach(probeStart);
     fillProxies();
-    if (DEMO) {
-      setTimeout(() => { probing = {}; fillProxies(); }, 600);
-      return;
-    }
+    const done = () => { probeAllBusy = false; names.forEach(probeEnd); fillProxies(); };
+    if (DEMO) { setTimeout(done, 600); return; }
     post("/api/probe-all").then((checks) => {
-      probing = {};
-      if (state && checks) state.checks = checks;
-      fillProxies();
-    }).catch((err) => { probing = {}; fillProxies(); showToast(err.message); });
+      if (state && checks) state.checks = Object.assign({}, state.checks, checks);
+      done();
+    }).catch((err) => { done(); showToast(err.message); });
     return;
   }
   if (id === "head-more") {
@@ -1396,11 +1545,7 @@ function onClick(e) {
       label: b.textContent.trim(),
       run: () => b.click(),
     }));
-    if (actions.length) openMenu(e.clientX, e.clientY, actions);
-    return;
-  }
-  if (id === "save" || id === "save-settings" || id === "rules-save-legacy") {
-    saveConfig({ rules: page === "rules" }).catch((err) => showToast(err.message));
+    if (actions.length) openMenu(act, actions, e.detail === 0);
     return;
   }
   if (id === "pause") {
@@ -1445,6 +1590,8 @@ function onClick(e) {
   if (id === "cancel") { modal = null; renderModal(); return; }
   if (id === "eye") { modal.showPass = !modal.showPass; readProxyDraft(); renderModal(); return; }
   if (id === "ptype") {
+    // A saved subscription stays one: its only type button does nothing.
+    if (modal.draft.subscription) return;
     readProxyDraft();
     modal.draft.type = act.dataset.value;
     modal.report = null;
@@ -1452,64 +1599,92 @@ function onClick(e) {
     renderModal();
     return;
   }
+  // Results of a parse or a check land only in the dialog that asked:
+  // it may be closed, or another one open, by then.
   if (id === "parse-link") {
     readProxyDraft();
-    parseVLESS(modal.draft.link).then((parsed) => {
-      applyParsed(modal.draft, parsed);
-      modal.parsedLink = (modal.draft.link || "").trim();
-      modal.parseError = "";
+    const m = modal;
+    parseVLESS(m.draft.link).then((parsed) => {
+      if (modal !== m) return;
+      applyParsed(m, parsed);
+      m.parsedLink = (m.draft.link || "").trim();
+      m.parseError = "";
       renderModal();
-    }).catch((err) => { modal.parseError = linkFail(err.message); renderModal(); });
+    }).catch((err) => {
+      if (modal !== m) return;
+      m.parseError = linkFail(err.message);
+      renderModal();
+    });
     return;
   }
   if (id === "probe-draft") {
     readProxyDraft();
-    if (DEMO) { modal.report = { ok: true, udp: modal.draft.type !== "http", label: "42 мс" }; renderModal(); return; }
+    const m = modal;
+    if (DEMO) { m.report = { ok: true, udp: m.draft.type !== "http", label: "42 мс" }; renderModal(); return; }
+    if (m.checking) return;
     const run = () => {
-      modal.checking = true;
-      modal.report = null;
+      if (modal !== m) return;
+      m.checking = true;
+      m.report = null;
       renderModal();
-      post("/api/probe", { proxy: modal.draft }).then((rep) => {
-        if (!modal) return;
-        modal.checking = false;
-        modal.report = rep;
-        modal.realityError = realityFail(modal.draft, rep);
+      post("/api/probe", { proxy: proxyPayload(m.draft) }).then((rep) => {
+        if (modal !== m) return;
+        m.checking = false;
+        m.report = rep;
+        m.realityError = realityFail(m.draft, rep);
         renderModal();
       }).catch((err) => {
-        if (modal) { modal.checking = false; renderModal(); }
+        if (modal !== m) return;
+        m.checking = false;
+        renderModal();
         showToast(err.message);
       });
     };
-    if (modal.draft.type === "vless") {
-      ensureVLESS(modal.draft).then(run).catch((err) => showToast(err.message));
+    if (m.draft.type === "vless") {
+      ensureVLESS(m).then(run).catch((err) => { if (modal === m) showToast(err.message); });
     } else run();
     return;
   }
 }
+function probeStart(name) { probing[name] = (probing[name] || 0) + 1; }
+function probeEnd(name) { if (--probing[name] <= 0) delete probing[name]; }
 function probeNamed(name) {
-  probing[name] = true;
+  probeStart(name);
   if (page === "proxies") fillProxies();
-  if (DEMO) { setTimeout(() => { delete probing[name]; fillProxies(); }, 600); return; }
+  if (DEMO) { setTimeout(() => { probeEnd(name); fillProxies(); }, 600); return; }
   post("/api/probe", { name }).then((rep) => {
-    delete probing[name];
+    probeEnd(name);
     if (state) { state.checks = state.checks || {}; state.checks[name] = rep; }
     fillProxies();
-  }).catch((err) => { delete probing[name]; fillProxies(); showToast(err.message); });
+  }).catch((err) => { probeEnd(name); fillProxies(); showToast(err.message); });
 }
-let settingsAuto = false;
+// Settings are read from the page when they change and saved 400 ms later,
+// whatever page is open by then: leaving by a tab click (its mousedown
+// ends a text edit) used to lose them.
+let settingsPending = null;
+let settingsSaving = 0;
 function queueSettings(autoTouched) {
-  if (autoTouched) settingsAuto = true;
+  if (!document.querySelector('[data-key="dns"]')) return;
+  const s = readSettings();
+  s.autoTouched = !!autoTouched || !!(settingsPending && settingsPending.autoTouched);
+  settingsPending = s;
   clearTimeout(settingsTimer);
-  settingsTimer = setTimeout(() => {
-    if (page !== "settings") return;
-    if (!document.querySelector('[data-key="dns"]')) return;
-    const sendAuto = settingsAuto;
-    settingsAuto = false;
-    const auto = readSettings();
-    const extra = { quiet: true };
-    if (sendAuto) extra.autostart = auto;
-    saveConfig(extra).catch((err) => showToast(err.message));
-  }, 400);
+  settingsTimer = setTimeout(flushSettings, 400);
+}
+function flushSettings() {
+  clearTimeout(settingsTimer);
+  settingsTimer = null;
+  const s = settingsPending;
+  settingsPending = null;
+  if (!s || !state) return;
+  applySettings(cfg(), s);
+  const extra = { quiet: true };
+  if (s.autoTouched) extra.autostart = s.auto;
+  settingsSaving++;
+  // A rejected save: the toast says why and the page shows the saved
+  // values again (fillSettings), not the rejected ones.
+  saveConfig(extra).catch((err) => { showToast(err.message); return refresh(); })
+    .finally(() => { settingsSaving--; if (page === "settings") fillPage(); });
 }
 async function pasteVLESS(silent) {
   let text = "";
@@ -1526,44 +1701,32 @@ async function pasteVLESS(silent) {
   built = "";
   render();
   openProxy(-1);
-  modal.draft.type = "vless";
-  modal.draft.link = text;
+  const m = modal;
+  m.draft.type = "vless";
+  m.draft.link = text;
   renderModal();
   parseVLESS(text).then((parsed) => {
-    if (!modal) return;
-    applyParsed(modal.draft, parsed);
-    modal.parsedLink = text;
-    modal.parseError = "";
+    if (modal !== m) return;
+    applyParsed(m, parsed);
+    m.parsedLink = text;
+    m.parseError = "";
     renderModal();
   }).catch((err) => {
-    if (!modal) return;
-    modal.parseError = linkFail(err.message);
+    if (modal !== m) return;
+    m.parseError = linkFail(err.message);
     renderModal();
   });
 }
-function showStartError(msg) {
-  const text = String(msg || "").trim();
-  if (/[А-Яа-яЁё]/.test(text)) {
-    showAlert("Перехват не запустился", text);
-    return;
-  }
-  if (/access is denied/i.test(text)) {
-    showAlert("Перехват не запустился", "Нет прав администратора или перехват уже занят другой копией Ashgate/другой программой (Proxifier, zapret/winws, GoodbyeDPI). Закройте их и запустите Ashgate от имени администратора.");
-    return;
-  }
-  const m = /код\s+(\d+)/.exec(text);
-  const code = m ? Number(m[1]) : 0;
-  const help = {
-    5: "Нет прав администратора или перехват уже занят другой копией Ashgate/другой программой (Proxifier, zapret/winws, GoodbyeDPI). Закройте их и запустите Ashgate от имени администратора. (код 5)",
-    2: "Рядом с программой нет WinDivert.dll или WinDivert64.sys (код 2). Положите их в ту же папку, что и ashgate.exe.",
-    577: "Windows отклонила подпись драйвера (код 577). Попробуйте другой вариант WinDivert — A, B или C.",
-    1275: "Драйвер заблокирован политикой Windows или антивирусом (код 1275). Разрешите WinDivert64.sys или отключите блокировку уязвимых драйверов.",
-    654: "Уже загружен несовместимый драйвер WinDivert (код 654). Перезагрузите компьютер и запустите Ashgate снова.",
-    1753: "Служба базовой фильтрации Windows выключена (код 1753). Включите Base Filtering Engine и повторите запуск.",
-  };
-  showAlert("Перехват не запустился", help[code] || (msg || "Не удалось запустить перехват."));
+// showStartError shows why capture did not start. The server's text is
+// already the plain Russian explanation (windivert.FormatError and the
+// runtime add the code and the conflicting programs). The alert closes by
+// itself when capture starts.
+function showStartError(msg, title) {
+  showAlert(title || "Перехват не запустился", String(msg || "").trim() || "Не удалось запустить перехват.");
+  modal.errAlert = true;
 }
 function startStop() {
+  if (powerBusy) return;
   const path = state.running ? "/api/stop" : "/api/start";
   if (DEMO) {
     state.running = !state.running;
@@ -1572,10 +1735,12 @@ function startStop() {
     return;
   }
   const starting = !state.running;
+  powerBusy = true;
+  render();
   post(path).then(refresh).catch((err) => {
-    if (starting) showStartError(err.message);
+    if (starting) { shownErr = err.message; showStartError(err.message); }
     else showToast(err.message);
-  });
+  }).finally(() => { powerBusy = false; render(); });
 }
 function askConfirm(title, text, ok, danger, run) {
   modal = { kind: "confirm", title, text, ok, danger, run };
@@ -1658,37 +1823,32 @@ function bootChrome() {
   document.body.addEventListener("submit", onSubmit);
   document.body.addEventListener("input", (e) => {
     if (appsInput(e)) return;
-    if (e.target.id === "p-socks" && modal && modal.draft && modal.draft.type === "vless") {
-      readProxyDraft();
-      const box = document.getElementById("socks-preview");
-      if (box) box.outerHTML = socksPreviewHTML(modal.draft);
-    }
+    if (e.target.closest("#modal")) proxyInput(e.target);
     if (e.target.id === "log-filter") { logFilter = e.target.value; fillLog(); }
   });
   // Text and select settings save when the user finishes editing, not on
   // every keystroke: a half-typed DNS address used to pop an error.
   document.body.addEventListener("change", (e) => {
+    if (e.target.closest("#modal")) { apInput(e.target); proxyInput(e.target); return; }
     if (page === "settings" && e.target.closest(".page") && (e.target.id === "dns-servers" || e.target.id === "sys-proxy" || e.target.id === "direct-domains")) queueSettings();
   });
+  // A file or link dropped on the window would open in it, as a page from
+  // elsewhere. Rule cards take their own drags (apBindDrag).
+  const external = (e) => !apDrag && e.dataTransfer && Array.from(e.dataTransfer.types || []).some((t) => t === "Files" || t === "text/uri-list" || t === "text/html");
+  document.addEventListener("dragover", (e) => {
+    if (!external(e)) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "none";
+  });
+  document.addEventListener("drop", (e) => { if (external(e)) e.preventDefault(); });
   document.body.addEventListener("mouseover", (e) => {
-    const n = e.target.closest("[data-err]");
-    if (n) showTip(n.dataset.err, e.clientX, e.clientY);
     const el = e.target.closest("td, .nm, .sub, .addr, .main");
     if (el && !el.title && !el.querySelector("button") && el.scrollWidth > el.clientWidth) {
       const text = el.textContent.replace(/\s+/g, " ").trim();
       if (text) el.title = text;
     }
   });
-  document.body.addEventListener("mouseout", (e) => {
-    if (e.target.closest("[data-err]")) hideTip();
-  });
   document.addEventListener("keydown", (e) => {
-    if ((e.ctrlKey || e.metaKey) && (e.key === "s" || e.key === "S")) {
-      if (rulesDirty) {
-        e.preventDefault();
-        saveConfig({ rules: true }).catch((err) => showToast(err.message));
-      }
-    }
     if (e.key === "Escape") {
       modal = null;
       closeMenu();
@@ -1729,7 +1889,6 @@ async function main() {
   if (DEMO) {
     state = demoState();
     applyRoute();
-    rememberRules();
     render();
     if (location.hash === "#proxy-dialog") openProxy(0);
     if (location.hash === "#vless-dialog") openProxy(cfg().proxies.findIndex((p) => p.type === "vless"));
@@ -1746,21 +1905,29 @@ async function main() {
   await refresh();
   // Without proxies there is nothing to route yet: start on the Proxies tab.
   if (state && !(cfg().proxies || []).length) { page = "proxies"; built = ""; render(); pasteVLESS(true); }
-  clipboardTried = true;
   poll();
-  document.addEventListener("visibilitychange", () => { if (!document.hidden && !modal) refresh(); });
+  // The host calls ashgateShown when the window is back on screen.
+  window.ashgateShown = wakePoll;
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) wakePoll(); });
+  window.addEventListener("focus", wakePoll);
 }
 // poll waits for each answer before asking again, so slow replies cannot
-// pile up, and slows down while the window is hidden in the tray.
-// poll waits for each answer before asking again. The live log needs
-// 250 ms; the other pages show figures that change once a second; in the
-// tray (the host reports it: WebView2 does not set document.hidden) or
-// minimized the page only needs to notice state changes.
+// pile up; it goes on while a dialog is open. The live log needs 250 ms,
+// the other pages show figures that change once a second. In the tray or
+// minimized (the host reports it: WebView2 does not set document.hidden)
+// it stops: the tray icon gets its state from Go, and the host wakes the
+// page when it is shown again.
+let polling = false;
 async function poll() {
-  if (!modal) await refresh();
+  polling = true;
+  await refresh();
+  if (document.hidden || (state && state.hidden && failedPolls === 0)) { polling = false; return; }
   let wait = 1000;
-  if (document.hidden || (state && state.hidden)) wait = 3000;
+  if (failedPolls) wait = 2000;
   else if (page === "log" && !paused) wait = 250;
   setTimeout(poll, wait);
+}
+function wakePoll() {
+  if (!polling && !DEMO) poll();
 }
 main();

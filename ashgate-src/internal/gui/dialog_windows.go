@@ -3,12 +3,17 @@
 package gui
 
 import (
+	"fmt"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
 
-var pGetOpenFileName = windows.NewLazySystemDLL("comdlg32.dll").NewProc("GetOpenFileNameW")
+var (
+	comdlg32         = windows.NewLazySystemDLL("comdlg32.dll")
+	pGetOpenFileName = comdlg32.NewProc("GetOpenFileNameW")
+	pCommDlgError    = comdlg32.NewProc("CommDlgExtendedError")
+)
 
 // openExe asks for an application file. An empty path means the user cancelled.
 func openExe(owner uintptr) (string, error) {
@@ -27,10 +32,12 @@ func openExe(owner uintptr) (string, error) {
 		Flags:      0x00080000 | 0x00001000 | 0x00000800 | 0x00000008,
 		Title:      title,
 	}
-	r, _, callErr := pGetOpenFileName.Call(uintptr(unsafe.Pointer(&ofn)))
+	r, _, _ := pGetOpenFileName.Call(uintptr(unsafe.Pointer(&ofn)))
 	if r == 0 {
-		if errno, ok := callErr.(windows.Errno); ok && errno != 0 {
-			return "", errno
+		// Zero means the user closed the dialog. The thread's last error is
+		// stale here and said nothing about the dialog.
+		if code, _, _ := pCommDlgError.Call(); code != 0 {
+			return "", fmt.Errorf("окно выбора файла не открылось (код %#x)", code)
 		}
 		return "", nil
 	}

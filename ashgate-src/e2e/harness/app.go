@@ -272,7 +272,8 @@ func (a *App) do(method, path string, in, out any) error {
 		return err
 	}
 	req.Header.Set("X-Ashgate-Token", a.Token)
-	if in != nil {
+	if in != nil || method == http.MethodPost {
+		// The app refuses a POST that does not say it is JSON.
 		req.Header.Set("Content-Type", "application/json")
 	}
 	resp, err := a.hc.Do(req)
