@@ -27,6 +27,29 @@ const (
 	// systemPID is the kernel ("System"). It has no image to read, and its
 	// sockets (SMB, NetBIOS) belong to no program a rule can name.
 	systemPID = 4
+	// recentClose is how long after its close a UDP socket still owns a
+	// NewDatagram packet. A program that sends one datagram and closes
+	// (syslog, STUN, NTP, a QUIC close) has its socket event closed before
+	// the capture loop decides the packet. Another program taking that
+	// random port within this time, before its own event arrives, is far
+	// less likely than the packet being the closing program's.
+	recentClose = 2 * time.Second
+)
+
+// Start says how a closed socket counts for the packet being looked up.
+type Start uint8
+
+const (
+	// Continuing: the packet belongs to a flow that may be over (the last
+	// packets of a connection). A closed socket keeps its owner for
+	// closeGrace.
+	Continuing Start = iota
+	// NewFlow: the packet starts a flow (a TCP SYN, a DNS query). A closed
+	// socket never counts: its port may be another program's by now.
+	NewFlow
+	// NewDatagram: the packet is a UDP datagram that may be a program's
+	// first and last. A closed socket counts for recentClose.
+	NewDatagram
 )
 
 type exactKey struct {
@@ -175,22 +198,23 @@ func (r *Resolver) pruneLocked(now time.Time) {
 // Lookup implements engine.Resolver. It is a last try: it may read the
 // IP Helper tables before it answers.
 func (r *Resolver) Lookup(proto uint8, src packet.Addr) (rules.Process, bool) {
-	return r.Owner(proto, src, false, true)
+	return r.Owner(proto, src, Continuing, true)
 }
 
 // LookupLive is Lookup without sockets that already closed; see Owner.
 func (r *Resolver) LookupLive(proto uint8, src packet.Addr) (rules.Process, bool) {
-	return r.Owner(proto, src, true, true)
+	return r.Owner(proto, src, NewFlow, true)
 }
 
 // Owner finds the program of the local socket src.
 //
-// live is for a packet that starts a flow (a TCP SYN, any UDP): a closed
+// start is for a packet that starts a flow (a TCP SYN, any UDP): a closed
 // socket's entry stays for closeGrace so a connection's last packets keep
 // their owner, but its port may already be another program's whose event
-// is still on the way. Live, such an entry does not count, and neither
-// does a table read before that socket closed: the table may still list
-// it. Unknown, the packet waits for the event or a newer table.
+// is still on the way. For a new flow, such an entry does not count, and
+// neither does a table read before that socket closed: the table may still
+// list it. Unknown, the packet waits for the event or a newer table. A
+// NewDatagram is the exception for its first recentClose after the close.
 //
 // final is the last try for a held packet. Before it, a lookup never waits
 // for the tables (four table reads on the packet goroutine stall every
@@ -198,20 +222,20 @@ func (r *Resolver) LookupLive(proto uint8, src packet.Addr) (rules.Process, bool
 // and the answer is "unknown", so the capture loop holds the packet and
 // asks again. The last try waits for a read when none since the packet
 // came has finished, at most one per helperGap.
-func (r *Resolver) Owner(proto uint8, src packet.Addr, live, final bool) (rules.Process, bool) {
+func (r *Resolver) Owner(proto uint8, src packet.Addr, start Start, final bool) (rules.Process, bool) {
 	if r == nil || src.Port == 0 {
 		return rules.Process{}, false
 	}
 	key := exactKey{proto, src}
 	now := r.now()
 	r.mu.Lock()
-	p, ok, closed := r.socketLocked(proto, src, now, live)
+	p, ok, closed := r.socketLocked(proto, src, now, start)
 	if ok {
 		delete(r.missAt, key)
 		r.mu.Unlock()
 		return r.finish(p)
 	}
-	since := r.sinceLocked(key, now, closed, live)
+	since := r.sinceLocked(key, now, closed, start != Continuing)
 	if !final {
 		if r.tableFromLocked(since) {
 			if p, ok := r.helperLocked(proto, src); ok {
@@ -245,7 +269,7 @@ func (r *Resolver) Owner(proto uint8, src packet.Addr, live, final bool) (rules.
 		r.mu.Lock()
 	}
 	// The socket's event may have come while the tables were read.
-	p, ok, closed = r.socketLocked(proto, src, r.now(), live)
+	p, ok, closed = r.socketLocked(proto, src, r.now(), start)
 	if !ok && r.tableFromLocked(closed) {
 		p, ok = r.helperLocked(proto, src)
 	}
@@ -326,14 +350,25 @@ func (r *Resolver) finish(p rules.Process) (rules.Process, bool) {
 	return rules.Process{PID: p.PID}, true
 }
 
-// socketLocked finds a socket event for src. live skips closed sockets
-// and reports the latest close among them.
-func (r *Resolver) socketLocked(proto uint8, src packet.Addr, now time.Time, live bool) (p rules.Process, ok bool, closed time.Time) {
+// socketLocked finds a socket event for src. Unless start is Continuing it
+// skips closed sockets (a NewDatagram keeps those closed within
+// recentClose) and reports the latest close among the skipped.
+func (r *Resolver) socketLocked(proto uint8, src packet.Addr, now time.Time, start Start) (p rules.Process, ok bool, closed time.Time) {
+	// counts reports that e answers: open, or closed but allowed by start.
+	counts := func(e entry) bool {
+		switch {
+		case start == Continuing || e.until.IsZero():
+			return true
+		case start == NewDatagram:
+			return now.Sub(e.closed) < recentClose
+		}
+		return false
+	}
 	if e, ok := r.exact[exactKey{proto, src}]; ok {
 		switch {
 		case !alive(e, now):
 			delete(r.exact, exactKey{proto, src})
-		case !live || e.until.IsZero():
+		case counts(e):
 			return e.proc, true, time.Time{}
 		default:
 			closed = e.closed
@@ -344,7 +379,7 @@ func (r *Resolver) socketLocked(proto uint8, src packet.Addr, now time.Time, liv
 		switch {
 		case !alive(e, now):
 			delete(r.wild, wk)
-		case !live || e.until.IsZero():
+		case counts(e):
 			return e.proc, true, time.Time{}
 		case e.closed.After(closed):
 			closed = e.closed

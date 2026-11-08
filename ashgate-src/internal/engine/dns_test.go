@@ -13,6 +13,7 @@ import (
 
 	"ashgate/internal/config"
 	"ashgate/internal/packet"
+	"ashgate/internal/process"
 	"ashgate/internal/rules"
 )
 
@@ -221,6 +222,15 @@ func (staleRes) LookupLive(uint8, packet.Addr) (rules.Process, bool) {
 	return rules.Process{}, false
 }
 
+// Owner answers like process.Resolver for a socket that just closed: the
+// last packets and a datagram keep it, a new flow does not.
+func (staleRes) Owner(_ uint8, _ packet.Addr, start process.Start, _ bool) (rules.Process, bool) {
+	if start == process.NewFlow {
+		return rules.Process{}, false
+	}
+	return rules.Process{PID: 2, Name: "direct.exe"}, true
+}
+
 func TestDNSIgnoresClosedSocketOwner(t *testing.T) {
 	e, _ := newEngine(t, testConfig(), staleRes{}, &fakeDial{}, nil)
 	pkt := udpDNS(t, packet.V4(10, 0, 0, 6, 50090), packet.V4(192, 168, 1, 1, 53), "a.example.com")
@@ -230,12 +240,8 @@ func TestDNSIgnoresClosedSocketOwner(t *testing.T) {
 	if r := e.HandlePacket(pkt, Meta{}, true); r.Action != ActionUDP {
 		t.Fatalf("query on a reused port went %v, want the tunnel", r.Action)
 	}
-	// Any new flow ignores the closed socket: other UDP, a TCP SYN. With
-	// a proxy rule the unknown owner's packet is dropped, not sent direct.
-	other, _ := packet.BuildUDP(packet.V4(10, 0, 0, 6, 50091), packet.V4(198, 51, 100, 1, 5000), []byte{1})
-	if r := e.HandlePacket(other, Meta{}, true); r.Action != ActionDrop {
-		t.Fatalf("UDP on a reused port went %v", r.Action)
-	}
+	// A TCP SYN ignores the closed socket. With a proxy rule the unknown
+	// owner's packet is dropped, not sent direct.
 	syn, _ := packet.BuildTCP(packet.V4(10, 0, 0, 6, 50092), packet.V4(198, 51, 100, 1, 443), 0x02)
 	if r := e.HandlePacket(syn, Meta{}, true); r.Action != ActionDrop {
 		t.Fatalf("SYN on a reused port went %v", r.Action)
@@ -244,6 +250,38 @@ func TestDNSIgnoresClosedSocketOwner(t *testing.T) {
 	ack, _ := packet.BuildTCP(packet.V4(10, 0, 0, 6, 50093), packet.V4(198, 51, 100, 1, 443), 0x11)
 	if r := e.HandlePacket(ack, Meta{}, true); r.Action != ActionPass {
 		t.Fatalf("FIN of direct.exe went %v", r.Action)
+	}
+	// So does a UDP datagram that is not DNS: a program that sends once and
+	// closes (syslog, NTP) must not lose its packet.
+	other, _ := packet.BuildUDP(packet.V4(10, 0, 0, 6, 50091), packet.V4(198, 51, 100, 1, 5000), []byte{1})
+	if r := e.HandlePacket(other, Meta{}, true); r.Action != ActionPass {
+		t.Fatalf("datagram of a program that closed went %v", r.Action)
+	}
+}
+
+// With the real resolver: a program without a rule sends one datagram and
+// closes at once; DNS and a SYN from the same closed socket are still
+// treated as from an unknown owner.
+func TestSendThenCloseDatagramIsNotDropped(t *testing.T) {
+	r := process.New()
+	r.SetImage(func(pid uint32) rules.Process { return rules.Process{PID: pid, Name: "syslogd.exe"} })
+	e, _ := newEngine(t, testConfig(), r, &fakeDial{}, nil)
+	src := packet.V4(10, 0, 0, 6, 50200)
+	r.Observe(packet.ProtoUDP, src, 9, false)
+	r.Observe(packet.ProtoUDP, src, 9, true)
+	udp, _ := packet.BuildUDP(src, packet.V4(198, 51, 100, 1, 514), []byte("log"))
+	if res := e.HandlePacket(udp, Meta{}, true); res.Action != ActionPass {
+		t.Fatalf("send-then-close datagram went %v", res.Action)
+	}
+	dns := udpDNS(t, src, packet.V4(192, 168, 1, 1, 53), "a.example.com")
+	if res := e.HandlePacket(dns, Meta{}, true); res.Action == ActionPass {
+		t.Fatalf("DNS from a closed socket went %v, want the strict path", res.Action)
+	}
+	syn, _ := packet.BuildTCP(src, packet.V4(198, 51, 100, 1, 443), 0x02)
+	r.Observe(packet.ProtoTCP, src, 9, false)
+	r.Observe(packet.ProtoTCP, src, 9, true)
+	if res := e.HandlePacket(syn, Meta{}, true); res.Action != ActionDrop {
+		t.Fatalf("SYN from a closed socket went %v", res.Action)
 	}
 }
 

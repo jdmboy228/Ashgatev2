@@ -163,19 +163,19 @@ func TestTableReadIsBackgroundAndSingle(t *testing.T) {
 		return []Endpoint{{Proto: packet.ProtoTCP, Addr: a, PID: 21}, {Proto: packet.ProtoTCP, Addr: b, PID: 22}}, nil
 	})
 	for _, src := range []packet.Addr{a, a, a, b, b} {
-		if _, ok := r.Owner(packet.ProtoTCP, src, true, false); ok {
+		if _, ok := r.Owner(packet.ProtoTCP, src, NewFlow, false); ok {
 			t.Fatal("found before any table was read")
 		}
 	}
 	close(release)
 	waitLoad(r)
 	*clock = start.Add(15 * time.Millisecond)
-	if p, ok := r.Owner(packet.ProtoTCP, b, true, false); !ok || p.PID != 22 {
+	if p, ok := r.Owner(packet.ProtoTCP, b, NewFlow, false); !ok || p.PID != 22 {
 		t.Fatalf("retry after the read: %+v %v", p, ok)
 	}
 	// The last try of a packet held since the read began needs no new one.
 	*clock = start.Add(60 * time.Millisecond)
-	if p, ok := r.Owner(packet.ProtoTCP, a, true, true); !ok || p.PID != 21 {
+	if p, ok := r.Owner(packet.ProtoTCP, a, NewFlow, true); !ok || p.PID != 21 {
 		t.Fatalf("last try: %+v %v", p, ok)
 	}
 	mu.Lock()
@@ -203,22 +203,22 @@ func TestLiveLookupDistrustsTableFromBeforeClose(t *testing.T) {
 	r.Observe(packet.ProtoUDP, local, 3, true)
 	// Within helperGap no new read may start; the old table must not answer.
 	*clock = start.Add(20 * time.Millisecond)
-	if p, ok := r.Owner(packet.ProtoUDP, local, true, true); ok {
+	if p, ok := r.Owner(packet.ProtoUDP, local, NewFlow, true); ok {
 		t.Fatalf("credited to the closed socket's program: %+v", p)
 	}
 	// The mid-connection lookup still finds the closing socket's owner.
-	if p, ok := r.Owner(packet.ProtoUDP, local, false, true); !ok || p.PID != 3 {
+	if p, ok := r.Owner(packet.ProtoUDP, local, Continuing, true); !ok || p.PID != 3 {
 		t.Fatalf("grace lookup: %+v %v", p, ok)
 	}
 	// A program binds the port; its event is late, a new table lists it.
 	owner = 8
 	*clock = start.Add(70 * time.Millisecond)
-	if _, ok := r.Owner(packet.ProtoUDP, local, true, false); ok {
+	if _, ok := r.Owner(packet.ProtoUDP, local, NewFlow, false); ok {
 		t.Fatal("answered from the old table")
 	}
 	waitLoad(r)
 	*clock = start.Add(85 * time.Millisecond)
-	if p, ok := r.Owner(packet.ProtoUDP, local, true, false); !ok || p.PID != 8 {
+	if p, ok := r.Owner(packet.ProtoUDP, local, NewFlow, false); !ok || p.PID != 8 {
 		t.Fatalf("new owner: %+v %v", p, ok)
 	}
 }
@@ -314,5 +314,39 @@ func TestWithParents(t *testing.T) {
 	}
 	if len(got[3].Parents) != 0 || len(got[4].Parents) != 0 {
 		t.Fatal("orphan or self-parent got a chain")
+	}
+}
+
+// A program that sends one datagram and closes has its socket closed before
+// the packet is decided. A NewDatagram lookup still finds it for
+// recentClose; later, and for a NewFlow, it does not.
+func TestOwnerNewDatagramKeepsRecentlyClosedSocket(t *testing.T) {
+	start := time.Unix(1000, 0)
+	r, clock := testResolver(start)
+	exact, wild := packet.V4(10, 0, 0, 8, 50000), packet.V4(0, 0, 0, 0, 50001)
+	r.Observe(packet.ProtoUDP, exact, 3, true)
+	r.Observe(packet.ProtoUDP, wild, 3, true)
+	for _, a := range []packet.Addr{exact, packet.V4(10, 0, 0, 8, 50001)} {
+		if p, ok := r.Owner(packet.ProtoUDP, a, NewDatagram, false); !ok || p.PID != 3 {
+			t.Fatalf("%s: datagram right after the close: %+v %v", a, p, ok)
+		}
+		if _, ok := r.Owner(packet.ProtoUDP, a, NewFlow, false); ok {
+			t.Fatalf("%s: a new flow found the closed socket", a)
+		}
+	}
+	*clock = start.Add(recentClose + time.Millisecond)
+	for _, a := range []packet.Addr{exact, packet.V4(10, 0, 0, 8, 50001)} {
+		if _, ok := r.Owner(packet.ProtoUDP, a, NewDatagram, false); ok {
+			t.Fatalf("%s: datagram after recentClose found the closed socket", a)
+		}
+		if p, ok := r.Owner(packet.ProtoUDP, a, Continuing, true); !ok || p.PID != 3 {
+			t.Fatalf("%s: grace lookup: %+v %v", a, p, ok)
+		}
+	}
+	// A new socket on the port wins at once.
+	*clock = start.Add(time.Second)
+	r.Observe(packet.ProtoUDP, exact, 4, false)
+	if p, ok := r.Owner(packet.ProtoUDP, exact, NewDatagram, false); !ok || p.PID != 4 {
+		t.Fatalf("new socket: %+v %v", p, ok)
 	}
 }

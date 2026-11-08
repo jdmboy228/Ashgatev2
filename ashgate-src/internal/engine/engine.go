@@ -19,6 +19,7 @@ import (
 	"ashgate/internal/dialer"
 	"ashgate/internal/logbuf"
 	"ashgate/internal/packet"
+	"ashgate/internal/process"
 	"ashgate/internal/rules"
 )
 
@@ -83,10 +84,10 @@ type liveResolver interface {
 	LookupLive(proto uint8, src packet.Addr) (rules.Process, bool)
 }
 
-// ownerResolver is process.Resolver: live as for liveResolver, and before
+// ownerResolver is process.Resolver: start as for liveResolver, and before
 // the last try (final) it never waits for the IP Helper tables.
 type ownerResolver interface {
-	Owner(proto uint8, src packet.Addr, live, final bool) (rules.Process, bool)
+	Owner(proto uint8, src packet.Addr, start process.Start, final bool) (rules.Process, bool)
 }
 
 // Allocator reserves a local port used as the source of a redirected TCP handshake.
@@ -508,14 +509,23 @@ func (e *Engine) HandlePacket(pkt []byte, meta Meta, final bool) Result {
 // flow (a TCP SYN, any UDP) is never credited to a socket that already
 // closed: its port may be another program's by now, whose event is still
 // on the way. The last packets of a connection keep the closed socket's
-// owner for a while.
+// owner for a while. UDP other than DNS is the exception for a moment: a
+// program that sends one datagram and closes has its socket closed by the
+// time the packet is decided, and dropping it for that would lose syslog,
+// STUN and NTP.
 func (e *Engine) lookup(h *packet.Header, final bool) (rules.Process, bool) {
-	live := h.Proto == packet.ProtoUDP || h.SYN && !h.ACK
+	start := process.Continuing
+	switch {
+	case h.Proto == packet.ProtoUDP && h.Dst.Port != 53:
+		start = process.NewDatagram
+	case h.Proto == packet.ProtoUDP, h.SYN && !h.ACK:
+		start = process.NewFlow
+	}
 	switch r := e.resolver.(type) {
 	case ownerResolver:
-		return r.Owner(h.Proto, h.Src, live, final)
+		return r.Owner(h.Proto, h.Src, start, final)
 	case liveResolver:
-		if live {
+		if start != process.Continuing {
 			return r.LookupLive(h.Proto, h.Src)
 		}
 	}
