@@ -21,13 +21,6 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-const (
-	holdFor    = 50 * time.Millisecond
-	holdTick   = 15 * time.Millisecond
-	maxPending = 256
-	udpWorkers = 4
-)
-
 // Start loads WinDivert, diverts outbound TCP/UDP, and relays flows selected
 // by the configuration. Other applications are reinjected unchanged.
 // VLESS bridges created here close when capture stops.
@@ -90,7 +83,15 @@ func start(parent context.Context, cfg *config.Config, logs *logbuf.Buffer, brid
 	if err != nil {
 		return nil, err
 	}
-	netH, err := windivert.Open("outbound and !impostor and (tcp or udp)", windivert.LayerNetwork, 0, 0)
+	port4, err := relayPort(cp.Relay.TCP4)
+	if err != nil {
+		return nil, err
+	}
+	port6, err := relayPort(cp.Relay.TCP6)
+	if err != nil {
+		return nil, err
+	}
+	netH, err := windivert.Open(netFilter(port4, port6), windivert.LayerNetwork, 0, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -114,7 +115,11 @@ func start(parent context.Context, cfg *config.Config, logs *logbuf.Buffer, brid
 		return nil, err
 	}
 	opened = append(opened, flowH)
-	_ = netH.ConfigureQueue()
+	// Socket events bunch up too: a burst lost there leaves packets
+	// without a program until holdFor runs out.
+	for _, h := range opened {
+		_ = h.ConfigureQueue()
+	}
 
 	div := &divert{h: netH}
 	eng.SetInjector(div)
@@ -132,28 +137,23 @@ func start(parent context.Context, cfg *config.Config, logs *logbuf.Buffer, brid
 
 	s := &Session{eng: eng, cancel: cancel, done: make(chan struct{}), bridges: bridges, bctx: ctx}
 	var wg sync.WaitGroup
-	udpCh := make(chan engine.UDPDatagram, 256)
-	for i := 0; i < udpWorkers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for d := range udpCh {
-				_ = eng.ForwardUDP(ctx, d)
-			}
-		}()
-	}
+	udp := newUDPQueue(udpShards, udpShardDepth, logs, func(d engine.UDPDatagram) {
+		_ = eng.ForwardUDP(ctx, d)
+	})
 	wg.Add(1)
 	go readEvents(ctx, sockH, res, &wg)
 	wg.Add(1)
 	go readEvents(ctx, flowH, res, &wg)
-	pkts := make(chan netMsg, 512)
+	// Up to 16 batches (1024 packets) wait for consume; the driver's
+	// queue holds the rest.
+	pkts := make(chan netBatch, 16)
 	wg.Add(1)
 	go recvNet(ctx, cancel, s, netH, pkts, &wg)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		defer close(udpCh)
-		consume(ctx, eng, div, logs, pkts, udpCh)
+		defer udp.close()
+		consume(ctx, newCapture(eng, div, udp), pkts)
 	}()
 	wg.Add(1)
 	go acceptLoop(ln4, eng, &wg)
@@ -217,24 +217,15 @@ func readEvents(ctx context.Context, h windivert.Handle, res *process.Resolver, 
 	}
 }
 
-type netMsg struct {
-	pkt  []byte
-	addr windivert.Address
-}
-
-type held struct {
-	pkt  []byte
-	addr windivert.Address
-	at   time.Time
-}
-
-func recvNet(ctx context.Context, cancel context.CancelFunc, s *Session, h windivert.Handle, out chan<- netMsg, wg *sync.WaitGroup) {
+// recvNet reads up to recvBatch packets per call into one reused buffer.
+// Each batch is copied once, and its packets are slices of that copy.
+func recvNet(ctx context.Context, cancel context.CancelFunc, s *Session, h windivert.Handle, out chan<- netBatch, wg *sync.WaitGroup) {
 	defer wg.Done()
 	defer close(out)
-	buf := make([]byte, 65535)
-	var addr windivert.Address
+	buf := make([]byte, recvBatch*windivert.MTUMax)
+	addrs := make([]windivert.Address, recvBatch)
 	for {
-		n, err := h.Recv(buf, &addr)
+		n, count, err := h.RecvBatch(buf, addrs)
 		if err != nil {
 			if ctx.Err() == nil && !windivert.IsNoData(err) {
 				s.setErr(fmt.Errorf("WinDivertRecv: %s", windivert.FormatError(err)))
@@ -242,109 +233,18 @@ func recvNet(ctx context.Context, cancel context.CancelFunc, s *Session, h windi
 			}
 			return
 		}
-		pkt := make([]byte, n)
-		copy(pkt, buf[:n])
-		msg := netMsg{pkt: pkt, addr: addr}
+		if n == 0 || count == 0 {
+			continue
+		}
+		data := make([]byte, n)
+		copy(data, buf[:n])
+		b := netBatch{pkts: windivert.SplitBatch(data, count, make([][]byte, 0, count))}
+		b.addrs = append([]windivert.Address(nil), addrs[:len(b.pkts)]...)
 		select {
-		case out <- msg:
+		case out <- b:
 		case <-ctx.Done():
 			return
 		}
-	}
-}
-
-func consume(ctx context.Context, eng *engine.Engine, div *divert, logs *logbuf.Buffer, in <-chan netMsg, udpCh chan<- engine.UDPDatagram) {
-	tick := time.NewTicker(holdTick)
-	defer tick.Stop()
-	var pending []held
-	flush := func(force bool) {
-		now := time.Now()
-		keep := pending[:0]
-		for _, h := range pending {
-			if force || now.Sub(h.at) >= holdFor {
-				queue(eng, div, logs, udpCh, &keep, h.pkt, h.addr, true)
-				continue
-			}
-			// The owning socket's event has often arrived by now. Decide
-			// on this tick instead of always waiting the full holdFor.
-			meta := engine.Meta{IfIdx: h.addr.IfIdx(), SubIfIdx: h.addr.SubIfIdx()}
-			res := eng.HandlePacket(h.pkt, meta, false)
-			if res.Action == engine.ActionUnknown {
-				keep = append(keep, h)
-				continue
-			}
-			apply(div, logs, udpCh, h.pkt, h.addr, res)
-		}
-		pending = keep
-	}
-	for {
-		select {
-		case <-ctx.Done():
-			flush(true)
-			return
-		case msg, ok := <-in:
-			if !ok {
-				flush(true)
-				return
-			}
-			if len(pending) >= maxPending {
-				flush(true)
-			}
-			queue(eng, div, logs, udpCh, &pending, msg.pkt, msg.addr, false)
-		case <-tick.C:
-			flush(false)
-		}
-	}
-}
-
-func queue(eng *engine.Engine, div *divert, logs *logbuf.Buffer, udpCh chan<- engine.UDPDatagram, pending *[]held, pkt []byte, addr windivert.Address, final bool) {
-	meta := engine.Meta{IfIdx: addr.IfIdx(), SubIfIdx: addr.SubIfIdx()}
-	res := eng.HandlePacket(pkt, meta, final)
-	if res.Action == engine.ActionUnknown && !final && len(*pending) < maxPending {
-		*pending = append(*pending, held{pkt: pkt, addr: addr, at: time.Now()})
-		return
-	}
-	if res.Action == engine.ActionUnknown {
-		res = eng.HandlePacket(pkt, meta, true)
-		if res.Action == engine.ActionUnknown {
-			res.Action = engine.ActionPass
-		}
-	}
-	apply(div, logs, udpCh, pkt, addr, res)
-}
-
-func apply(div *divert, logs *logbuf.Buffer, udpCh chan<- engine.UDPDatagram, pkt []byte, addr windivert.Address, res engine.Result) {
-	switch res.Action {
-	case engine.ActionDrop:
-		return
-	case engine.ActionUDP:
-		if res.UDP == nil {
-			return
-		}
-		select {
-		case udpCh <- *res.UDP:
-		default:
-			if logs != nil {
-				logs.Add(logbuf.Event{Process: res.UDP.Process, PID: res.UDP.PID, Proto: "UDP", Dest: res.UDP.OrigDst.String(), Via: res.UDP.ProxyName, Status: "blocked", Error: "очередь UDP переполнена"})
-			}
-		}
-		return
-	case engine.ActionModified:
-		// Impostor stops this handle from taking the packet again.
-		// WinDivert decrements TTL on impostor packets; that is acceptable
-		// because the packet was rewritten. Unmodified packets keep the
-		// address WinDivertRecv returned, so their TTL and checksum offload
-		// flags stay as they were.
-		addr.SetImpostor(true)
-		if res.Inbound {
-			addr.SetOutbound(false)
-			addr.SetIfIdx(res.IfIdx)
-			addr.SetSubIfIdx(res.SubIfIdx)
-		}
-		windivert.MarkValidChecksums(&addr, pkt)
-		_ = div.send(pkt, &addr)
-	default:
-		_ = div.send(pkt, &addr)
 	}
 }
 
@@ -389,6 +289,12 @@ func (d *divert) send(pkt []byte, addr *windivert.Address) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.h.Send(pkt, addr)
+}
+
+func (d *divert) sendBatch(b *windivert.Batch) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.h.SendBatch(b.Buf, b.Addrs)
 }
 
 func (d *divert) InjectInbound(pkt []byte, ifIdx, subIfIdx uint32) error {
