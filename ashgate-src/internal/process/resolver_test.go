@@ -350,3 +350,36 @@ func TestOwnerNewDatagramKeepsRecentlyClosedSocket(t *testing.T) {
 		t.Fatalf("new socket: %+v %v", p, ok)
 	}
 }
+
+// A process whose image cannot be read (PID 4, a protected one) has no
+// handle, so exited says true for it. Its live sockets must survive a prune;
+// those of a process that is gone do not.
+func TestPruneKeepsSocketsOfUnreadablePIDs(t *testing.T) {
+	start := time.Unix(1000, 0)
+	r, clock := testResolver(start)
+	r.SetImage(func(pid uint32) rules.Process {
+		if pid == 4 || pid == 6 {
+			return rules.Process{PID: pid} // unreadable
+		}
+		return rules.Process{PID: pid, Name: "app.exe", Path: `C:\apps\app.exe`}
+	})
+	r.SetExited(func(pid uint32) bool { return pid == 4 || pid == 6 || pid == 7 })
+	r.SetPresent(func(pid uint32) bool { return pid == 4 })
+	sys, prot, app := packet.V4(10, 0, 0, 1, 445), packet.V4(10, 0, 0, 1, 446), packet.V4(10, 0, 0, 1, 447)
+	r.Observe(packet.ProtoTCP, sys, 4, false)  // unreadable, runs
+	r.Observe(packet.ProtoTCP, prot, 6, false) // unreadable, gone
+	r.Observe(packet.ProtoTCP, app, 7, false)  // readable, exited by its handle
+	*clock = start.Add(pruneEvery)
+	r.Observe(packet.ProtoTCP, packet.V4(10, 0, 0, 1, 448), 8, false)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.exact[exactKey{packet.ProtoTCP, sys}]; !ok {
+		t.Fatal("the socket of a running unreadable PID was pruned")
+	}
+	if _, ok := r.exact[exactKey{packet.ProtoTCP, prot}]; ok {
+		t.Fatal("the socket of a gone PID was kept")
+	}
+	if _, ok := r.exact[exactKey{packet.ProtoTCP, app}]; ok {
+		t.Fatal("the socket of an exited process was kept")
+	}
+}

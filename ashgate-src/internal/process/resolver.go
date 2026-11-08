@@ -170,13 +170,29 @@ func (r *Resolver) pruneLocked(now time.Time) {
 		}
 		return d
 	}
+	// A socket's process is gone by the handle when its image is cached.
+	// Without one (System, a protected process) exited has no handle to
+	// ask and says true, so present decides; else live sockets would
+	// vanish every pruneEvery.
+	sockGone := map[uint32]bool{}
+	socketDead := func(pid uint32) bool {
+		if img, ok := r.images[pid]; ok && (img.Name != "" || img.Path != "") || r.present == nil {
+			return dead(pid)
+		}
+		d, ok := sockGone[pid]
+		if !ok {
+			d = !r.present(pid)
+			sockGone[pid] = d
+		}
+		return d
+	}
 	for k, e := range r.exact {
-		if !alive(e, now) || dead(e.proc.PID) {
+		if !alive(e, now) || socketDead(e.proc.PID) {
 			delete(r.exact, k)
 		}
 	}
 	for k, e := range r.wild {
-		if !alive(e, now) || dead(e.proc.PID) {
+		if !alive(e, now) || socketDead(e.proc.PID) {
 			delete(r.wild, k)
 		}
 	}
