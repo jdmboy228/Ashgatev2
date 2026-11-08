@@ -199,3 +199,18 @@ func TestDisplayUnnamedProcess(t *testing.T) {
 		t.Fatalf("protected process went %v", r.Action)
 	}
 }
+
+// The Windows DNS client can be a process whose image cannot be read. Its
+// DNS has no name for a rule to match and must still go through the
+// tunnel like the DNS client's, never direct.
+func TestUnnamedProcessDNSThroughTunnel(t *testing.T) {
+	e, _ := newEngine(t, testConfig(), fixedRes{p: rules.Process{PID: 1234}, ok: true}, &fakeDial{}, &memInj{})
+	q, _ := packet.BuildUDP(packet.V4(10, 0, 0, 2, 60994), packet.V4(168, 63, 129, 16, 53), dnsQuery(7, "n1.e2e-tunnel.example.com", 1))
+	if r := e.HandlePacket(q, Meta{}, true); r.Action != ActionUDP {
+		t.Fatalf("DNS of a nameless process went %v, want the tunnel", r.Action)
+	}
+	bypass, _ := packet.BuildUDP(packet.V4(10, 0, 0, 2, 60995), packet.V4(168, 63, 129, 16, 53), dnsQuery(8, "printer.local", 1))
+	if r := e.HandlePacket(bypass, Meta{}, true); r.Action != ActionPass {
+		t.Fatalf("a local name went %v, want the LAN", r.Action)
+	}
+}

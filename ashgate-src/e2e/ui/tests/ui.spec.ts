@@ -395,13 +395,18 @@ test.describe.serial("Ashgate window", () => {
         await screens("dialog-ap-gname");
         await closeDialog();
       }
+      // Renaming closed the group menu: open it again to ungroup.
+      if (!(await page.locator('[data-act="ap-gsplit"]').first().isVisible().catch(() => false))) {
+        await page.locator('.ap-card.group [data-act="ap-menu"]').first().click().catch(() => {});
+      }
       await page.locator('[data-act="ap-gsplit"]').first().click().catch(() => {});
       } else {
       findings.push({ kind: "groups", text: "no «group» button after selecting two rules" });
     }
 
     // Delete the curl rule (no confirmation by design).
-    const curl = page.locator(".ap-card", { hasText: "curl" });
+    // Not the group card, which also contains the curl rule if ungrouping failed.
+    const curl = page.locator(".ap-card:not(.group)", { hasText: "curl" });
     await curl.locator('[data-act="ap-menu"]').click();
     await page.locator('[data-act="ap-del"]').first().click();
     await expect(page.locator(".ap-card", { hasText: "curl" })).toHaveCount(0);

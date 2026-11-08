@@ -183,6 +183,8 @@ func TestFileReopensAfterFailedRotation(t *testing.T) {
 	clock := time.Unix(1000, 0)
 	w := newFileWriter(path, f)
 	w.now = func() time.Time { return clock }
+	// Windows cannot delete an open file; rotate's own Close is then a no-op.
+	_ = f.Close()
 	if err := os.RemoveAll(dir); err != nil { // the new file cannot be created
 		t.Fatal(err)
 	}
