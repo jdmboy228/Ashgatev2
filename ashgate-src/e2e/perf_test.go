@@ -383,7 +383,9 @@ func TestPerf(t *testing.T) {
 		if first.Goroutines >= 0 && len(rest) >= 10 && gSlope > 5 && float64(last.Goroutines-first.Goroutines) > 5*mins {
 			t.Errorf("goroutines keep growing: %.1f/min (%d → %d)", gSlope, first.Goroutines, last.Goroutines)
 		}
-		if pSlope > 3 && last.PrivateMB-first.PrivateMB > 3*mins {
+		// Like goroutines, memory steps of a megabyte or two read as growth
+		// over a few samples: judge it on the long run only.
+		if len(rest) >= 10 && pSlope > 3 && last.PrivateMB-first.PrivateMB > 3*mins {
 			t.Errorf("private memory keeps growing: %.1f MB/min (%.0f → %.0f MB)", pSlope, first.PrivateMB, last.PrivateMB)
 		}
 	})

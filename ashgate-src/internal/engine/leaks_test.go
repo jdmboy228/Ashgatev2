@@ -214,3 +214,18 @@ func TestUnnamedProcessDNSThroughTunnel(t *testing.T) {
 		t.Fatalf("a local name went %v, want the LAN", r.Action)
 	}
 }
+
+// Windows can report System (PID 4) as the owner of the DNS client's
+// socket. Its DNS must go through the tunnel too; its other traffic (SMB)
+// stays direct.
+func TestSystemProcessDNSThroughTunnel(t *testing.T) {
+	e, _ := newEngine(t, testConfig(), fixedRes{p: rules.Process{PID: 4, Name: "System"}, ok: true}, &fakeDial{}, &memInj{})
+	q, _ := packet.BuildUDP(packet.V4(10, 0, 0, 2, 62090), packet.V4(168, 63, 129, 16, 53), dnsQuery(9, "n5.e2e-tunnel.example.com", 1))
+	if r := e.HandlePacket(q, Meta{}, true); r.Action != ActionUDP {
+		t.Fatalf("DNS of System went %v, want the tunnel", r.Action)
+	}
+	smb, _ := packet.BuildTCP(packet.V4(10, 0, 0, 2, 4800), packet.V4(198, 51, 100, 3, 445), 0x02)
+	if r := e.HandlePacket(smb, Meta{}, true); r.Action != ActionPass {
+		t.Fatalf("SMB of System went %v, want direct", r.Action)
+	}
+}

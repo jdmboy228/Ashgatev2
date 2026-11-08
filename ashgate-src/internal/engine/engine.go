@@ -712,10 +712,11 @@ func (e *Engine) decide(pkt []byte, h *packet.Header, meta Meta, proc rules.Proc
 	}
 	proxyName := dec.Proxy
 	action := dec.Action
-	// A running process whose image cannot be read (a protected one, and
-	// the Windows DNS client can be one) has no name for a rule to match.
-	// Its DNS is treated like the DNS client's, never sent direct.
-	if action == "" && (rules.IsSystemDNS(proc.Name) || (proc.Name == "" && proc.Path == "")) {
+	// DNS that the Windows DNS client may have sent goes its way, never
+	// direct: the client itself, a process whose image cannot be read (no
+	// name for a rule), and System (PID 4), which Windows reports as the
+	// owner of the DNS client's long-lived socket (CI, leaks/Browser).
+	if action == "" && (rules.IsSystemDNS(proc.Name) || proc.PID == 4 || (proc.Name == "" && proc.Path == "")) {
 		if dns {
 			return e.systemDNS(pkt, h, meta, proc, snap)
 		}
