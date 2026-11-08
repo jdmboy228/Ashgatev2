@@ -22,7 +22,10 @@ func (e *Engine) addDirectUDP(k udpKey) {
 	m[k] = struct{}{}
 }
 
-// ForgetUDPPort drops the cached direct decisions of UDP sources on port.
+// ForgetUDPPort drops the cached decisions of UDP sources on port: direct,
+// blocked and "program unknown". A block or an unknown owner belonged to the
+// socket that closed, not to the next one on the port. Proxied flows in
+// e.udp stay; they retire on idle.
 // The capture loop calls it when a UDP socket on that port closes. The port
 // alone is enough: a socket bound to 0.0.0.0 closes with that address, and
 // forgetting too much only means one more lookup.
@@ -36,6 +39,16 @@ func (e *Engine) ForgetUDPPort(port uint16) {
 		e.directUDP.del(k)
 	}
 	delete(e.directPorts, port)
+	// These sets are small and have no port index: scan them.
+	for _, set := range []*ageSet[udpKey]{&e.blockUDP, &e.unknownUDP} {
+		for _, gen := range []map[udpKey]struct{}{set.cur, set.old} {
+			for k := range gen {
+				if k.Src.Port == port {
+					delete(gen, k)
+				}
+			}
+		}
+	}
 }
 
 // reindexDirectUDP rebuilds the port index from the cache after it aged,

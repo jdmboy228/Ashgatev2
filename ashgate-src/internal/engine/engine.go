@@ -471,10 +471,8 @@ func parseRelay(addr string, ver int) (packet.Addr, error) {
 func (e *Engine) HandlePacket(pkt []byte, meta Meta, final bool) Result {
 	var h packet.Header
 	if err := packet.Parse(pkt, &h); err != nil {
-		// Nothing tells whose it is. With a routed program it may be its.
-		if snap := e.snap.Load(); snap != nil && snap.strict {
-			return Result{Action: ActionDrop}
-		}
+		// No transport header means no ports to route by. Dropping would
+		// risk odd but legitimate traffic (offload packets).
 		return Result{Action: ActionPass}
 	}
 	if h.L4Off == 0 {

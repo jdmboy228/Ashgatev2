@@ -74,3 +74,30 @@ func TestUDPPortIndexFollowsTheCache(t *testing.T) {
 		t.Fatalf("index keeps %d ports the cache dropped", n)
 	}
 }
+
+// The port's blocked and unknown-owner entries go with its direct ones; other
+// ports keep theirs.
+func TestClosedUDPPortForgetsBlockAndUnknown(t *testing.T) {
+	e, _ := newEngine(t, testConfig(), &ownerRes{}, &fakeDial{}, nil)
+	dst := packet.V4(1, 2, 3, 4, 443)
+	mine, other := packet.V4(10, 0, 0, 4, 4444), packet.V4(10, 0, 0, 4, 4445)
+	e.mu.Lock()
+	e.blockUDP.add(udpKey{Src: mine, Dst: dst})
+	e.unknownUDP.add(udpKey{Src: mine, Dst: dst})
+	e.blockUDP.add(udpKey{Src: other, Dst: dst})
+	e.unknownUDP.add(udpKey{Src: other, Dst: dst})
+	e.blockUDP.rotate() // the old generation is scanned too
+	e.unknownUDP.rotate()
+	e.blockUDP.add(udpKey{Src: mine, Dst: packet.V4(5, 6, 7, 8, 443)})
+	e.mu.Unlock()
+	e.ForgetUDPPort(mine.Port)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.blockUDP.has(udpKey{Src: mine, Dst: dst}) || e.unknownUDP.has(udpKey{Src: mine, Dst: dst}) ||
+		e.blockUDP.has(udpKey{Src: mine, Dst: packet.V4(5, 6, 7, 8, 443)}) {
+		t.Fatal("entries of the closed port survive")
+	}
+	if !e.blockUDP.has(udpKey{Src: other, Dst: dst}) || !e.unknownUDP.has(udpKey{Src: other, Dst: dst}) {
+		t.Fatal("another port lost its entries")
+	}
+}
