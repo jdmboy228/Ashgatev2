@@ -145,9 +145,9 @@ func start(parent context.Context, cfg *config.Config, logs *logbuf.Buffer, brid
 		_ = eng.ForwardUDP(ctx, d)
 	})
 	wg.Add(1)
-	go readEvents(ctx, sockH, res, eng, &wg)
+	go readEvents(ctx, cancel, s, "сокетов", sockH, res, eng, &wg)
 	wg.Add(1)
-	go readEvents(ctx, flowH, res, eng, &wg)
+	go readEvents(ctx, cancel, s, "потоков", flowH, res, eng, &wg)
 	// Up to 16 batches (1024 packets) wait for consume; the driver's
 	// queue holds the rest.
 	pkts := make(chan netBatch, 16)
@@ -208,7 +208,11 @@ func start(parent context.Context, cfg *config.Config, logs *logbuf.Buffer, brid
 // udpProto is IPPROTO_UDP in a socket event.
 const udpProto = 17
 
-func readEvents(ctx context.Context, h windivert.Handle, res *process.Resolver, eng *engine.Engine, wg *sync.WaitGroup) {
+// readEvents feeds the resolver with socket or flow events (what names the
+// events in an error). Without them programs stay unknown, so a read error
+// ends the session like recvNet's does, instead of leaving capture running
+// blind.
+func readEvents(ctx context.Context, cancel context.CancelFunc, s *Session, what string, h windivert.Handle, res *process.Resolver, eng *engine.Engine, wg *sync.WaitGroup) {
 	defer wg.Done()
 	var addr windivert.Address
 	for {
@@ -216,6 +220,10 @@ func readEvents(ctx context.Context, h windivert.Handle, res *process.Resolver, 
 			return
 		}
 		if _, err := h.Recv(nil, &addr); err != nil {
+			if ctx.Err() == nil && !windivert.IsNoData(err) {
+				s.setErr(fmt.Errorf("WinDivertRecv (события %s): %s", what, windivert.FormatError(err)))
+				cancel()
+			}
 			return
 		}
 		ev := addr.Event()
