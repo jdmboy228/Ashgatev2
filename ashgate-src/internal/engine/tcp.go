@@ -278,21 +278,40 @@ func relay(dst countWriter, src *source) {
 	relayBufs.Put(bp)
 }
 
+// noReplyGrace is how long an upstream that has sent nothing at all may
+// stay open after the app ended its side. A half-closed connection that
+// was answered goes on as long as the server likes; one that never was
+// is a session nobody waits for, and closing it also cancels what Xray
+// still does for it (the dial retries of a black-holed destination ran
+// for over a minute after the app was gone).
+var noReplyGrace = 5 * time.Second
+
 // splice copies both ways until both ends are done. Each side gets EOF
 // as a half-close when the other stops sending. It returns the error the
 // upstream's reads ended with: nil for EOF or a close of our own.
 func splice(app, upstream net.Conn, up, down counter) error {
 	var wg sync.WaitGroup
 	wg.Add(1)
+	var grace atomic.Pointer[time.Timer]
 	go func() {
 		defer wg.Done()
 		relay(countWriter{upstream, up}, &source{r: app})
 		closeWrite(upstream)
+		// The app is gone or finished sending. If the upstream has not
+		// said a single byte, give it noReplyGrace, then close it fully.
+		grace.Store(time.AfterFunc(noReplyGrace, func() {
+			if down.flow.Load() == 0 {
+				_ = upstream.Close()
+			}
+		}))
 	}()
 	from := &source{r: upstream}
 	relay(countWriter{app, down}, from)
 	closeWrite(app)
 	wg.Wait()
+	if t := grace.Load(); t != nil {
+		t.Stop()
+	}
 	if err := from.err; err != nil && err != io.EOF && !errors.Is(err, net.ErrClosed) && !errors.Is(err, io.ErrClosedPipe) {
 		return err
 	}

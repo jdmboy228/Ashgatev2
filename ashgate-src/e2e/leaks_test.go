@@ -393,6 +393,20 @@ func TestLeaks(t *testing.T) {
 		if d := ownDirect(socks, directIP); len(d) > 0 {
 			t.Errorf("ashgate.exe connected directly to %v", d)
 		}
+		// The request to the black hole never gets an answer. Wait until
+		// the relay has let go of it (it closes an unanswered upstream a
+		// few seconds after the client is gone), so that its dial retries
+		// do not run into the next subtests.
+		if err := harness.Eventually(30*time.Second, 500*time.Millisecond, func() error {
+			for _, sk := range harness.SocketsOf(pid) {
+				if sk.Remote.String() == directIP {
+					return fmt.Errorf("ashgate.exe still has a socket to %s", directIP)
+				}
+			}
+			return nil
+		}); err != nil {
+			t.Errorf("the direct-domain flow did not end: %v", err)
+		}
 	})
 
 	t.Run("KillSwitchServersDown", func(t *testing.T) {
@@ -533,7 +547,10 @@ func TestLeaks(t *testing.T) {
 		if leak := harness.Filter(pkts, harness.DNSFor("e2e-server")); len(leak) > 0 {
 			t.Errorf("the server name went out in plain DNS:%s", harness.Brief(leak, 5))
 		}
-		if d := ownDirect(socks); len(d) > 0 {
+		// DirectHostIP is direct by design (the Direct domain of
+		// DomainExceptions); a leftover connection of an earlier subtest to
+		// it says nothing about how the VLESS server's name was resolved.
+		if d := ownDirect(socks, directHost()); len(d) > 0 {
 			t.Errorf("ashgate.exe connected directly to %v while resolving its server", d)
 		}
 	})

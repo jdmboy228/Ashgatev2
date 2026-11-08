@@ -200,3 +200,65 @@ func TestSpliceUsesLargeBuffers(t *testing.T) {
 		t.Fatalf("largest write %d, total %d, counted %d", app.max, app.total, c.Load())
 	}
 }
+
+// silentUpstream never answers: reads block until Close, and CloseWrite
+// only records the half-close like a VLESS session does.
+type silentUpstream struct {
+	net.Conn
+	closed chan struct{}
+	once   sync.Once
+}
+
+func (u *silentUpstream) Read([]byte) (int, error) {
+	<-u.closed
+	return 0, net.ErrClosed
+}
+func (u *silentUpstream) Write(p []byte) (int, error) { return len(p), nil }
+func (u *silentUpstream) CloseWrite() error           { return nil }
+func (u *silentUpstream) Close() error {
+	u.once.Do(func() { close(u.closed) })
+	return nil
+}
+
+// After the app ended its side, an upstream that has sent nothing is
+// closed after noReplyGrace; one that answered keeps its half-close.
+func TestSpliceClosesSilentUpstreamAfterAppEOF(t *testing.T) {
+	old := noReplyGrace
+	noReplyGrace = 200 * time.Millisecond
+	defer func() { noReplyGrace = old }()
+
+	run := func(answer bool) (took time.Duration, closedEarly bool) {
+		near, far := net.Pipe()
+		up := &silentUpstream{closed: make(chan struct{})}
+		var a, b, c, d atomic.Int64
+		if answer {
+			c.Store(1) // the upstream's first bytes were counted
+		}
+		finished := make(chan error, 1)
+		start := time.Now()
+		go func() {
+			finished <- splice(near, up, counter{flow: &a, total: &b}, counter{flow: &c, total: &d})
+		}()
+		_, _ = far.Write([]byte("GET /"))
+		_ = far.Close() // the app gives up
+		select {
+		case err := <-finished:
+			if err != nil {
+				t.Errorf("splice: %v", err)
+			}
+			return time.Since(start), true
+		case <-time.After(1500 * time.Millisecond):
+			up.Close() // let the half-closed relay end
+			<-finished
+			return 0, false
+		}
+	}
+
+	took, ok := run(false)
+	if !ok || took < noReplyGrace {
+		t.Fatalf("silent upstream: closed=%v after %v, want close after ~%v", ok, took, noReplyGrace)
+	}
+	if _, ok := run(true); ok {
+		t.Fatal("an upstream that answered was closed after the app's EOF")
+	}
+}

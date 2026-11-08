@@ -312,7 +312,18 @@ func TestPerf(t *testing.T) {
 		if n := churnFail.Load(); n > 0 {
 			t.Errorf("%d rounds of short connections failed during the run", n)
 		}
-		warm := len(samples) / 5
+		// Warm-up: caches, pools and the Go heap settle in the first minute
+		// or so, a step and then a plateau. Skip a fifth of the run and at
+		// least 60 s, so that a short push run does not fit the step as
+		// growth (the 10-minute run still skips 2 minutes).
+		warmAt := max(60.0, d.Seconds()/5)
+		warm := len(samples)
+		for i, s := range samples {
+			if s.At >= warmAt {
+				warm = i
+				break
+			}
+		}
 		if len(samples)-warm < 4 {
 			return
 		}
