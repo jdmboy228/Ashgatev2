@@ -17,18 +17,27 @@ The app is in `ashgate-src/` (Go module `ashgate`). The installer is `installer.
   (`.claude/agents/ci-log-analyzer.md`) with the run id. Do not read raw Windows runner logs in
   the main session.
 
-## E2E progress (2026-11-01)
+## E2E progress (2026-11-08)
 
-- Green on version 0.9.1: push run 41315227236, and the long workflow_dispatch run 41316470292
-  (failover back to XHTTP after 1204 s, 10-minute stability and growth). All 8 jobs pass.
-- App bugs found and fixed are in `ashgate-src/CHANGELOG.md` under 0.9.1.
-- 0.9.2 (branch `dns-leaks`, PR #1): DNS never reaches the provider for routed apps (Windows DNS
-  client through the tunnel except .ru/.рф/.su and bypass names, DoH for Ashgate's own lookups).
-  Push run 41347818766 green; the long workflow_dispatch run is not done yet. Locally, build with
-  `-overlay` stubs for `internal/vless/xray.go` and `inproc.go`: a full Xray build does not fit the disk.
+- 0.9.3 (PR #2, branch `audit-0.9.3`, includes 0.9.2 from PR #1): VLESS TCP in-process
+  (`vless.DialTCP`), batched WinDivert I/O, lossless UDP, adaptive handshake gate, leak fixes,
+  UI fixes. See `ashgate-src/CHANGELOG.md` under 0.9.3.
+- Green on 0.9.3: PR run 42502394766 and the long workflow_dispatch run 42502418664 (failover
+  back to XHTTP after 1205 s, 10-minute growth flat). All jobs pass.
+- Load test on the CI runner (varies with the runner), 0.9.1 → 0.9.3: RAW 46.7 → 72–135 MB/s,
+  XHTTP 28.2 → 66–124 MB/s; Ashgate CPU per 100 MB 4.1 → 1.1–2.2 s (RAW), 6.3 → 1.3–2.6 s
+  (XHTTP). The page no longer polls in the tray. Failover to RAW still takes ~86 s in the test
+  (the early check needs failing app traffic, which that test does not make).
+- The leak test runs at log level debug: ashgate.log then says why each DNS packet went direct.
+  Windows reports System (PID 4) as the owner of the DNS client's socket; its DNS must take the
+  system DNS path (engine.decide).
+- Local builds (1 CPU, small disk): every go command under
+  `flock $CLAUDE_JOB_DIR/tmp/go.lock` with `GOFLAGS=-p=1`. Everything except `./internal/vless/`
+  is built with `-overlay` stubs for `internal/vless/xray.go` and `inproc.go` (drop
+  `inproc_test.go`), so Xray is never compiled, and never with `-race`. Never build `./e2e/...`
+  locally: the harness imports Xray and a Windows Xray build fills the disk.
 - go-webview2 is a patched copy in `ashgate-src/third_party/go-webview2`, pulled in by `replace` in
   go.mod. See its PATCHES.md, and keep the patch when updating the module.
-- Flagged, not changed:
-  - The page keeps polling `/api/state` every 3 s while in the tray.
-  - `schtasks.exe` runs once a minute for the autostart check.
-  - `ashgate.exe` has no VERSIONINFO resource.
+- Known limits, not changed: datagrams over 8 KB through VLESS are truncated (as in Xray);
+  later IP fragments may not be captured by WinDivert at all; `update.bat` still trusts the
+  clone's `.git/config` (it builds the clone's code elevated anyway).
