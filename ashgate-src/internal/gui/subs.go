@@ -581,11 +581,14 @@ func (c *controller) addSub(name, rawURL string) error {
 		return err
 	}
 	now := time.Now()
-	// Copy the config under the lock, after the fetch: a copy taken
-	// before it would undo whatever the window saved meanwhile.
+	// Copy the config after the fetch and save it under saveMu: a copy
+	// taken earlier, or a save in between, would undo what the window
+	// saved meanwhile.
+	c.saveMu.Lock()
 	c.mu.Lock()
 	if _, ok := c.cfg.ProxyByName(name); ok {
 		c.mu.Unlock()
+		c.saveMu.Unlock()
 		return errors.New("Имя прокси уже занято.")
 	}
 	cfg := cloneCfg(c.cfg)
@@ -594,7 +597,9 @@ func (c *controller) addSub(name, rawURL string) error {
 		Name: name, Type: "vless",
 		Sub: &config.Subscription{Sealed: sealed, Count: len(ordered), Host: subs.Mask(rawURL), UpdatedAt: now, CheckedAt: now},
 	})
-	if err := c.replace(cfg); err != nil {
+	err = c.replaceLocked(cfg)
+	c.saveMu.Unlock()
+	if err != nil {
 		return err
 	}
 	c.subLog(name, "info", "Подписка добавлена: серверов "+strconv.Itoa(len(ordered)))

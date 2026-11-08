@@ -180,7 +180,7 @@ func TestHandshakeGate(t *testing.T) {
 
 // A bridge's dispatch context is the one Xray's SOCKS inbound would give:
 // the instance (sniffing needs it), the inbound tag, sniffing only with
-// Direct domains, and the policy's 30-minute idle timeout.
+// Direct domains, and the policy's timeouts.
 func TestBridgeContext(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -193,6 +193,9 @@ func TestBridgeContext(t *testing.T) {
 	pm := br.inst.GetFeature(policy.ManagerType()).(policy.Manager)
 	if idle := pm.ForLevel(0).Timeouts.ConnectionIdle; idle != 30*time.Minute {
 		t.Fatalf("connIdle %v", idle)
+	}
+	if to := pm.ForLevel(0).Timeouts; to.UplinkOnly != 2*time.Second || to.DownlinkOnly != 5*time.Second {
+		t.Fatalf("uplinkOnly %v downlinkOnly %v", to.UplinkOnly, to.DownlinkOnly)
 	}
 	if hs := pm.ForLevel(0).Timeouts.Handshake; hs != 60*time.Second {
 		t.Fatalf("other timeouts changed: handshake %v", hs)

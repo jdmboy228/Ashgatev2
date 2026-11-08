@@ -425,8 +425,12 @@ func ClientJSON(c ClientConfig) ([]byte, error) {
 		"log":      map[string]any{"loglevel": "info"},
 		"inbounds": inbounds,
 		// Xray closes a connection idle for 300 s by default, which drops
-		// quiet SSH and IMAP sessions. 30 minutes; other timeouts stay.
-		"policy": map[string]any{"levels": map[string]any{"0": map[string]any{"connIdle": 1800}}},
+		// quiet SSH and IMAP sessions: 30 minutes. After one side finishes,
+		// Xray's default gives the other side 1 s of silence, which cuts a
+		// slow answer to a half-closed request: 2 s and 5 s, as V2Ray had.
+		"policy": map[string]any{"levels": map[string]any{"0": map[string]any{
+			"connIdle": 1800, "uplinkOnly": 2, "downlinkOnly": 5,
+		}}},
 	}
 	if len(c.Routing.DNS) > 0 {
 		dnsOut := map[string]any{"tag": tagDNS, "protocol": "dns"}

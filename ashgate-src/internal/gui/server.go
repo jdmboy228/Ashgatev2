@@ -714,6 +714,12 @@ func (c *controller) stop() error {
 func (c *controller) replace(next *config.Config) error {
 	c.saveMu.Lock()
 	defer c.saveMu.Unlock()
+	return c.replaceLocked(next)
+}
+
+// replaceLocked is replace for a caller that holds saveMu: it can copy the
+// current config, change it and save it with no other save in between.
+func (c *controller) replaceLocked(next *config.Config) error {
 	c.mu.Lock()
 	old := c.cfg
 	c.mu.Unlock()
