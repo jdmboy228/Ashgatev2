@@ -204,6 +204,21 @@ func TestXHTTPRealityEcho(t *testing.T) {
 	if string(buf) != "xhttp" {
 		t.Fatalf("%q", buf)
 	}
+
+	// The same tunnel in-process, without the SOCKS5 hop.
+	inproc, err := vless.DialTCP(br.Addr, host, eport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer inproc.Close()
+	if _, err := io.WriteString(inproc, "in-process"); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, 10)
+	_ = inproc.SetReadDeadline(time.Now().Add(12 * time.Second))
+	if _, err := io.ReadFull(inproc, got); err != nil || string(got) != "in-process" {
+		t.Fatalf("xhttp in-process: %q %v\n%s", got, err, vless.RecentLog(time.Now().Add(-30*time.Second)))
+	}
 }
 
 func TestTLSWSEcho(t *testing.T) {
@@ -1008,22 +1023,37 @@ func TestDirectDomainsSkipTheTunnel(t *testing.T) {
 	}
 	t.Cleanup(br.Close)
 	host, port := splitHostPort(t, origin)
-	get := func(hostHeader string) string {
-		conn, err := socks5.Dial(ctx, config.Proxy{Address: br.Addr, Username: br.User, Password: br.Pass}, host, port)
-		if err != nil {
-			return ""
+	// Both ways in: the private SOCKS5 inbound (health checks) and the
+	// in-process dial (capture), which sniffs the same.
+	dials := map[string]func() (net.Conn, error){
+		"socks5": func() (net.Conn, error) {
+			return socks5.Dial(ctx, config.Proxy{Address: br.Addr, Username: br.User, Password: br.Pass}, host, port)
+		},
+		"in-process": func() (net.Conn, error) { return vless.DialTCP(br.Addr, host, port) },
+	}
+	for how, dial := range dials {
+		get := func(hostHeader string) (string, bool) {
+			conn, err := dial()
+			if err != nil {
+				return "", false
+			}
+			defer conn.Close()
+			_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+			_, _ = fmt.Fprintf(conn, "GET / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", hostHeader)
+			body, _ := io.ReadAll(conn)
+			d, ok := conn.(interface{ Direct() bool })
+			return string(body), ok && d.Direct()
 		}
-		defer conn.Close()
-		_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
-		_, _ = fmt.Fprintf(conn, "GET / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", hostHeader)
-		body, _ := io.ReadAll(conn)
-		return string(body)
-	}
-	if body := get("www.direct.test"); !strings.Contains(body, "direct-ok") {
-		t.Fatalf("direct-list name did not go direct: %q", body)
-	}
-	if body := get("other.test"); strings.Contains(body, "direct-ok") {
-		t.Fatal("a name off the list went direct")
+		body, direct := get("www.direct.test")
+		if !strings.Contains(body, "direct-ok") {
+			t.Fatalf("%s: direct-list name did not go direct: %q", how, body)
+		}
+		if how == "in-process" && !direct {
+			t.Fatal("the in-process connection does not report its direct route")
+		}
+		if body, _ := get("other.test"); strings.Contains(body, "direct-ok") {
+			t.Fatalf("%s: a name off the list went direct", how)
+		}
 	}
 }
 

@@ -190,6 +190,7 @@ func TestClientJSONPublishesSOCKSAndHTTP(t *testing.T) {
 	for _, want := range []string{
 		`"port":20000`, `"port":10808`, `"port":10809`, `"protocol":"socks"`, `"protocol":"http"`,
 		`"user":"u1"`, `"pass":"p1"`, `"user":"dolphin"`, `"pass":"secret"`, `"udp":false`,
+		`"policy":{"levels":{"0":{"connIdle":1800}}}`,
 	} {
 		if !strings.Contains(s, want) {
 			t.Fatalf("missing %s\n%s", want, s)
