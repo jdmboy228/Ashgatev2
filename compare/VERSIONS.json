@@ -1,0 +1,26 @@
+{
+  "server": {
+    "id": "xray-core",
+    "version": "v26.10.31",
+    "file": "Xray-windows-64.zip",
+    "url": "https://github.com/XTLS/Xray-core/releases/download/v26.10.31/Xray-windows-64.zip",
+    "sha256": "2e04a9995a6f2ad1b28c0bb25c708ecb2695e43a1c9c7889c4b6ac2b48cf7a6a",
+    "publisher_sha256_file": "https://github.com/XTLS/Xray-core/releases/download/v26.10.31/Xray-windows-64.zip.dgst"
+  },
+  "clients": {
+    "sing-box": {
+      "version": "1.14.4",
+      "file": "sing-box-1.14.4-windows-amd64.zip",
+      "url": "https://github.com/SagerNet/sing-box/releases/download/v1.14.4/sing-box-1.14.4-windows-amd64.zip",
+      "sha256": "99185d75d314a07dbba4a130c8ad986cbeb629a07927975636b341ca61f991df",
+      "exe": "sing-box-1.14.4-windows-amd64/sing-box.exe"
+    },
+    "v2rayn": {
+      "version": "7.25.6",
+      "file": "v2rayN-windows-64.zip",
+      "url": "https://github.com/2dust/v2rayN/releases/download/7.25.6/v2rayN-windows-64.zip",
+      "sha256": "9b94718c2a214a246b04dec84b9a27f1f0ced8489c2dd25eb80a0fbb806bd13f",
+      "exe": "v2rayN-windows-64/v2rayN.exe"
+    }
+  }
+}
