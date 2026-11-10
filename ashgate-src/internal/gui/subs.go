@@ -53,9 +53,6 @@ const browserUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/201
 // subRand is the jitter source; tests replace it.
 var subRand = rand.Float64
 
-// foConfig holds the failover timings; tests shorten them.
-var foConfig = failover.Defaults
-
 // tunnelSession is what the subscription loop reads from the capture
 // session.
 type tunnelSession interface {
@@ -64,9 +61,22 @@ type tunnelSession interface {
 	RuleStats() map[string]engine.RuleStat
 }
 
-// sessionOf is c's capture session or nil; tests replace it. Callers hold
-// c.mu.
-var sessionOf = func(c *controller) tunnelSession {
+// foHooks replaces, per controller, what the failover loop reads and runs.
+// Only tests set them, before the first round they drive; nil fields mean
+// the real thing. They are fields, not package variables: controllers of
+// other tests keep running their loops.
+type foHooks struct {
+	session func() tunnelSession
+	check   func(vless.Status) failover.Result
+	probe   func(subs.Entry) bool
+	route   func(addr string) bool
+}
+
+// tunnel is c's capture session or nil. Callers hold c.mu.
+func (c *controller) tunnel() tunnelSession {
+	if c.fo.session != nil {
+		return c.fo.session()
+	}
 	if c.sess == nil {
 		return nil
 	}
@@ -193,13 +203,13 @@ func openSub(p config.Proxy, now time.Time) *subGroup {
 	sec, err := subs.Open(p.Sub.Sealed)
 	if err != nil {
 		g.openErr = "Подписка: " + err.Error()
-		g.fo = failover.New(0, now, foConfig, subRand)
+		g.fo = failover.New(0, now, failover.Defaults, subRand)
 		g.nextFetch = now.Add(100 * 365 * 24 * time.Hour)
 		return g
 	}
 	g.url = sec.URL
 	g.entries = subs.Entries(sec.Links)
-	g.fo = failover.New(len(g.entries), now, foConfig, subRand)
+	g.fo = failover.New(len(g.entries), now, failover.Defaults, subRand)
 	g.nextFetch = nextUpdate(p.Sub.UpdatedAt)
 	if p.Sub.UpdatedAt.IsZero() || g.nextFetch.Before(now.Add(subFirst)) {
 		// Due: give the tunnel a minute to come up, so the update can go
@@ -299,6 +309,7 @@ func (c *controller) subLog(name, status, msg string) {
 // subsLoop runs updates, and watches the traffic through the active
 // servers for the checks and probes it calls for.
 func (c *controller) subsLoop() {
+	defer close(c.loopDone)
 	t := time.NewTicker(subTick)
 	defer t.Stop()
 	for {
@@ -315,7 +326,7 @@ func (c *controller) subsTick(now time.Time) {
 	var fetch string
 	var checks, probes []string
 	c.mu.Lock()
-	sess := sessionOf(c)
+	sess := c.tunnel()
 	running := sess != nil && sess.Running()
 	var stats map[string]engine.RuleStat
 	for name, g := range c.subs {
@@ -582,8 +593,15 @@ func (c *controller) healthCheck(name string) {
 		server = g.entries[g.fo.Active].Address
 	}
 	c.mu.Unlock()
-	res := checkActive(st)
-	if res != failover.OK && !routeTo(server) {
+	check, route := checkBridge, hasRoute
+	if c.fo.check != nil {
+		check = c.fo.check
+	}
+	if c.fo.route != nil {
+		route = c.fo.route
+	}
+	res := check(st)
+	if res != failover.OK && !route(server) {
 		res = failover.NoNetwork
 	}
 	c.mu.Lock()
@@ -593,7 +611,7 @@ func (c *controller) healthCheck(name string) {
 	}
 	// Real traffic answered while the check ran outweighs the check.
 	var good time.Time
-	if sess := sessionOf(c); sess != nil && sess.Running() {
+	if sess := c.tunnel(); sess != nil && sess.Running() {
 		good = sess.RelayHealth(name, g.fo.Since()).LastGood
 	}
 	switched := g.fo.Check(time.Now(), res, good, g.label)
@@ -606,21 +624,21 @@ func (c *controller) healthCheck(name string) {
 	}
 }
 
-// checkActive checks the active server through its bridge; one that is not
-// up has failed. Tests replace it.
-var checkActive = func(st vless.Status) failover.Result {
+// checkBridge checks the active server through its bridge; one that is not
+// up has failed.
+func checkBridge(st vless.Status) failover.Result {
 	if !st.Up || st.SOCKS == "" {
 		return failover.Failed
 	}
 	return checkTunnel(context.Background(), st.SOCKS, st.User, st.Pass)
 }
 
-// routeTo reports whether this machine has a route to the server at addr
+// hasRoute reports whether this machine has a route to the server at addr
 // (IP:port). It sends nothing: connecting a UDP socket only asks the
 // routing table. With no route, a failed check means the machine's own
 // network is down. An address that is a name, or anything else that
-// cannot be asked, counts as reachable. Tests replace it.
-var routeTo = func(addr string) bool {
+// cannot be asked, counts as reachable.
+func hasRoute(addr string) bool {
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil || net.ParseIP(host) == nil {
 		return true
@@ -633,9 +651,9 @@ var routeTo = func(addr string) bool {
 	return true
 }
 
-// probeEntry checks a server that carries no traffic through a tunnel of
-// its own, made for this one check. Tests replace it.
-var probeEntry = func(e subs.Entry) bool {
+// probeServer checks a server that carries no traffic through a tunnel of
+// its own, made for this one check.
+func probeServer(e subs.Entry) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
 	defer cancel()
 	br, err := vless.Listen(ctx, e.Address, e.Params, vless.Inbound{})
@@ -669,7 +687,11 @@ func (c *controller) probePrimary(name string) {
 		e = g.entries[0]
 	}
 	c.mu.Unlock()
-	ok := e.Link != "" && probeEntry(e)
+	probe := probeServer
+	if c.fo.probe != nil {
+		probe = c.fo.probe
+	}
+	ok := e.Link != "" && probe(e)
 	c.mu.Lock()
 	if g == nil || c.subs[name] != g {
 		c.mu.Unlock()

@@ -348,6 +348,8 @@ type foRig struct {
 	probes int
 	// noRoute: the machine has no route to the server.
 	noRoute bool
+	// during runs while a check of the active server is under way.
+	during func()
 }
 
 const rigSub = "sub"
@@ -355,37 +357,40 @@ const rigSub = "sub"
 func newFoRig(t *testing.T, cfg failover.Config) *foRig {
 	t.Helper()
 	r := &foRig{t: t, ft: &fakeTunnel{}}
-	oldRand, oldSess, oldCfg, oldCheck, oldProbe, oldRoute := subRand, sessionOf, foConfig, checkActive, probeEntry, routeTo
-	routeTo = func(string) bool {
-		r.mu.Lock()
-		defer r.mu.Unlock()
-		return !r.noRoute
-	}
-	subRand = func() float64 { return 0.5 }
-	sessionOf = func(*controller) tunnelSession { return r.ft }
-	foConfig = cfg
-	checkActive = func(vless.Status) failover.Result {
-		r.mu.Lock()
-		defer r.mu.Unlock()
-		r.checks++
-		return r.check
-	}
-	probeEntry = func(subs.Entry) bool {
-		r.mu.Lock()
-		defer r.mu.Unlock()
-		r.probes++
-		return r.probe
-	}
-	t.Cleanup(func() {
-		subRand, sessionOf, foConfig, checkActive, probeEntry, routeTo = oldRand, oldSess, oldCfg, oldCheck, oldProbe, oldRoute
-	})
-
 	r.logs, _ = logbuf.New(50, "")
 	r.c = newController(filepath.Join(t.TempDir(), "config.json"), config.Default(), r.logs, hooks{})
 	t.Cleanup(r.c.shutdown)
+	// The test runs the loop's rounds itself (tick). The controller's own
+	// loop would run them too, four times a second: stop it, and wait
+	// until it has, before anything it reads is set.
+	r.c.doneOnce.Do(func() { close(r.c.done) })
+	<-r.c.loopDone
 	r.g = &subGroup{entries: subs.Entries([]string{subLink("xhttp", "x1"), subLink("tcp", "raw1")}),
-		fo: failover.New(2, time.Now(), cfg, subRand), nextFetch: time.Now().Add(24 * time.Hour)}
+		fo: failover.New(2, time.Now(), cfg, func() float64 { return 0.5 }), nextFetch: time.Now().Add(24 * time.Hour)}
 	r.c.mu.Lock()
+	r.c.fo = foHooks{
+		session: func() tunnelSession { return r.ft },
+		check: func(vless.Status) failover.Result {
+			r.mu.Lock()
+			defer r.mu.Unlock()
+			r.checks++
+			if r.during != nil {
+				r.during()
+			}
+			return r.check
+		},
+		probe: func(subs.Entry) bool {
+			r.mu.Lock()
+			defer r.mu.Unlock()
+			r.probes++
+			return r.probe
+		},
+		route: func(string) bool {
+			r.mu.Lock()
+			defer r.mu.Unlock()
+			return !r.noRoute
+		},
+	}
 	r.c.subs = map[string]*subGroup{rigSub: r.g}
 	r.c.mu.Unlock()
 	return r
@@ -557,11 +562,13 @@ func TestAnswerDuringCheckKeepsServer(t *testing.T) {
 	asked := time.Now()
 	r.ft.set(engine.RelayHealth{Waiting: 1, WaitingSince: asked, LastAsk: asked})
 	time.Sleep(210 * time.Millisecond)
-	checkActive = func(vless.Status) failover.Result {
+	r.mu.Lock()
+	r.check = failover.Frozen
+	r.during = func() {
 		// A relay gets its first bytes while the check waits in vain.
 		r.ft.set(engine.RelayHealth{LastGood: time.Now(), LastAsk: asked})
-		return failover.Frozen
 	}
+	r.mu.Unlock()
 	r.tick(time.Now())
 	if r.active() != 0 {
 		t.Fatal("switched although traffic was answered during the check")
