@@ -107,10 +107,10 @@ function Get-Tree([int]$Root) {
     while ($changed) {
         $changed = $false
         foreach ($p in $all) {
-            $pid = [int]$p.ProcessId
-            $ppid = [int]$p.ParentProcessId
-            if ($ids.Contains($ppid) -and -not $ids.Contains($pid)) {
-                $ids.Add($pid)
+            $procId = [int]$p.ProcessId
+            $parentId = [int]$p.ParentProcessId
+            if ($ids.Contains($parentId) -and -not $ids.Contains($procId)) {
+                $ids.Add($procId)
                 $changed = $true
             }
         }
@@ -204,7 +204,8 @@ function Invoke-Captured([string]$Name, [string[]]$Names, [scriptblock]$Body) {
     if ($LASTEXITCODE -ne 0) { throw "packet capture did not start" }
     Start-Sleep -Milliseconds 1200
     try {
-        & $Body
+        # Callers dot-source this function so the body sees their variables.
+        . $Body
     } finally {
         Start-Sleep -Milliseconds 700
         & pktmon stop 2>&1 | Out-Null
@@ -219,7 +220,7 @@ function Invoke-Captured([string]$Name, [string[]]$Names, [scriptblock]$Body) {
     & $script:Lab @arg
     if ($LASTEXITCODE -ne 0) { throw "packet summary failed" }
     Remove-Item $etl, $pcap -Force -ErrorAction SilentlyContinue
-    return (Get-Content -Raw $json | ConvertFrom-Json)
+    $script:LastCapture = Get-Content -Raw $json | ConvertFrom-Json
 }
 
 function Count-Name($Summary, [string]$Name) {
@@ -265,6 +266,23 @@ function Wait-Connected($Proc, [string]$LogPath) {
     return @{ ok = $ok; error = Hide-Secrets $err; seconds = [math]::Round($launch.Elapsed.TotalSeconds, 2) }
 }
 
+function Stop-OneClient($Client) {
+    if (-not $Client -or -not $Client.Pid) { return }
+    $procId = [int]$Client.Pid
+    switch ($Client.Tool) {
+        "ashgate" {
+            & $script:AshgateExe quit 2>&1 | Out-Null
+            Start-Sleep -Seconds 1
+            if ($Client.Config) { & $script:AshgateExe cleanup -config $Client.Config 2>&1 | Out-Null }
+        }
+    }
+    $alive = Get-Process -Id $procId -ErrorAction SilentlyContinue
+    if ($alive) { & taskkill.exe /T /F /PID $procId 2>&1 | Out-Null }
+    if ($Client.Tool -eq "v2rayn") {
+        Get-Process -Name v2rayN -ErrorAction SilentlyContinue | ForEach-Object { & taskkill.exe /T /F /PID $_.Id 2>&1 | Out-Null }
+    }
+}
+
 function Start-Ashgate([string]$Transport, [bool]$KillSwitch, [bool]$Failover) {
     $dir = Join-Path $script:Out "clients\ashgate"
     New-Item -ItemType Directory -Force $dir | Out-Null
@@ -274,32 +292,26 @@ function Start-Ashgate([string]$Transport, [bool]$KillSwitch, [bool]$Failover) {
     $setup = [Diagnostics.Stopwatch]::StartNew()
     & $script:Python (Join-Path $script:Compare "configs.py") ashgate --lab $script:LabJson --rules $script:Rules --probe $script:ProbeExe --out $cfg --kill-switch $ks --mode $mode --transport $Transport
     if ($LASTEXITCODE -ne 0) {
-        return @{ Ok = $false; Error = "could not write configuration"; Pid = 0; Actions = @(); Stop = { }; ScanRoots = @() }
+        return @{ Ok = $false; Error = "could not write configuration"; Pid = 0; Tool = "ashgate"; Actions = @(); ScanRoots = @() }
     }
     $setup.Stop()
     & $script:AshgateExe quit 2>&1 | Out-Null
     & $script:AshgateExe cleanup -config $cfg 2>&1 | Out-Null
     $proc = Start-Process -FilePath $script:AshgateExe -ArgumentList @("--autostart", "-config", $cfg) -PassThru
     $wait = Wait-Connected $proc (Join-Path $dir "ashgate.log")
-    $stop = {
-        & $script:AshgateExe quit 2>&1 | Out-Null
-        Start-Sleep -Seconds 1
-        & $script:AshgateExe cleanup -config $cfg 2>&1 | Out-Null
-        if ($proc -and -not $proc.HasExited) { & taskkill.exe /T /F /PID $proc.Id 2>&1 | Out-Null }
-    }.GetNewClosure()
     return @{
-        Ok = $wait.ok; Error = $wait.error; Pid = $proc.Id
+        Ok = $wait.ok; Error = $wait.error; Pid = $proc.Id; Tool = "ashgate"; Config = $cfg
         Actions = @("write configuration file", "start the client")
         SetupSeconds = [math]::Round($setup.Elapsed.TotalSeconds, 2)
         LaunchSeconds = $wait.seconds
         ScanRoots = @($dir, (Join-Path $env:LOCALAPPDATA "Ashgate"), (Join-Path $env:ProgramData "Ashgate"))
-        Stop = $stop; Log = (Join-Path $dir "ashgate.log")
+        Log = (Join-Path $dir "ashgate.log")
     }
 }
 
 function Start-SingBox([string]$Transport) {
     if ($Transport -ne "raw") {
-        return @{ Ok = $false; Unsupported = $true; Error = "this build has no XHTTP transport"; Pid = 0; Actions = @(); Stop = { }; ScanRoots = @() }
+        return @{ Ok = $false; Unsupported = $true; Error = "this build has no XHTTP transport"; Pid = 0; Tool = "sing-box"; Actions = @(); ScanRoots = @() }
     }
     $dir = Join-Path $script:Out "clients\sing-box"
     New-Item -ItemType Directory -Force $dir | Out-Null
@@ -308,58 +320,51 @@ function Start-SingBox([string]$Transport) {
     $setup = [Diagnostics.Stopwatch]::StartNew()
     & $script:Python (Join-Path $script:Compare "configs.py") singbox --lab $script:LabJson --rules $script:Rules --probe-name "compare-probe.exe" --out $cfg --log $log --transport raw
     if ($LASTEXITCODE -ne 0) {
-        return @{ Ok = $false; Error = "could not write configuration"; Pid = 0; Actions = @(); Stop = { }; ScanRoots = @($dir) }
+        return @{ Ok = $false; Error = "could not write configuration"; Pid = 0; Tool = "sing-box"; Actions = @(); ScanRoots = @($dir) }
     }
     $setup.Stop()
     $check = & $script:SingBoxExe check -c $cfg 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) {
-        return @{ Ok = $false; Error = ("configuration check failed. " + (Hide-Secrets $check)); Pid = 0; Actions = @("write configuration file"); Stop = { }; ScanRoots = @($dir) }
+        return @{ Ok = $false; Error = ("configuration check failed. " + (Hide-Secrets $check)); Pid = 0; Tool = "sing-box"; Actions = @("write configuration file"); ScanRoots = @($dir) }
     }
     $proc = Start-Process -FilePath $script:SingBoxExe -ArgumentList @("run", "-c", $cfg) -PassThru -WindowStyle Hidden
     $wait = Wait-Connected $proc $log
-    $stop = {
-        if ($proc -and -not $proc.HasExited) { & taskkill.exe /T /F /PID $proc.Id 2>&1 | Out-Null }
-    }.GetNewClosure()
     return @{
-        Ok = $wait.ok; Error = $wait.error; Pid = $proc.Id
+        Ok = $wait.ok; Error = $wait.error; Pid = $proc.Id; Tool = "sing-box"
         Actions = @("write configuration file", "start the client")
         SetupSeconds = [math]::Round($setup.Elapsed.TotalSeconds, 2)
         LaunchSeconds = $wait.seconds
-        ScanRoots = @($dir); Stop = $stop; Log = $log
+        ScanRoots = @($dir); Log = $log
     }
 }
 
 function Start-V2rayN([string]$Transport) {
     $dir = Split-Path $script:V2Exe -Parent
-    $db = Join-Path $dir "guiConfigs\guiNDB.db"
-    $gui = Join-Path $dir "guiConfigs\guiNConfig.json"
+    $db = $script:V2Db
+    $gui = $script:V2Gui
     if (-not $script:V2Ready) {
-        return @{ Ok = $false; Error = "application data was not created"; Pid = 0; Actions = @(); Stop = { }; ScanRoots = @() }
+        return @{ Ok = $false; Error = "application data was not created. $($script:V2SetupNote)"; Pid = 0; Tool = "v2rayn"; Actions = @(); ScanRoots = @() }
     }
     $setup = [Diagnostics.Stopwatch]::StartNew()
     & $script:Python (Join-Path $script:Compare "configs.py") v2rayn --lab $script:LabJson --rules $script:Rules --db $db --gui $gui --probe-name "compare-probe.exe" --transport $Transport
     if ($LASTEXITCODE -ne 0) {
-        return @{ Ok = $false; Error = "could not import the server profile"; Pid = 0; Actions = @(); Stop = { }; ScanRoots = @((Join-Path $dir "guiConfigs")) }
+        return @{ Ok = $false; Error = "could not import the server profile"; Pid = 0; Tool = "v2rayn"; Actions = @(); ScanRoots = @((Join-Path $dir "guiConfigs")) }
     }
     $setup.Stop()
-    $proc = Start-Process -FilePath $script:V2Exe -PassThru
+    $proc = Start-Process -FilePath $script:V2Exe -WorkingDirectory $dir -PassThru
     $logDir = Join-Path $dir "guiLogs"
     $wait = Wait-Connected $proc $logDir
-    $stop = {
-        if ($proc -and -not $proc.HasExited) { & taskkill.exe /T /F /PID $proc.Id 2>&1 | Out-Null }
-        Get-Process -Name v2rayN -ErrorAction SilentlyContinue | ForEach-Object { & taskkill.exe /T /F /PID $_.Id 2>&1 | Out-Null }
-    }.GetNewClosure()
     $actions = @("import the server profile", "enable the per-app tunnel", "start the client")
     if (-not $script:V2Noted) {
         $actions = @("create the application data files") + $actions
         $script:V2Noted = $true
     }
     return @{
-        Ok = $wait.ok; Error = $wait.error; Pid = $proc.Id; Actions = $actions
+        Ok = $wait.ok; Error = $wait.error; Pid = $proc.Id; Tool = "v2rayn"; Actions = $actions
         SetupSeconds = [math]::Round($setup.Elapsed.TotalSeconds, 2)
         LaunchSeconds = $wait.seconds
-        ScanRoots = @((Join-Path $dir "guiConfigs"), (Join-Path $dir "guiLogs"), (Join-Path $dir "binConfigs"))
-        Stop = $stop; Log = $logDir
+        ScanRoots = @((Join-Path $dir "guiConfigs"), (Join-Path $dir "guiLogs"), (Join-Path $dir "binConfigs"), (Join-Path $env:LOCALAPPDATA "v2rayN"))
+        Log = $logDir
     }
 }
 
@@ -413,7 +418,7 @@ function Measure-Steady([string]$Tool, [string]$Transport) {
         $bypassName = (New-Guid).ToString("N").Substring(0, 12) + ".probe.ru"
         ipconfig /flushdns | Out-Null
         $dnsProbe = @{ udp = $false; tcp = $false; lookup = $false }
-        $dnsCap = Invoke-Captured "$tag-dns" @($udpName, $tcpName, $lookupName, $bypassName) ({
+        . Invoke-Captured "$tag-dns" @($udpName, $tcpName, $lookupName, $bypassName) {
             $a = Invoke-Probe $script:ProbeExe @("dns", "--proto", "udp", "--server", "1.1.1.1:53", "--name", $udpName, "--timeout", "4s")
             $b = Invoke-Probe $script:ProbeExe @("dns", "--proto", "tcp", "--server", "1.1.1.1:53", "--name", $tcpName, "--timeout", "4s")
             $c = Invoke-Probe $script:ProbeExe @("lookup", "--name", $lookupName, "--timeout", "6s")
@@ -421,29 +426,34 @@ function Measure-Steady([string]$Tool, [string]$Transport) {
             $dnsProbe.udp = [bool]$a.ok
             $dnsProbe.tcp = [bool]$b.ok
             $dnsProbe.lookup = [bool]$c.ok
-        }.GetNewClosure())
+        }
+        $dnsCap = $script:LastCapture
         $v4 = @{ ok = $false }
-        $v4cap = Invoke-Captured "$tag-v4" @() ({
+        . Invoke-Captured "$tag-v4" @() {
             $r = Invoke-Probe $script:ProbeExe @("ping", "--url", $script:Ping, "--timeout", "8s")
             $v4.ok = [bool]$r.ok
-        }.GetNewClosure())
+        }
+        $v4cap = $script:LastCapture
         $v6 = @{ ok = $false }
-        $v6cap = Invoke-Captured "$tag-v6" @() ({
+        . Invoke-Captured "$tag-v6" @() {
             $r = Invoke-Probe $script:ProbeExe @("ping", "--url", $script:Ping6, "--timeout", "8s")
             $v6.ok = [bool]$r.ok
-        }.GetNewClosure())
+        }
+        $v6cap = $script:LastCapture
         $ctl = @{ ok = $false }
-        $ctlcap = Invoke-Captured "$tag-ctl" @() ({
+        . Invoke-Captured "$tag-ctl" @() {
             $r = Invoke-Probe $script:ControlExe @("ping", "--url", $script:PingControl, "--timeout", "6s")
             $ctl.ok = [bool]$r.ok
-        }.GetNewClosure())
+        }
+        $ctlcap = $script:LastCapture
         Invoke-RestMethod -Method Post -Uri "$($script:Control)/gate?name=$Transport&mode=refuse" | Out-Null
         $disc = @{ ok = $false }
         try {
-            $disccap = Invoke-Captured "$tag-disc" @() ({
+            . Invoke-Captured "$tag-disc" @() {
                 $r = Invoke-Probe $script:ProbeExe @("ping", "--url", $script:Ping, "--timeout", "6s")
                 $disc.ok = [bool]$r.ok
-            }.GetNewClosure())
+            }
+            $disccap = $script:LastCapture
         } finally {
             Reset-Gates
         }
@@ -483,7 +493,7 @@ function Measure-Steady([string]$Tool, [string]$Transport) {
     } catch {
         return @{ status = "error"; error = Hide-Secrets $_.Exception.Message; actions = @() }
     } finally {
-        if ($client -and $client.Stop) { & $client.Stop }
+        if ($client) { Stop-OneClient $client }
         Stop-NamedClients
         Start-Sleep -Seconds 2
     }
@@ -520,7 +530,7 @@ function Measure-Failover([string]$Tool) {
         return @{ status = "error"; error = Hide-Secrets $_.Exception.Message }
     } finally {
         Reset-Gates
-        if ($client -and $client.Stop) { & $client.Stop }
+        if ($client) { Stop-OneClient $client }
         Stop-NamedClients
         Start-Sleep -Seconds 2
     }
@@ -542,31 +552,34 @@ function Measure-Crash([string]$Tool, [string]$Transport, [bool]$KillSwitch) {
         $disc = @{ ok = $false }
         $disccap = $null
         try {
-            $disccap = Invoke-Captured "$tag-disc" @() ({
+            . Invoke-Captured "$tag-disc" @() {
                 $r = Invoke-Probe $script:ProbeExe @("ping", "--url", $script:Ping, "--timeout", "6s")
                 $disc.ok = [bool]$r.ok
-            }.GetNewClosure())
+            }
+            $disccap = $script:LastCapture
         } finally { Reset-Gates }
         $main = @{ ok = $false }
-        $mainCap = Invoke-Captured "$tag-main" @() ({
+        . Invoke-Captured "$tag-main" @() {
             Stop-Process -Id $client.Pid -Force -ErrorAction SilentlyContinue
             Start-Sleep -Seconds 1
             $r = Invoke-Probe $script:ProbeExe @("ping", "--url", $script:Ping, "--timeout", "6s")
             $main.ok = [bool]$r.ok
-        }.GetNewClosure())
-        if ($client.Stop) { & $client.Stop }
+        }
+        $mainCap = $script:LastCapture
+        Stop-OneClient $client
         Stop-NamedClients
         Start-Sleep -Seconds 2
         $client = Start-Client $Tool $Transport $KillSwitch $false
         $tree = @{ ok = $false }
         $treeCap = $null
         if ($client.Ok) {
-            $treeCap = Invoke-Captured "$tag-tree" @() ({
+            . Invoke-Captured "$tag-tree" @() {
                 & taskkill.exe /T /F /PID $client.Pid 2>&1 | Out-Null
                 Start-Sleep -Seconds 1
                 $r = Invoke-Probe $script:ProbeExe @("ping", "--url", $script:Ping, "--timeout", "6s")
                 $tree.ok = [bool]$r.ok
-            }.GetNewClosure())
+            }
+            $treeCap = $script:LastCapture
         }
         $status = $(if ($KillSwitch) { "measured" } else { "unsupported" })
         return @{
@@ -585,7 +598,7 @@ function Measure-Crash([string]$Tool, [string]$Transport, [bool]$KillSwitch) {
         return @{ status = "error"; error = Hide-Secrets $_.Exception.Message; reason = $reason }
     } finally {
         Reset-Gates
-        if ($client -and $client.Stop) { & $client.Stop }
+        if ($client) { Stop-OneClient $client }
         Stop-NamedClients
         Start-Sleep -Seconds 2
     }
@@ -635,7 +648,7 @@ function Measure-Soak([string]$Tool, [string]$Transport) {
     } catch {
         return @{ status = "error"; error = Hide-Secrets $_.Exception.Message }
     } finally {
-        if ($client -and $client.Stop) { & $client.Stop }
+        if ($client) { Stop-OneClient $client }
         Stop-NamedClients
         Start-Sleep -Seconds 2
     }
@@ -703,20 +716,35 @@ function Find-Secrets([string[]]$Roots) {
 function Initialize-V2rayN {
     Write-Step "creating v2rayN application data"
     $dir = Split-Path $script:V2Exe -Parent
-    $db = Join-Path $dir "guiConfigs\guiNDB.db"
-    $proc = Start-Process -FilePath $script:V2Exe -PassThru
-    $deadline = (Get-Date).AddSeconds(120)
-    while (-not (Test-Path $db)) {
-        if ($proc.HasExited) { break }
-        if ((Get-Date) -gt $deadline) { break }
+    $candidates = @(
+        (Join-Path $dir "guiConfigs\guiNDB.db"),
+        (Join-Path $env:LOCALAPPDATA "v2rayN\guiConfigs\guiNDB.db")
+    )
+    $proc = Start-Process -FilePath $script:V2Exe -WorkingDirectory $dir -PassThru
+    $deadline = (Get-Date).AddSeconds(90)
+    $db = $null
+    while ((Get-Date) -lt $deadline) {
+        foreach ($c in $candidates) {
+            if (Test-Path $c) { $db = $c; break }
+        }
+        if ($db) { break }
+        $alive = @(Get-Process -Name v2rayN -ErrorAction SilentlyContinue)
+        if ($proc.HasExited -and $alive.Count -eq 0) { break }
         Start-Sleep -Seconds 1
     }
-    Start-Sleep -Seconds 8
+    Start-Sleep -Seconds 3
+    $code = "running"
+    if ($proc.HasExited) { $code = [string]$proc.ExitCode }
     if (-not $proc.HasExited) { & taskkill.exe /T /F /PID $proc.Id 2>&1 | Out-Null }
     Get-Process -Name v2rayN -ErrorAction SilentlyContinue | ForEach-Object { & taskkill.exe /T /F /PID $_.Id 2>&1 | Out-Null }
     Start-Sleep -Seconds 2
-    $script:V2Ready = (Test-Path $db) -and (Test-Path (Join-Path $dir "guiConfigs\guiNConfig.json"))
-    if (-not $script:V2Ready) { Write-Step "v2rayN did not create its database" }
+    $gui = $null
+    if ($db) { $gui = Join-Path (Split-Path $db -Parent) "guiNConfig.json" }
+    $script:V2Db = $db
+    $script:V2Gui = $gui
+    $script:V2Ready = [bool]($db -and $gui -and (Test-Path $gui))
+    $script:V2SetupNote = "exit=$code db=$db"
+    if (-not $script:V2Ready) { Write-Step "v2rayN did not create its database ($($script:V2SetupNote))" }
 }
 
 function Stop-Lab {
