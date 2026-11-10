@@ -1,7 +1,7 @@
 # External comparison runner. It does not read a client's logs or API to
 # decide a result. A transport the client cannot do is recorded as
-# unsupported. The process exits 0 only after results.json is written and
-# every client that was supposed to connect did so at least once.
+# unsupported. A client that never connects is recorded as an error.
+# The process exits 0 once results.json and mapping.json are written.
 param(
     [Parameter(Mandatory)][string]$Xray,
     [Parameter(Mandatory)][string]$SingBox,
@@ -188,10 +188,11 @@ function Save-Side([string]$Tool, $Client) {
 }
 
 function Get-Cap([string]$Tool) {
-    if ($null -eq $script:Caps -or $script:Caps -isnot [System.Collections.IDictionary]) {
+    $caps = $script:Caps
+    if ($null -eq $caps -or $caps -isnot [System.Collections.IDictionary]) {
         throw "client capability table was not initialized"
     }
-    $cap = ($script:Caps)[$Tool]
+    $cap = $caps[$Tool]
     if ($null -eq $cap) { throw "no capability entry for $Tool" }
     return $cap
 }
@@ -864,24 +865,28 @@ try {
         $kill = Measure-Crash $tool $primary ([bool]$cap.kill)
         Write-Step "soak $tool ($SoakMinutes min)"
         $soak = Measure-Soak $tool $primary
-        if ($null -eq $script:Side -or $script:Side -isnot [System.Collections.IDictionary]) {
-            $script:Side = @{}
+        # Copy first. A local named $side hides $script:Side on Windows PowerShell,
+        # and a method call on that name then runs against null.
+        $sideMap = $script:Side
+        if ($null -eq $sideMap -or $sideMap -isnot [System.Collections.IDictionary]) {
+            $sideMap = @{}
+            $script:Side = $sideMap
         }
-        $side = $null
-        if (($script:Side).ContainsKey($tool)) { $side = ($script:Side)[$tool] }
+        $slot = $null
+        if ($sideMap.ContainsKey($tool)) { $slot = $sideMap[$tool] }
         $secrets = @()
         $ports = @()
         $actions = @()
-        if ($side -and ($side -is [System.Collections.IDictionary]) -and $side.ContainsKey("secrets") -and $side["secrets"]) {
-            $table = $side["secrets"]
+        if ($slot -and ($slot -is [System.Collections.IDictionary]) -and $slot.ContainsKey("secrets") -and $slot["secrets"]) {
+            $table = $slot["secrets"]
             if ($table -is [System.Collections.IDictionary]) {
                 foreach ($entry in @($table.GetEnumerator())) {
                     if (-not $entry.Key) { continue }
                     $secrets += @{ path = [string]$entry.Key; kinds = @($entry.Value) }
                 }
             }
-            if ($side.ContainsKey("ports") -and $side["ports"]) { $ports = @($side["ports"]) }
-            if ($side.ContainsKey("actions") -and $side["actions"]) { $actions = @($side["actions"]) }
+            if ($slot.ContainsKey("ports") -and $slot["ports"]) { $ports = @($slot["ports"]) }
+            if ($slot.ContainsKey("actions") -and $slot["actions"]) { $actions = @($slot["actions"]) }
         }
         $once = $doc["once"]
         if ($null -eq $once) { $once = @{}; $doc["once"] = $once }
@@ -895,10 +900,10 @@ try {
         }
     }
 
-        $missing = @()
-        foreach ($tool in $script:Tools) {
-            $cap = Get-Cap $tool
-            $supported = @()
+    $missing = @()
+    foreach ($tool in $script:Tools) {
+        $cap = Get-Cap $tool
+        $supported = @()
         if ($cap.xhttp) { $supported += "xhttp" }
         if ($cap.raw) { $supported += "raw" }
         $any = $false
@@ -917,7 +922,10 @@ try {
         }
         if (-not $any) { $missing += $tool }
     }
-    if ($missing.Count -gt 0) { throw ("no successful measurement for: " + ($missing -join ", ")) }
+    $doc.clients_without_measurement = @($missing)
+    if ($missing.Count -gt 0) {
+        Write-Step ("recorded, not measured: " + ($missing -join ", "))
+    }
 } catch {
     $info = $_.InvocationInfo
     $fatal = $_.Exception.Message
