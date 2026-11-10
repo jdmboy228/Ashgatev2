@@ -4,6 +4,10 @@
 name: Compare
 
 on:
+  # pull_request is only here so this branch can execute before the file
+  # exists on the default branch. GitHub refuses workflow_dispatch until then.
+  # It is removed once a run is green, leaving workflow_dispatch only.
+  pull_request:
   workflow_dispatch:
     inputs:
       rounds:
@@ -18,6 +22,10 @@ on:
         description: Seconds of transfer in each direction
         default: "8"
         required: false
+
+concurrency:
+  group: compare-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -109,9 +117,9 @@ jobs:
             -Ashgate (Join-Path $env:ProgramFiles "Ashgate\ashgate.exe") `
             -Lab (Join-Path $pwd "compare-bin\lab.exe") `
             -Probe (Join-Path $pwd "compare-bin\compare-probe.exe") `
-            -Rounds ([int]'${{ inputs.rounds }}') `
-            -SoakMinutes ([int]'${{ inputs.soak_minutes }}') `
-            -ThroughputSeconds ([int]'${{ inputs.throughput_seconds }}') `
+            -Rounds ([int]'${{ github.event.inputs.rounds || '1' }}') `
+            -SoakMinutes ([int]'${{ github.event.inputs.soak_minutes || '0' }}') `
+            -ThroughputSeconds ([int]'${{ github.event.inputs.throughput_seconds || '4' }}') `
             -Out (Join-Path $pwd "compare-out")
 
       - uses: actions/upload-artifact@v4
