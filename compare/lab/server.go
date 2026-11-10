@@ -308,6 +308,10 @@ func serverConfig(priv, sid, uuidX, uuidR, dest string, innerX, innerR int, netw
 		"dest": dest, "serverNames": []string{realitySNI},
 		"privateKey": priv, "shortIds": []string{sid},
 	}
+	// Xray 26 refuses to send a proxied connection to loopback or a private
+	// address unless finalRules allows it. The echo and the connectivity
+	// responder both live on 127.0.0.1.
+	allow := []any{map[string]any{"action": "allow"}}
 	return map[string]any{
 		"log": map[string]any{"access": access, "error": errlog, "loglevel": "warning"},
 		"inbounds": []any{
@@ -334,8 +338,8 @@ func serverConfig(priv, sid, uuidX, uuidR, dest string, innerX, innerR int, netw
 		},
 		"outbounds": []any{
 			map[string]any{"tag": "block", "protocol": "blackhole"},
-			map[string]any{"tag": "target", "protocol": "freedom", "settings": map[string]any{"redirect": "127.0.0.1:0"}},
-			map[string]any{"tag": "health", "protocol": "freedom", "settings": map[string]any{"redirect": fmt.Sprintf("127.0.0.1:%d", healthPort)}},
+			map[string]any{"tag": "target", "protocol": "freedom", "settings": map[string]any{"redirect": "127.0.0.1:0", "finalRules": allow}},
+			map[string]any{"tag": "health", "protocol": "freedom", "settings": map[string]any{"redirect": fmt.Sprintf("127.0.0.1:%d", healthPort), "finalRules": allow}},
 		},
 		"routing": map[string]any{
 			"domainStrategy": "AsIs",

@@ -89,7 +89,7 @@ func TestServerConfigUsesBothTransports(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := string(raw)
-	for _, want := range []string{`"network":"xhttp"`, `"network":"raw"`, "198.51.100.0/24", "www.gstatic.com", "xtls-rprx-vision"} {
+	for _, want := range []string{`"network":"xhttp"`, `"network":"raw"`, "198.51.100.0/24", "www.gstatic.com", "xtls-rprx-vision", `"finalRules"`} {
 		if !contains([]byte(text), []byte(want)) {
 			t.Fatalf("config missing %s\n%s", want, text)
 		}
