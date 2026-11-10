@@ -723,23 +723,28 @@ function Initialize-V2rayN {
     $proc = Start-Process -FilePath $script:V2Exe -WorkingDirectory $dir -PassThru
     $deadline = (Get-Date).AddSeconds(90)
     $db = $null
+    $gui = $null
     while ((Get-Date) -lt $deadline) {
         foreach ($c in $candidates) {
             if (Test-Path $c) { $db = $c; break }
         }
-        if ($db) { break }
+        if ($db) {
+            $candidateGui = Join-Path (Split-Path $db -Parent) "guiNConfig.json"
+            if (Test-Path $candidateGui) { $gui = $candidateGui; break }
+        }
         $alive = @(Get-Process -Name v2rayN -ErrorAction SilentlyContinue)
         if ($proc.HasExited -and $alive.Count -eq 0) { break }
         Start-Sleep -Seconds 1
     }
-    Start-Sleep -Seconds 3
     $code = "running"
     if ($proc.HasExited) { $code = [string]$proc.ExitCode }
     if (-not $proc.HasExited) { & taskkill.exe /T /F /PID $proc.Id 2>&1 | Out-Null }
     Get-Process -Name v2rayN -ErrorAction SilentlyContinue | ForEach-Object { & taskkill.exe /T /F /PID $_.Id 2>&1 | Out-Null }
     Start-Sleep -Seconds 2
-    $gui = $null
-    if ($db) { $gui = Join-Path (Split-Path $db -Parent) "guiNConfig.json" }
+    if ($db -and -not $gui) {
+        $gui = Join-Path (Split-Path $db -Parent) "guiNConfig.json"
+        if (-not (Test-Path $gui)) { Set-Content -Encoding utf8 -Path $gui -Value "{}" }
+    }
     $script:V2Db = $db
     $script:V2Gui = $gui
     $script:V2Ready = [bool]($db -and $gui -and (Test-Path $gui))
@@ -837,9 +842,15 @@ try {
         $ports = @()
         $actions = @()
         if ($side) {
-            foreach ($path in $side.secrets.Keys) { $secrets += @{ path = [string]$path; kinds = @($side.secrets[$path]) } }
-            $ports = @($side.ports)
-            $actions = @($side.actions)
+            if ($side.secrets) {
+                foreach ($path in @($side.secrets.Keys)) {
+                    if (-not $path) { continue }
+                    $kinds = @($side.secrets[$path])
+                    $secrets += @{ path = [string]$path; kinds = $kinds }
+                }
+            }
+            if ($side.ports) { $ports = @($side.ports) }
+            if ($side.actions) { $actions = @($side.actions) }
         }
         $doc.once[$tool] = @{
             failover = $failover

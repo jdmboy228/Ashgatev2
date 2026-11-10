@@ -197,6 +197,7 @@ def cmd_singbox(args: argparse.Namespace) -> None:
         ],
         "route": {
             "auto_detect_interface": True,
+            "default_domain_resolver": "local",
             "final": "direct",
             "rules": [
                 {"action": "sniff"},

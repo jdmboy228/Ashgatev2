@@ -123,6 +123,7 @@ class ConfigTests(unittest.TestCase):
         self.assertIn(".ru", suffixes)
         self.assertIn(".vk.com", suffixes)
         self.assertEqual(doc["route"]["final"], "direct")
+        self.assertEqual(doc["route"]["default_domain_resolver"], "local")
 
     def test_subscription_payload_has_both_links(self):
         raw = configs.subscription_payload("http://127.0.0.1/sub/t", ["vless://a", "vless://b"])
