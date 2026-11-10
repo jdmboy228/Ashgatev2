@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"time"
 
 	"ashgate/internal/bootstrap"
 	"ashgate/internal/config"
@@ -86,13 +87,13 @@ func (s *Session) RuleStats() map[string]engine.RuleStat {
 	return s.eng.RuleStats()
 }
 
-// RelayHealth is how the recent TCP relays through proxy went; see
-// engine.RelayHealth.
-func (s *Session) RelayHealth(proxy string) engine.RelayHealth {
+// RelayHealth is how the TCP relays through proxy that started at since
+// or later go; see engine.RelayHealth.
+func (s *Session) RelayHealth(proxy string, since time.Time) engine.RelayHealth {
 	if s == nil || s.eng == nil {
 		return engine.RelayHealth{}
 	}
-	return s.eng.RelayHealth(proxy)
+	return s.eng.RelayHealth(proxy, since)
 }
 
 // Traffic is bytes relayed by this session.

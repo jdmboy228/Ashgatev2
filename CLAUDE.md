@@ -17,6 +17,23 @@ The app is in `ashgate-src/` (Go module `ashgate`). The installer is `installer.
   (`.claude/agents/ci-log-analyzer.md`) with the run id. Do not read raw Windows runner logs in
   the main session.
 
+## Failover (2026-11-10, PR #3, branch `failover-fast`)
+
+- No timer: the active server of a subscription is judged by real traffic. Evidence comes from
+  `engine.RelayHealth` (relays that sent and wait, relays that ended unanswered) and from the
+  byte counters of the subscription's rules (`gui/subs.go`). One check through the tunnel
+  (3.5 s) confirms; the state machine is `internal/failover`. See README «Подписка 3x-ui».
+- An idle tunnel is never checked. E2E tests that want a switch or a return must make client
+  traffic (`harness.StartTraffic`, `harness.WaitActive`); a session is ready when a client
+  request gets through (`harness.WaitTunnel`), not when a health check arrives.
+- After a test cuts a server off, wait for the return to XHTTP (`harness.WaitActive`) before
+  the next subtest: the return ends open connections once.
+- Measured in CI (run 42832884352): stall noticed 5.7 s, requests through RAW 6.0 s, refused
+  port 6.5 s, return to XHTTP 27 s after it answered again.
+- The loop ticks four times a second, in every controller a test leaves running. Tests of the
+  loop set their hooks on their own controller (`controller.fo`, see `foRig` in
+  `gui/subs_test.go`) after stopping its loop; package-level hooks raced under `-race`.
+
 ## E2E progress (2026-11-08)
 
 - 0.9.3 (PR #2, branch `audit-0.9.3`, includes 0.9.2 from PR #1): VLESS TCP in-process
@@ -26,8 +43,7 @@ The app is in `ashgate-src/` (Go module `ashgate`). The installer is `installer.
   back to XHTTP after 1205 s, 10-minute growth flat). All jobs pass.
 - Load test on the CI runner (varies with the runner), 0.9.1 → 0.9.3: RAW 46.7 → 72–135 MB/s,
   XHTTP 28.2 → 66–124 MB/s; Ashgate CPU per 100 MB 4.1 → 1.1–2.2 s (RAW), 6.3 → 1.3–2.6 s
-  (XHTTP). The page no longer polls in the tray. Failover to RAW still takes ~86 s in the test
-  (the early check needs failing app traffic, which that test does not make).
+  (XHTTP). The page no longer polls in the tray. Failover took ~86 s then; see Failover above.
 - The leak test runs at log level debug: ashgate.log then says why each DNS packet went direct.
   Windows reports System (PID 4) as the owner of the DNS client's socket; its DNS must take the
   system DNS path (engine.decide).

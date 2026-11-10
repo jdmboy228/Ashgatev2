@@ -444,6 +444,14 @@ func TestLeaks(t *testing.T) {
 		}
 	})
 
+	// With both servers refused the active one changed back and forth.
+	// Let the primary take over again before the next subtests: a return
+	// in the middle of one would end its connections.
+	if _, err := harness.WaitActive(a, s.Client, "XHTTP", 8*time.Minute); err != nil {
+		t.Errorf("no return to the primary after the servers came back: %v", err)
+	}
+	time.Sleep(2 * time.Second)
+
 	t.Run("KillSwitchCaptureStopped", func(t *testing.T) {
 		if err := a.StopCapture(); err != nil {
 			t.Fatal(err)
@@ -467,12 +475,11 @@ func TestLeaks(t *testing.T) {
 	})
 
 	t.Run("HealthAndSubscriptionThroughTunnel", func(t *testing.T) {
-		// Capture was just restarted, and while the servers were down a
-		// backup may have taken over: wait for a check of this tunnel, not
-		// the first one of the session, then give the app time to note it.
-		verified := harness.WaitTunnelHealthy(t, s.Fx, time.Now(), 150*time.Second).Time
-		time.Sleep(2 * time.Second)
-		since := time.Now()
+		// Capture was just restarted and nothing has used the tunnel since,
+		// so it is not proven: the refresh checks it once first, and then
+		// the update must come through the tunnel.
+		verified := time.Now()
+		since := verified
 		pkts, socks := phase(t, "sub-refresh", func() {
 			if err := a.Post("/api/subscription/refresh", map[string]string{"name": harness.SubName}, nil); err != nil {
 				t.Errorf("refresh: %v", err)

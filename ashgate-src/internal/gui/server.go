@@ -105,6 +105,10 @@ type controller struct {
 	saveMu       sync.Mutex
 	done         chan struct{}
 	doneOnce     sync.Once
+	// loopDone is closed when subsLoop has returned.
+	loopDone chan struct{}
+	// fo is for tests of the failover loop; see foHooks.
+	fo foHooks
 
 	// Per-rule speed sampling; see ruleStatsLocked.
 	statPrev  map[string]engine.RuleStat
@@ -131,7 +135,7 @@ func newController(path string, cfg *config.Config, logs *logbuf.Buffer, h hooks
 	c := &controller{
 		path: path, cfg: cfg, logs: logs, checks: map[string]probe.Report{},
 		bridges: vless.NewManager(), bridgeSt: map[string]vless.Status{}, hooks: h,
-		token: newToken(), done: make(chan struct{}),
+		token: newToken(), done: make(chan struct{}), loopDone: make(chan struct{}),
 	}
 	c.syncSubsLocked(cfg, time.Now())
 	_ = c.syncBridges(c.runtimeCfg())

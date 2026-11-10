@@ -3,8 +3,8 @@
 # on a fresh runner and runs one part of ashgate-src/e2e. Fake keys only:
 # every server, key and subscription is made up inside the runner.
 #
-# Long tests (failover back to XHTTP after ~20 min, the 10-minute
-# stability run) only run nightly and on workflow_dispatch.
+# The long test (the 10-minute stability run) only runs nightly and on
+# workflow_dispatch.
 name: Windows E2E
 
 on:

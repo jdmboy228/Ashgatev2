@@ -102,26 +102,34 @@ func TestRelayHealth(t *testing.T) {
 		}
 	}
 	start := clk.now()
+	var none time.Time
 	for i := 1; i <= 3; i++ {
 		relay("GET /", "", nil)
-		clk.add(time.Second)
-		if h := e.RelayHealth("p"); h.Dead != i || !h.Since.Equal(start) {
+		if h := e.RelayHealth("p", none); h.Dead != i || !h.LastDead.Equal(clk.now()) || !h.LastAsk.Equal(clk.now()) || h.Waiting != 0 {
 			t.Fatalf("after %d dead relays: %+v", i, h)
 		}
+		clk.add(time.Second)
+	}
+	// Relays that started before the cutoff are another server's.
+	if h := e.RelayHealth("p", start.Add(time.Second)); h.Dead != 2 {
+		t.Fatalf("dead relays from the cutoff on: %+v", h)
+	}
+	if h := e.RelayHealth("p", clk.now()); h.Dead != 0 || !h.LastDead.IsZero() {
+		t.Fatalf("dead relays before the cutoff counted: %+v", h)
 	}
 	relay("", "", nil) // opened and closed: nothing to judge
-	if h := e.RelayHealth("p"); h.Dead != 3 {
+	if h := e.RelayHealth("p", none); h.Dead != 3 {
 		t.Fatalf("an idle relay counted: %+v", h)
 	}
 	relay("GET /", "200 OK", directConn{}.wrap)
-	if h := e.RelayHealth("p"); h.Dead != 3 || !h.LastGood.IsZero() {
+	if h := e.RelayHealth("p", none); h.Dead != 3 || !h.LastGood.IsZero() {
 		t.Fatalf("a Direct domain's answer counted for the server: %+v", h)
 	}
 	relay("GET /", "200 OK", nil)
-	if h := e.RelayHealth("p"); h.Dead != 0 || !h.LastGood.Equal(clk.now()) {
+	if h := e.RelayHealth("p", none); h.Dead != 0 || !h.LastGood.Equal(clk.now()) || h.Waiting != 0 {
 		t.Fatalf("an answer did not clear the dead relays: %+v", h)
 	}
-	if h := e.RelayHealth("other"); h != (RelayHealth{}) {
+	if h := e.RelayHealth("other", none); h != (RelayHealth{}) {
 		t.Fatalf("another proxy: %+v", h)
 	}
 
@@ -130,13 +138,126 @@ func TestRelayHealth(t *testing.T) {
 	appSide, relaySide := net.Pipe()
 	defer appSide.Close()
 	e.serveFlow(relaySide, &tcpFlow{proxy: config.Proxy{Name: "p"}, created: clk.now()})
-	if h := e.RelayHealth("p"); h.Dead != 1 {
+	if h := e.RelayHealth("p", none); h.Dead != 1 {
 		t.Fatalf("dial error: %+v", h)
 	}
 	clk.add(relayWindow + time.Second)
-	if h := e.RelayHealth("p"); h.Dead != 0 {
+	if h := e.RelayHealth("p", none); h.Dead != 0 {
 		t.Fatalf("outside the window: %+v", h)
 	}
+}
+
+// An open relay whose app sent something and got nothing yet is waiting,
+// from its first bytes until the first ones back. A relay that asked
+// before the last answer waits for its own destination, and one where the
+// server speaks first never waits.
+func TestRelayWaiting(t *testing.T) {
+	clk := &clock{t: time.Unix(1_700_000_000, 0)}
+	pd := &pipeDial{next: make(chan net.Conn, 1)}
+	e, _ := newEngine(t, testConfig(), fixedRes{}, pd, nil)
+	e.now = clk.now
+	var none time.Time
+
+	// open starts a relay and returns the app's and the server's ends.
+	open := func() (app, server net.Conn, done chan struct{}) {
+		t.Helper()
+		near, far := net.Pipe()
+		pd.next <- near
+		appSide, relaySide := net.Pipe()
+		done = make(chan struct{})
+		go func() {
+			defer close(done)
+			e.serveFlow(relaySide, &tcpFlow{proxy: config.Proxy{Name: "p"}, created: clk.now()})
+		}()
+		return appSide, far, done
+	}
+	// health polls until ok accepts it: the relay's goroutines count the
+	// bytes a moment after the test wrote them.
+	health := func(since time.Time, what string, ok func(RelayHealth) bool) RelayHealth {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			h := e.RelayHealth("p", since)
+			if ok(h) {
+				return h
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("%s: %+v", what, h)
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+	}
+	send := func(c net.Conn, peer net.Conn, msg string) {
+		t.Helper()
+		go func() { _, _ = c.Write([]byte(msg)) }()
+		if _, err := io.ReadFull(peer, make([]byte, len(msg))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	finish := func(app, server net.Conn, done chan struct{}) {
+		t.Helper()
+		_ = server.Close()
+		_ = app.Close()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("relay did not finish")
+		}
+	}
+
+	// Opened, nothing sent: not waiting.
+	a1, s1, d1 := open()
+	if h := e.RelayHealth("p", none); h.Waiting != 0 {
+		t.Fatalf("a relay that sent nothing waits: %+v", h)
+	}
+	asked := clk.now()
+	send(a1, s1, "hello")
+	health(none, "a relay that sent does not wait", func(h RelayHealth) bool {
+		return h.Waiting == 1 && h.WaitingSince.Equal(asked) && h.LastAsk.Equal(asked)
+	})
+	// A second one asks two seconds later: the first is still the oldest.
+	clk.add(2 * time.Second)
+	a2, s2, d2 := open()
+	send(a2, s2, "hello")
+	health(none, "two waiting relays", func(h RelayHealth) bool { return h.Waiting == 2 && h.WaitingSince.Equal(asked) })
+	// The cutoff leaves out the relay that started before it.
+	health(clk.now(), "relays from the cutoff on", func(h RelayHealth) bool {
+		return h.Waiting == 1 && h.WaitingSince.Equal(clk.now())
+	})
+	// The second gets its answer: the server works, and the first, which
+	// asked before that, waits for its own destination.
+	clk.add(time.Second)
+	send(s2, a2, "world")
+	health(none, "an answered relay still waits", func(h RelayHealth) bool {
+		return h.Waiting == 0 && h.LastGood.Equal(clk.now())
+	})
+	// A third asks after the answer and waits.
+	clk.add(time.Second)
+	a3, s3, d3 := open()
+	send(a3, s3, "hello")
+	health(none, "a relay that asked after the last answer", func(h RelayHealth) bool {
+		return h.Waiting == 1 && h.WaitingSince.Equal(clk.now())
+	})
+	// It ends unanswered: no longer waiting, dead instead.
+	finish(a3, s3, d3)
+	if h := e.RelayHealth("p", none); h.Waiting != 0 || h.Dead != 1 {
+		t.Fatalf("an ended relay: %+v", h)
+	}
+	finish(a1, s1, d1)
+	finish(a2, s2, d2)
+
+	// The server speaks first (SSH, SMTP): what the app sends after that
+	// is not a question left unanswered.
+	a4, s4, d4 := open()
+	send(s4, a4, "220 ready")
+	health(none, "the banner is not an answer", func(h RelayHealth) bool { return h.LastGood.Equal(clk.now()) })
+	clk.add(time.Second)
+	send(a4, s4, "EHLO")
+	health(none, "the app's bytes were not seen", func(h RelayHealth) bool { return h.LastAsk.Equal(clk.now()) })
+	if h := e.RelayHealth("p", none); h.Waiting != 0 {
+		t.Fatalf("a relay whose server spoke first waits: %+v", h)
+	}
+	finish(a4, s4, d4)
 }
 
 func (directConn) wrap(c net.Conn) net.Conn { return directConn{c} }
@@ -147,8 +268,13 @@ func TestRelayBookKeepsTheNewest(t *testing.T) {
 	for i := 0; i < relayKeep+10; i++ {
 		b.dead("p", at.Add(time.Duration(i)*time.Millisecond), at.Add(time.Duration(i)*time.Millisecond))
 	}
-	h := b.health("p", at.Add(time.Second))
-	if h.Dead != relayKeep || !h.Since.Equal(at.Add(10*time.Millisecond)) {
+	// The ten oldest were dropped: a cutoff at the eleventh's start still
+	// counts all that are kept.
+	h := b.health("p", at.Add(10*time.Millisecond), at.Add(time.Second))
+	if h.Dead != relayKeep || !h.LastDead.Equal(at.Add(time.Duration(relayKeep+9)*time.Millisecond)) {
+		t.Fatalf("%+v", h)
+	}
+	if h := b.health("p", time.Time{}, at.Add(time.Second)); h.Dead != relayKeep {
 		t.Fatalf("%+v", h)
 	}
 }
