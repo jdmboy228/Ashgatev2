@@ -4,10 +4,6 @@
 name: Compare
 
 on:
-  # pull_request is only here so this branch can execute before the file
-  # exists on the default branch. GitHub refuses workflow_dispatch until then.
-  # It is removed once a run is green, leaving workflow_dispatch only.
-  pull_request:
   workflow_dispatch:
     inputs:
       rounds:
