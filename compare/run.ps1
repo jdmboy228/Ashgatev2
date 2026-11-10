@@ -69,6 +69,12 @@ function Hide-Secrets([string]$Text) {
 
 function Get-Tail([string]$Path) {
     if (-not (Test-Path $Path)) { return "" }
+    $item = Get-Item $Path
+    if ($item.PSIsContainer) {
+        $file = Get-ChildItem $Path -File -Recurse -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+        if (-not $file) { return "" }
+        $Path = $file.FullName
+    }
     $lines = @(Get-Content $Path -Tail 30 -ErrorAction SilentlyContinue)
     return Hide-Secrets ($lines -join "`n")
 }
@@ -808,6 +814,7 @@ try {
         rounds = @()
         once = @{}
     }
+    $roundList = [System.Collections.Generic.List[object]]::new()
 
     for ($i = 1; $i -le $Rounds; $i++) {
         $order = @(Get-Shuffled $script:Tools)
@@ -825,8 +832,9 @@ try {
                 $round.by_tool[$tool].transports[$transport] = Measure-Steady $tool $transport
             }
         }
-        $doc.rounds += $round
+        $roundList.Add($round)
     }
+    $doc.rounds = @($roundList)
 
     $onceOrder = @(Get-Shuffled $script:Tools)
     foreach ($tool in $onceOrder) {
@@ -841,16 +849,16 @@ try {
         $secrets = @()
         $ports = @()
         $actions = @()
-        if ($side) {
-            if ($side.secrets) {
-                foreach ($path in @($side.secrets.Keys)) {
-                    if (-not $path) { continue }
-                    $kinds = @($side.secrets[$path])
-                    $secrets += @{ path = [string]$path; kinds = $kinds }
+        if ($side -and ($side -is [System.Collections.IDictionary]) -and $side.ContainsKey("secrets") -and $side["secrets"]) {
+            $table = $side["secrets"]
+            if ($table -is [System.Collections.IDictionary]) {
+                foreach ($entry in @($table.GetEnumerator())) {
+                    if (-not $entry.Key) { continue }
+                    $secrets += @{ path = [string]$entry.Key; kinds = @($entry.Value) }
                 }
             }
-            if ($side.ports) { $ports = @($side.ports) }
-            if ($side.actions) { $actions = @($side.actions) }
+            if ($side.ContainsKey("ports") -and $side["ports"]) { $ports = @($side["ports"]) }
+            if ($side.ContainsKey("actions") -and $side["actions"]) { $actions = @($side["actions"]) }
         }
         $doc.once[$tool] = @{
             failover = $failover
@@ -868,16 +876,27 @@ try {
         if ($script:Caps[$tool].xhttp) { $supported += "xhttp" }
         if ($script:Caps[$tool].raw) { $supported += "raw" }
         $any = $false
-        foreach ($round in $doc.rounds) {
+        foreach ($round in @($doc.rounds)) {
+            if ($round -isnot [System.Collections.IDictionary]) { continue }
+            $by = $round["by_tool"]
+            if ($by -isnot [System.Collections.IDictionary]) { continue }
+            $block = $by[$tool]
+            if ($block -isnot [System.Collections.IDictionary]) { continue }
+            $transports = $block["transports"]
+            if ($transports -isnot [System.Collections.IDictionary]) { continue }
             foreach ($transport in $supported) {
-                if ($round.by_tool[$tool].transports[$transport].status -eq "measured") { $any = $true }
+                $one = $transports[$transport]
+                if ($one -and $one["status"] -eq "measured") { $any = $true }
             }
         }
         if (-not $any) { $missing += $tool }
     }
     if ($missing.Count -gt 0) { throw ("no successful measurement for: " + ($missing -join ", ")) }
 } catch {
+    $info = $_.InvocationInfo
     $fatal = $_.Exception.Message
+    if ($info -and $info.PositionMessage) { $fatal = $fatal + "`n" + $info.PositionMessage }
+    if ($_.ScriptStackTrace) { $fatal = $fatal + "`n" + $_.ScriptStackTrace }
     Write-Step "FAILED $fatal"
 } finally {
     Stop-NamedClients

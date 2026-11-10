@@ -123,6 +123,7 @@ class ConfigTests(unittest.TestCase):
         self.assertIn(".ru", suffixes)
         self.assertIn(".vk.com", suffixes)
         self.assertEqual(doc["route"]["final"], "direct")
+        self.assertIn("127.0.0.0/8", doc["inbounds"][0]["route_exclude_address"])
         self.assertEqual(doc["route"]["default_domain_resolver"], "local")
 
     def test_subscription_payload_has_both_links(self):
@@ -182,6 +183,7 @@ class ConfigTests(unittest.TestCase):
         saved = json.loads(gui.read_text(encoding="utf-8"))
         self.assertEqual(saved["IndexId"], "bench-fallback")
         self.assertTrue(saved["TunModeItem"]["EnableTun"])
+        self.assertIn("127.0.0.0/8", saved["TunModeItem"]["RouteExcludeAddress"])
         self.assertTrue(saved["TunModeItem"]["StrictRoute"])
         self.assertEqual(saved["SystemProxyItem"]["SysProxyType"], 2)
 

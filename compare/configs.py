@@ -171,6 +171,10 @@ def cmd_singbox(args: argparse.Namespace) -> None:
                 "auto_route": True,
                 "strict_route": True,
                 "stack": "mixed",
+                # The lab server is on loopback. Windows TUN will capture that
+                # address unless it is excluded, and the handshake then sees
+                # the wrong certificate.
+                "route_exclude_address": ["127.0.0.0/8", "::1/128"],
             }
         ],
         "outbounds": [
@@ -342,6 +346,7 @@ def cmd_v2rayn(args: argparse.Namespace) -> None:
     tun = gui.get("TunModeItem") or {}
     tun["EnableTun"] = True
     tun["EnableIPv6Address"] = True
+    tun["RouteExcludeAddress"] = ["127.0.0.0/8", "::1/128"]
     if "AutoRoute" not in tun:
         tun["AutoRoute"] = True
     if "StrictRoute" not in tun:
