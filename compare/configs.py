@@ -351,6 +351,10 @@ def cmd_v2rayn(args: argparse.Namespace) -> None:
         tun["AutoRoute"] = True
     if "StrictRoute" not in tun:
         tun["StrictRoute"] = True
+    if not tun.get("Stack"):
+        tun["Stack"] = "gvisor"
+    if not tun.get("Mtu"):
+        tun["Mtu"] = 9000
     gui["TunModeItem"] = tun
     proxy = gui.get("SystemProxyItem") or {}
     proxy["SysProxyType"] = 2

@@ -170,15 +170,30 @@ function Get-Listen([int]$Root) {
 }
 
 function Save-Side([string]$Tool, $Client) {
-    if (-not $script:Side.ContainsKey($Tool)) {
-        $script:Side[$Tool] = @{ secrets = @{}; ports = @(); actions = @($Client.Actions) }
+    if ($null -eq $script:Side -or $script:Side -isnot [System.Collections.IDictionary]) {
+        $script:Side = @{}
     }
+    $map = $script:Side
+    if (-not $map.ContainsKey($Tool)) {
+        $map[$Tool] = @{ secrets = @{}; ports = @(); actions = @($Client.Actions) }
+    }
+    $slot = $map[$Tool]
+    $found = $slot["secrets"]
     foreach ($row in @(Find-Secrets @($Client.ScanRoots))) {
-        $script:Side[$Tool].secrets[$row.path] = @($row.kinds)
+        if ($row.path) { $found[$row.path] = @($row.kinds) }
     }
-    if (@($script:Side[$Tool].ports).Count -eq 0 -and $Client.Pid) {
-        $script:Side[$Tool].ports = @(Get-Listen ([int]$Client.Pid))
+    if (@($slot["ports"]).Count -eq 0 -and $Client.Pid) {
+        $slot["ports"] = @(Get-Listen ([int]$Client.Pid))
     }
+}
+
+function Get-Cap([string]$Tool) {
+    if ($null -eq $script:Caps -or $script:Caps -isnot [System.Collections.IDictionary]) {
+        throw "client capability table was not initialized"
+    }
+    $cap = ($script:Caps)[$Tool]
+    if ($null -eq $cap) { throw "no capability entry for $Tool" }
+    return $cap
 }
 
 function Stop-NamedClients {
@@ -506,7 +521,7 @@ function Measure-Steady([string]$Tool, [string]$Transport) {
 }
 
 function Measure-Failover([string]$Tool) {
-    if (-not $script:Caps[$Tool].failover) {
+    if (-not (Get-Cap $Tool).failover) {
         return @{ status = "unsupported"; reason = "failover between XHTTP and RAW requires both transports" }
     }
     $client = $null
@@ -821,15 +836,18 @@ try {
         Write-Step ("round {0} order {1}" -f $i, ($order -join ","))
         $round = @{ index = $i; order = @($order); by_tool = @{} }
         foreach ($tool in $order) {
+            $cap = Get-Cap $tool
             $torder = @(Get-Shuffled @("xhttp", "raw"))
-            $round.by_tool[$tool] = @{ transports = @{} }
+            $by = $round["by_tool"]
+            $by[$tool] = @{ transports = @{} }
+            $transports = ($by[$tool])["transports"]
             foreach ($transport in $torder) {
                 Write-Step "round $i $tool $transport"
-                if (-not $script:Caps[$tool][$transport]) {
-                    $round.by_tool[$tool].transports[$transport] = @{ status = "unsupported"; reason = "this build has no XHTTP transport" }
+                if (-not $cap[$transport]) {
+                    $transports[$transport] = @{ status = "unsupported"; reason = "this build has no XHTTP transport" }
                     continue
                 }
-                $round.by_tool[$tool].transports[$transport] = Measure-Steady $tool $transport
+                $transports[$transport] = Measure-Steady $tool $transport
             }
         }
         $roundList.Add($round)
@@ -838,14 +856,19 @@ try {
 
     $onceOrder = @(Get-Shuffled $script:Tools)
     foreach ($tool in $onceOrder) {
-        $primary = $(if ($script:Caps[$tool].xhttp) { "xhttp" } else { "raw" })
+        $cap = Get-Cap $tool
+        $primary = $(if ($cap.xhttp) { "xhttp" } else { "raw" })
         Write-Step "failover $tool"
         $failover = Measure-Failover $tool
         Write-Step "kill-switch phase $tool"
-        $kill = Measure-Crash $tool $primary ([bool]$script:Caps[$tool].kill)
+        $kill = Measure-Crash $tool $primary ([bool]$cap.kill)
         Write-Step "soak $tool ($SoakMinutes min)"
         $soak = Measure-Soak $tool $primary
-        $side = $script:Side[$tool]
+        if ($null -eq $script:Side -or $script:Side -isnot [System.Collections.IDictionary]) {
+            $script:Side = @{}
+        }
+        $side = $null
+        if (($script:Side).ContainsKey($tool)) { $side = ($script:Side)[$tool] }
         $secrets = @()
         $ports = @()
         $actions = @()
@@ -860,7 +883,9 @@ try {
             if ($side.ContainsKey("ports") -and $side["ports"]) { $ports = @($side["ports"]) }
             if ($side.ContainsKey("actions") -and $side["actions"]) { $actions = @($side["actions"]) }
         }
-        $doc.once[$tool] = @{
+        $once = $doc["once"]
+        if ($null -eq $once) { $once = @{}; $doc["once"] = $once }
+        $once[$tool] = @{
             failover = $failover
             kill_switch = $kill
             soak = $soak
@@ -870,11 +895,12 @@ try {
         }
     }
 
-    $missing = @()
-    foreach ($tool in $script:Tools) {
-        $supported = @()
-        if ($script:Caps[$tool].xhttp) { $supported += "xhttp" }
-        if ($script:Caps[$tool].raw) { $supported += "raw" }
+        $missing = @()
+        foreach ($tool in $script:Tools) {
+            $cap = Get-Cap $tool
+            $supported = @()
+        if ($cap.xhttp) { $supported += "xhttp" }
+        if ($cap.raw) { $supported += "raw" }
         $any = $false
         foreach ($round in @($doc.rounds)) {
             if ($round -isnot [System.Collections.IDictionary]) { continue }

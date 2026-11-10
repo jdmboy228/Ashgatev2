@@ -103,7 +103,7 @@ func startLab(xrayPath, outDir string) (*lab, error) {
 	if err != nil {
 		return nil, err
 	}
-	sid, err := randHex(4)
+	sid, err := randHex(8)
 	if err != nil {
 		return nil, err
 	}
