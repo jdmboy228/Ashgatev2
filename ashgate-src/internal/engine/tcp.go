@@ -37,6 +37,9 @@ type tcpFlow struct {
 	parent   string
 	stat     *ruleStat
 	mu       sync.Mutex
+	// settled is set when the relay got its first bytes back or ended; a
+	// relay asks at most once before that. Guarded by relayBook.mu.
+	settled bool
 }
 
 // ServeConn looks up the NAT entry for an accepted local connection and relays it.
@@ -105,7 +108,12 @@ func (e *Engine) serveFlow(conn net.Conn, flow *tcpFlow) {
 		Parent:  flow.parent,
 	})
 	var up, down atomic.Int64
+	// From the app's first bytes until the first ones back, the relay
+	// waits for an answer; see RelayHealth.
+	asked := func() { e.relays.asked(flow.proxy.Name, flow, e.now()) }
+	defer e.relays.settled(flow.proxy.Name, flow)
 	good := func() {
+		e.relays.settled(flow.proxy.Name, flow)
 		// A VLESS bridge sends Direct domains past its server; their
 		// answers say nothing about it.
 		if d, ok := upstream.(interface{ Direct() bool }); ok && d.Direct() {
@@ -114,7 +122,7 @@ func (e *Engine) serveFlow(conn net.Conn, flow *tcpFlow) {
 		e.relays.good(flow.proxy.Name, e.now())
 	}
 	upErr := splice(conn, upstream,
-		counter{flow: &up, total: &e.bytesUp, rule: flow.stat.upCounter()},
+		counter{flow: &up, total: &e.bytesUp, rule: flow.stat.upCounter(), first: asked},
 		counter{flow: &down, total: &e.bytesDown, rule: flow.stat.downCounter(), first: good})
 	if down.Load() == 0 && (up.Load() > 0 || upErr != nil) {
 		// The app spoke, or the upstream broke, and nothing came back.
@@ -324,17 +332,29 @@ const relayWindow = 20 * time.Second
 // relayKeep caps the dead relays remembered per proxy.
 const relayKeep = 32
 
-// RelayHealth is how the TCP relays through one proxy went lately: an early
-// sign that its server stopped answering, before a health check sees it.
+// RelayHealth is how the TCP relays through one proxy go right now. The
+// subscription failover reads it several times a second: unanswered
+// relays are its sign that the server stopped answering, an answered one
+// its proof that the server works. Relays that started before the cutoff
+// given to Engine.RelayHealth are left out of Dead and Waiting.
 type RelayHealth struct {
 	// Dead counts relays that ended within relayWindow with nothing
 	// downloaded although the app sent something (or the dial or the
 	// upstream failed), after the last relay that got an answer.
 	Dead int
-	// Since is when the first of those relays started.
-	Since time.Time
-	// LastGood is when a relay last got its first bytes back.
+	// LastDead is when the newest of those relays ended.
+	LastDead time.Time
+	// Waiting counts open relays whose app sent something, after the last
+	// relay that got an answer, and that have received nothing yet.
+	Waiting int
+	// WaitingSince is when the first of those relays sent its first bytes.
+	WaitingSince time.Time
+	// LastGood is when a relay last got its first bytes back through the
+	// proxy's server.
 	LastGood time.Time
+	// LastAsk is when a relay last sent its first bytes: programs use the
+	// proxy.
+	LastAsk time.Time
 }
 
 // relayBook keeps RelayHealth per proxy name. It has its own lock: relays
@@ -347,9 +367,15 @@ type relayBook struct {
 type relayLog struct {
 	dead     []deadRelay // by end time
 	lastGood time.Time
+	lastAsk  time.Time
+	// waiting holds the open relays that sent and got nothing yet, with
+	// the time of their first bytes.
+	waiting map[*tcpFlow]waitingRelay
 }
 
 type deadRelay struct{ start, end time.Time }
+
+type waitingRelay struct{ start, asked time.Time }
 
 func (b *relayBook) logLocked(proxy string) *relayLog {
 	if b.m == nil {
@@ -372,6 +398,31 @@ func (l *relayLog) prune(now time.Time) {
 	l.dead = append(l.dead[:0], l.dead[i:]...)
 }
 
+// asked notes the first bytes flow's app sent.
+func (b *relayBook) asked(proxy string, flow *tcpFlow, now time.Time) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	l := b.logLocked(proxy)
+	l.lastAsk = now
+	if flow.settled {
+		return // the server spoke first
+	}
+	if l.waiting == nil {
+		l.waiting = map[*tcpFlow]waitingRelay{}
+	}
+	l.waiting[flow] = waitingRelay{start: flow.created, asked: now}
+}
+
+// settled ends flow's wait: its first bytes came back, or it ended.
+func (b *relayBook) settled(proxy string, flow *tcpFlow) {
+	b.mu.Lock()
+	flow.settled = true
+	if l := b.m[proxy]; l != nil {
+		delete(l.waiting, flow)
+	}
+	b.mu.Unlock()
+}
+
 func (b *relayBook) good(proxy string, now time.Time) {
 	b.mu.Lock()
 	l := b.logLocked(proxy)
@@ -391,7 +442,7 @@ func (b *relayBook) dead(proxy string, start, now time.Time) {
 	b.mu.Unlock()
 }
 
-func (b *relayBook) health(proxy string, now time.Time) RelayHealth {
+func (b *relayBook) health(proxy string, since, now time.Time) RelayHealth {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	l := b.m[proxy]
@@ -399,19 +450,36 @@ func (b *relayBook) health(proxy string, now time.Time) RelayHealth {
 		return RelayHealth{}
 	}
 	l.prune(now)
-	h := RelayHealth{Dead: len(l.dead), LastGood: l.lastGood}
-	for i, d := range l.dead {
-		if i == 0 || d.start.Before(h.Since) {
-			h.Since = d.start
+	h := RelayHealth{LastGood: l.lastGood, LastAsk: l.lastAsk}
+	for _, d := range l.dead {
+		if d.start.Before(since) {
+			continue
+		}
+		h.Dead++
+		if d.end.After(h.LastDead) {
+			h.LastDead = d.end
+		}
+	}
+	for _, w := range l.waiting {
+		// One that asked before the last answer is waiting for its own
+		// destination, not for the server.
+		if w.start.Before(since) || !w.asked.After(l.lastGood) {
+			continue
+		}
+		h.Waiting++
+		if h.WaitingSince.IsZero() || w.asked.Before(h.WaitingSince) {
+			h.WaitingSince = w.asked
 		}
 	}
 	return h
 }
 
-// RelayHealth reports how the recent TCP relays through the proxy named
-// proxy went; see RelayHealth.
-func (e *Engine) RelayHealth(proxy string) RelayHealth {
-	return e.relays.health(proxy, e.now())
+// RelayHealth reports how the TCP relays through the proxy named proxy
+// go; see RelayHealth. Relays that started before since are not counted
+// as dead or waiting: the caller knows they say nothing (they used the
+// server it has since replaced, or it has judged them already).
+func (e *Engine) RelayHealth(proxy string, since time.Time) RelayHealth {
+	return e.relays.health(proxy, since, e.now())
 }
 
 func closeWrite(c net.Conn) {

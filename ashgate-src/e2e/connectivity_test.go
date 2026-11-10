@@ -3,6 +3,7 @@
 package e2e
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -153,85 +154,130 @@ func TestConnectivity(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		// A program in use: a small page twice a second. Failover judges
+		// the server by such traffic; an idle tunnel is not checked.
+		tr := harness.StartTraffic(s.Client, 500*time.Millisecond)
+		time.Sleep(3 * time.Second)
 		// A censor: the XHTTP port accepts but nothing comes back.
 		s.Fx.XHTTP.Set(harness.GateBlackhole)
 		blocked := time.Now()
-		stopProbe := make(chan struct{})
-		var probes []harness.ClientResult
-		var wg sync.WaitGroup
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for {
-				select {
-				case <-stopProbe:
-					return
-				case <-time.After(5 * time.Second):
+		_, err = act.waitFor("RAW", 60*time.Second)
+		var back time.Time
+		if err == nil {
+			// Switched; now the program's requests must get through again.
+			err = harness.Eventually(30*time.Second, 200*time.Millisecond, func() error {
+				at, ok := tr.FirstOK(blocked.Add(time.Second))
+				if !ok {
+					return errors.New("no request got through after the switch")
 				}
-				probes = append(probes, harness.RunClient(s.Client, "tcp", "-addr", harness.TargetTCP, "-timeout", "3s"))
-			}
-		}()
-		at, err := act.waitFor("RAW", 150*time.Second)
-		close(stopProbe)
-		wg.Wait()
+				back = at
+				return nil
+			})
+		}
+		reqs := tr.Stop()
 		pkts, _ := c.Stop()
+		env.WriteJSON("connectivity/failover-requests.json", reqs)
 		if err != nil {
 			t.Fatalf("no failover: %v", err)
 		}
-		d := at.Sub(blocked)
+		decided := a.MustState().Subs[harness.SubName].SwitchedAt.Sub(blocked)
+		d := back.Sub(blocked)
+		env.Metric("failover.decide_seconds", decided.Seconds(), "s", "lower")
 		env.Metric("failover.to_raw_seconds", d.Seconds(), "s", "lower")
-		if d > 120*time.Second {
-			t.Errorf("switched to RAW after %s, want ≤ 120 s (check every 60 s ±20 %% + 15 s freeze)", d.Round(time.Second))
+		if d > 10*time.Second {
+			t.Errorf("requests got through RAW %s after XHTTP was cut off (the switch was decided after %s), want ≤ 10 s",
+				d.Round(100*time.Millisecond), decided.Round(100*time.Millisecond))
+		}
+		if failed, all := harness.Failed(reqs, blocked.Add(-3*time.Second), blocked.Add(-500*time.Millisecond)); failed > 0 {
+			t.Errorf("%d of %d requests failed before XHTTP was cut off", failed, all)
 		}
 		if leak := harness.Filter(pkts, harness.ToTestNet()); len(leak) > 0 {
 			t.Errorf("direct packets during the failover:%s", harness.Brief(leak, 10))
 		}
-		t.Logf("%d connection attempts during the outage", len(probes))
+		failed, all := harness.Failed(reqs, blocked, back)
+		t.Logf("%d of %d requests failed during the outage", failed, all)
 	})
 
 	t.Run("ThroughputRAW", func(t *testing.T) { transfer(t, env, s, "raw", "in-raw") })
 
-	if env.Long {
-		t.Run("ReturnToXHTTP", func(t *testing.T) {
-			s.Fx.XHTTP.Set(harness.GatePass)
-			open := time.Now()
-			at, err := act.waitFor("XHTTP", 22*time.Minute)
-			if err != nil {
-				t.Fatal(err)
-			}
-			env.Metric("failover.return_seconds", at.Sub(open).Seconds(), "s", "lower")
-			if r := harness.RunClient(s.Client, "get", "-url", harness.URL(harness.TargetTCP), "-n", "2000000"); !r.OK {
-				t.Errorf("after returning to XHTTP: %s", r)
-			}
-		})
-		t.Run("NoFlapping", func(t *testing.T) {
-			h := act.History()
-			env.WriteJSON("connectivity/active-history.json", h)
-			// XHTTP at start, RAW after the block, XHTTP after two good probes.
-			if len(h) != 3 {
-				t.Errorf("active server changed %d times, want exactly 2 switches: %+v", len(h)-1, h)
-			}
-		})
-	} else {
-		env.Note("skipped", "connectivity: return to XHTTP after 2 good probes (≈20 min): nightly and workflow_dispatch only")
+	t.Run("ReturnToXHTTP", func(t *testing.T) {
 		s.Fx.XHTTP.Set(harness.GatePass)
-	}
+		open := time.Now()
+		// The primary is probed only while programs use the tunnel: after
+		// a first probe 15 s from the switch, with pauses that double up to
+		// 5 min. Three good probes 8 s apart bring traffic back.
+		at, err := harness.WaitActive(a, s.Client, "XHTTP", 10*time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		d := at.Sub(open)
+		env.Metric("failover.return_seconds", d.Seconds(), "s", "lower")
+		if d > 8*time.Minute {
+			t.Errorf("returned to XHTTP %s after it answered again, want ≤ 8 min (a 5 min pause ±20 %%, then 3 probes)", d.Round(time.Second))
+		}
+		// The new tunnel comes up a moment after the switch is shown.
+		err = harness.Eventually(15*time.Second, time.Second, func() error {
+			if r := harness.RunClient(s.Client, "get", "-url", harness.URL(harness.TargetTCP), "-n", "2000000", "-stall", "5s"); !r.OK {
+				return errors.New(r.String())
+			}
+			return nil
+		})
+		if err != nil {
+			t.Errorf("after returning to XHTTP: %v", err)
+		}
+	})
+
+	t.Run("NoFlapping", func(t *testing.T) {
+		// A program keeps using the primary: it must stay.
+		tr := harness.StartTraffic(s.Client, time.Second)
+		time.Sleep(20 * time.Second)
+		reqs := tr.Stop()
+		if failed, all := harness.Failed(reqs, time.Time{}, time.Now()); failed > 0 {
+			t.Errorf("%d of %d requests failed on the primary after the return", failed, all)
+		}
+		h := act.History()
+		env.WriteJSON("connectivity/active-history.json", h)
+		// XHTTP at start, RAW after the block, XHTTP after the good probes.
+		if len(h) != 3 {
+			t.Errorf("active server changed %d times, want exactly 2 switches: %+v", len(h)-1, h)
+		}
+	})
 
 	t.Run("RefusedPortSwitches", func(t *testing.T) {
-		// Whichever is active now gets its port refused (RST): two failed
-		// checks in a row must move to the other one.
+		// Whichever is active now gets its port refused (RST): the
+		// program's connections fail, a check and its repeat are refused
+		// too, and the other server takes over.
 		from, to, gate := "RAW", "XHTTP", s.Fx.RAW
 		if strings.Contains(harness.ActiveServer(a), "XHTTP") {
 			from, to, gate = "XHTTP", "RAW", s.Fx.XHTTP
 		}
+		tr := harness.StartTraffic(s.Client, 500*time.Millisecond)
+		time.Sleep(2 * time.Second)
 		gate.Set(harness.GateRefuse)
 		defer gate.Set(harness.GatePass)
 		refused := time.Now()
-		at, err := act.waitFor(to, 180*time.Second)
+		_, err := act.waitFor(to, 60*time.Second)
+		var back time.Time
+		if err == nil {
+			err = harness.Eventually(30*time.Second, 200*time.Millisecond, func() error {
+				at, ok := tr.FirstOK(refused.Add(time.Second))
+				if !ok {
+					return errors.New("no request got through after the switch")
+				}
+				back = at
+				return nil
+			})
+		}
+		reqs := tr.Stop()
+		env.WriteJSON("connectivity/refused-requests.json", reqs)
 		if err != nil {
 			t.Fatalf("refused %s port: %v", from, err)
 		}
-		env.Metric("failover.refused_seconds", at.Sub(refused).Seconds(), "s", "lower")
+		d := back.Sub(refused)
+		env.Metric("failover.refused_seconds", d.Seconds(), "s", "lower")
+		if d > 10*time.Second {
+			t.Errorf("requests got through %s %s after the %s port began to refuse, want ≤ 10 s", to, d.Round(100*time.Millisecond), from)
+		}
 		if r := harness.RunClient(s.Client, "get", "-url", harness.URL(harness.TargetTCP), "-n", "2000000"); !r.OK {
 			t.Errorf("after switching to %s: %s", to, r)
 		}

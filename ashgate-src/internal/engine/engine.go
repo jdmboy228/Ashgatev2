@@ -173,7 +173,7 @@ type Engine struct {
 	rotatedAt time.Time
 
 	dnsSem chan struct{}
-	// relays is how TCP relays ended per proxy; see RelayHealth.
+	// relays is how TCP relays go per proxy; see RelayHealth.
 	relays relayBook
 
 	active    atomic.Int64

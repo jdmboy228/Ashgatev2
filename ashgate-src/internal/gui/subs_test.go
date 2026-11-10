@@ -20,6 +20,7 @@ import (
 	"ashgate/internal/logbuf"
 	"ashgate/internal/subs"
 	"ashgate/internal/testkit"
+	"ashgate/internal/vless"
 )
 
 // Fake values only.
@@ -120,12 +121,13 @@ func TestSubscriptionLifecycle(t *testing.T) {
 	// The primary freezes: traffic moves to the RAW backup.
 	c.mu.Lock()
 	g := c.subs[name]
-	switched := g.fo.Check(time.Now(), failover.Frozen, g.label)
+	g.fo.Begin(time.Now())
+	switched := g.fo.Check(time.Now(), failover.Frozen, time.Time{}, g.label)
 	c.mu.Unlock()
 	if !switched {
 		t.Fatal("no switch on a freeze")
 	}
-	c.applySubs()
+	c.switched(g)
 	label, local2 := activeOf(t, c, name)
 	if label != "raw1 · RAW" || local2 == local1 {
 		t.Fatalf("after freeze: active %q bridge %q (was %q)", label, local2, local1)
@@ -242,9 +244,9 @@ func TestAddSubscriptionRejectsBadInput(t *testing.T) {
 
 // checkTunnel tells a working tunnel, a refused one and a frozen one apart.
 func TestCheckTunnel(t *testing.T) {
-	oldFreeze, oldHost, oldPort := freezeAfter, healthHost, healthPort
-	freezeAfter = 300 * time.Millisecond
-	t.Cleanup(func() { freezeAfter, healthHost, healthPort = oldFreeze, oldHost, oldPort })
+	oldFreeze, oldHost, oldPort := checkTimeout, healthHost, healthPort
+	checkTimeout = 300 * time.Millisecond
+	t.Cleanup(func() { checkTimeout, healthHost, healthPort = oldFreeze, oldHost, oldPort })
 
 	px, err := testkit.ListenSOCKS("u", "p")
 	if err != nil {
@@ -289,18 +291,40 @@ func TestCheckTunnel(t *testing.T) {
 	}
 }
 
-// fakeTunnel is a running capture session whose relays the test scripts.
+// fakeTunnel is a running capture session whose relays and byte counters
+// the test scripts.
 type fakeTunnel struct {
-	mu sync.Mutex
-	h  engine.RelayHealth
+	mu    sync.Mutex
+	h     engine.RelayHealth
+	stats map[string]engine.RuleStat
+	since []time.Time // the cutoffs RelayHealth was asked with
 }
 
 func (f *fakeTunnel) Running() bool { return true }
 
-func (f *fakeTunnel) RelayHealth(string) engine.RelayHealth {
+func (f *fakeTunnel) RelayHealth(_ string, since time.Time) engine.RelayHealth {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.h
+	f.since = append(f.since, since)
+	h := f.h
+	// Like the engine: what started before the cutoff is left out.
+	if h.WaitingSince.Before(since) {
+		h.Waiting, h.WaitingSince = 0, time.Time{}
+	}
+	if h.LastDead.Before(since) {
+		h.Dead, h.LastDead = 0, time.Time{}
+	}
+	return h
+}
+
+func (f *fakeTunnel) RuleStats() map[string]engine.RuleStat {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := map[string]engine.RuleStat{}
+	for k, v := range f.stats {
+		out[k] = v
+	}
+	return out
 }
 
 func (f *fakeTunnel) set(h engine.RelayHealth) {
@@ -309,91 +333,392 @@ func (f *fakeTunnel) set(h engine.RelayHealth) {
 	f.mu.Unlock()
 }
 
-// Relays through the active server keep dying: a health check starts at
-// once, not at the next 60 s timer, and no more than once per 15 s.
-// Switching still takes the second failed check, 10 s later.
-func TestDeadRelaysStartAnEarlyCheck(t *testing.T) {
-	old, oldSess := subRand, sessionOf
+// foRig is a controller with one two-server subscription, a scripted
+// capture session and scripted checks.
+type foRig struct {
+	t      *testing.T
+	c      *controller
+	g      *subGroup
+	ft     *fakeTunnel
+	logs   *logbuf.Buffer
+	mu     sync.Mutex
+	check  failover.Result // what a check of the active server finds
+	checks int
+	probe  bool // what a probe of the primary finds
+	probes int
+	// noRoute: the machine has no route to the server.
+	noRoute bool
+}
+
+const rigSub = "sub"
+
+func newFoRig(t *testing.T, cfg failover.Config) *foRig {
+	t.Helper()
+	r := &foRig{t: t, ft: &fakeTunnel{}}
+	oldRand, oldSess, oldCfg, oldCheck, oldProbe, oldRoute := subRand, sessionOf, foConfig, checkActive, probeEntry, routeTo
+	routeTo = func(string) bool {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		return !r.noRoute
+	}
 	subRand = func() float64 { return 0.5 }
-	ft := &fakeTunnel{}
-	sessionOf = func(*controller) tunnelSession { return ft }
-	t.Cleanup(func() { subRand, sessionOf = old, oldSess })
+	sessionOf = func(*controller) tunnelSession { return r.ft }
+	foConfig = cfg
+	checkActive = func(vless.Status) failover.Result {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		r.checks++
+		return r.check
+	}
+	probeEntry = func(subs.Entry) bool {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		r.probes++
+		return r.probe
+	}
+	t.Cleanup(func() {
+		subRand, sessionOf, foConfig, checkActive, probeEntry, routeTo = oldRand, oldSess, oldCfg, oldCheck, oldProbe, oldRoute
+	})
 
-	logs, _ := logbuf.New(50, "")
-	c := newController(filepath.Join(t.TempDir(), "config.json"), config.Default(), logs, hooks{})
-	t.Cleanup(c.shutdown)
-	const name = "sub"
+	r.logs, _ = logbuf.New(50, "")
+	r.c = newController(filepath.Join(t.TempDir(), "config.json"), config.Default(), r.logs, hooks{})
+	t.Cleanup(r.c.shutdown)
+	r.g = &subGroup{entries: subs.Entries([]string{subLink("xhttp", "x1"), subLink("tcp", "raw1")}),
+		fo: failover.New(2, time.Now(), cfg, subRand), nextFetch: time.Now().Add(24 * time.Hour)}
+	r.c.mu.Lock()
+	r.c.subs = map[string]*subGroup{rigSub: r.g}
+	r.c.mu.Unlock()
+	return r
+}
+
+// tick runs one loop round at now and waits for what it started.
+func (r *foRig) tick(now time.Time) {
+	r.t.Helper()
+	r.c.subsTick(now)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		r.c.mu.Lock()
+		busy := r.g.checking || r.g.probing || r.g.applying
+		r.c.mu.Unlock()
+		if !busy {
+			return
+		}
+		if time.Now().After(deadline) {
+			r.t.Fatal("the check did not finish")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func (r *foRig) active() int {
+	r.c.mu.Lock()
+	defer r.c.mu.Unlock()
+	return r.g.fo.Active
+}
+
+func (r *foRig) counts() (checks, probes int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.checks, r.probes
+}
+
+func (r *foRig) set(check failover.Result, probe bool) {
+	r.mu.Lock()
+	r.check, r.probe = check, probe
+	r.mu.Unlock()
+}
+
+// fastFo is failover.Defaults with the waits cut to milliseconds, so that
+// the loop can be driven in real time.
+func fastFo() failover.Config {
+	cfg := failover.Defaults
+	cfg.SuspectAfter = 200 * time.Millisecond
+	cfg.RetryAfter = 200 * time.Millisecond
+	cfg.RecheckBase = 200 * time.Millisecond
+	cfg.ProbeBase = 30 * time.Millisecond
+	cfg.ConfirmEvery = 10 * time.Millisecond
+	cfg.MinReturn = 60 * time.Millisecond
+	return cfg
+}
+
+// An idle tunnel is never checked, however long it stays idle: there is
+// no timer, and Ashgate sends nothing of its own through it.
+func TestIdleTunnelIsNeverChecked(t *testing.T) {
+	r := newFoRig(t, failover.Defaults)
+	r.set(failover.OK, false)
 	base := time.Now()
-	g := &subGroup{entries: subs.Entries([]string{subLink("xhttp", "x1"), subLink("tcp", "raw1")}),
-		fo: failover.New(2, base, failover.Defaults, subRand), nextFetch: base.Add(24 * time.Hour)}
-	c.mu.Lock()
-	c.subs = map[string]*subGroup{name: g}
-	c.mu.Unlock()
+	for d := time.Duration(0); d < 12*time.Hour; d += 5 * time.Second {
+		r.tick(base.Add(d))
+	}
+	if checks, probes := r.counts(); checks != 0 || probes != 0 {
+		t.Fatalf("%d checks and %d probes of an idle tunnel in 12 h", checks, probes)
+	}
+	if r.active() != 0 {
+		t.Fatal("the idle tunnel changed its server")
+	}
+}
 
-	// tick runs one loop round and waits for the check it started.
-	tick := func(now time.Time) (checked bool) {
-		t.Helper()
-		c.subsTick(now)
-		deadline := time.Now().Add(5 * time.Second)
-		for {
-			c.mu.Lock()
-			busy, at := g.checking, g.earlyAt
-			c.mu.Unlock()
-			if !busy {
-				return at.Equal(now)
-			}
-			if time.Now().After(deadline) {
-				t.Fatal("the health check did not finish")
-			}
-			time.Sleep(5 * time.Millisecond)
+// A connection that sent and waits, and a check that gets no answer
+// either: the backup takes over after that one check, and what the old
+// server left behind is not held against the new one.
+func TestStallSwitchesAfterOneCheck(t *testing.T) {
+	r := newFoRig(t, fastFo())
+	r.set(failover.Frozen, false)
+	asked := time.Now()
+	r.ft.set(engine.RelayHealth{Waiting: 1, WaitingSince: asked, LastAsk: asked})
+	r.tick(time.Now())
+	if checks, _ := r.counts(); checks != 0 {
+		t.Fatalf("%d checks before the connection waited long enough", checks)
+	}
+	time.Sleep(210 * time.Millisecond)
+	r.tick(time.Now())
+	if checks, _ := r.counts(); checks != 1 || r.active() != 1 {
+		t.Fatalf("after the stall: %d checks, active %d; want one check and the backup", checks, r.active())
+	}
+	// The same waiting relay is still reported: it started before the
+	// switch, so the cutoff leaves it out and no check follows.
+	r.tick(time.Now())
+	r.tick(time.Now())
+	if checks, _ := r.counts(); checks != 1 || r.active() != 1 {
+		t.Fatalf("the old server's relay was held against the new one: %d checks, active %d", checks, r.active())
+	}
+	r.ft.mu.Lock()
+	last := r.ft.since[len(r.ft.since)-1]
+	r.ft.mu.Unlock()
+	if !last.After(asked) {
+		t.Fatal("after the switch the engine was still asked for relays of the old server")
+	}
+	n := 0
+	for _, e := range r.logs.Snapshot() {
+		if strings.Contains(e.Error, "Переключение сервера") && strings.Contains(e.Error, "нет ответа") {
+			n++
 		}
 	}
-	active := func() int {
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		return g.fo.Active
+	if n != 1 {
+		t.Fatalf("%d switch lines in the log, want 1", n)
+	}
+}
+
+// A refused check is repeated once before the switch.
+func TestRefusedSwitchesAfterTwoChecks(t *testing.T) {
+	r := newFoRig(t, fastFo())
+	r.set(failover.Failed, false)
+	now := time.Now()
+	r.ft.set(engine.RelayHealth{Dead: 1, LastDead: now, LastAsk: now})
+	r.tick(time.Now())
+	if checks, _ := r.counts(); checks != 1 || r.active() != 0 {
+		t.Fatalf("after one refusal: %d checks, active %d", checks, r.active())
+	}
+	r.ft.set(engine.RelayHealth{})
+	r.tick(time.Now())
+	if checks, _ := r.counts(); checks != 1 {
+		t.Fatal("the second check did not wait")
+	}
+	time.Sleep(210 * time.Millisecond)
+	r.tick(time.Now())
+	if checks, _ := r.counts(); checks != 2 || r.active() != 1 {
+		t.Fatalf("after two refusals: %d checks, active %d", checks, r.active())
+	}
+}
+
+// The machine has no route to the server (Wi-Fi is reconnecting): a check
+// that fails then says nothing about the server, and nothing switches.
+func TestNoNetworkKeepsServer(t *testing.T) {
+	r := newFoRig(t, fastFo())
+	r.set(failover.Frozen, false)
+	r.mu.Lock()
+	r.noRoute = true
+	r.mu.Unlock()
+	for i := 0; i < 3; i++ {
+		now := time.Now()
+		r.ft.set(engine.RelayHealth{Dead: 1, LastDead: now, LastAsk: now})
+		r.tick(time.Now())
+		time.Sleep(260 * time.Millisecond)
+	}
+	if checks, _ := r.counts(); checks != 3 || r.active() != 0 {
+		t.Fatalf("with no network: %d checks, active %d; want 3 checks and the same server", checks, r.active())
+	}
+	// The network is back and the server still does not answer: switch.
+	r.mu.Lock()
+	r.noRoute = false
+	r.mu.Unlock()
+	now := time.Now()
+	r.ft.set(engine.RelayHealth{Dead: 1, LastDead: now, LastAsk: now})
+	r.tick(time.Now())
+	if r.active() != 1 {
+		t.Fatal("no switch once the network was back")
+	}
+}
+
+// Traffic answered while the check ran keeps the server, whatever the
+// check found.
+func TestAnswerDuringCheckKeepsServer(t *testing.T) {
+	r := newFoRig(t, fastFo())
+	asked := time.Now()
+	r.ft.set(engine.RelayHealth{Waiting: 1, WaitingSince: asked, LastAsk: asked})
+	time.Sleep(210 * time.Millisecond)
+	checkActive = func(vless.Status) failover.Result {
+		// A relay gets its first bytes while the check waits in vain.
+		r.ft.set(engine.RelayHealth{LastGood: time.Now(), LastAsk: asked})
+		return failover.Frozen
+	}
+	r.tick(time.Now())
+	if r.active() != 0 {
+		t.Fatal("switched although traffic was answered during the check")
+	}
+}
+
+// The byte counters of the subscription's rules: bytes that go up again
+// and again with none coming down are silence; any byte down ends it.
+func TestSilenceFromByteCounters(t *testing.T) {
+	cfg := config.Default()
+	on, off := true, false
+	cfg.Groups = []config.Group{{Name: "g", Action: "proxy", Proxy: rigSub}}
+	cfg.Rules = []config.Rule{
+		{Enabled: &on, Process: `C:\Apps\One.exe`, Action: "proxy", Proxy: rigSub},
+		{Enabled: &on, Process: "two.exe", Group: "g"},
+		{Enabled: &on, Process: "other.exe", Action: "proxy", Proxy: "another"},
+		{Enabled: &off, Process: "off.exe", Action: "proxy", Proxy: rigSub},
+		{Enabled: &on, Process: "direct.exe", Action: "direct"},
+	}
+	stats := map[string]engine.RuleStat{
+		engine.RuleKey(`C:\Apps\One.exe`): {Up: 10, Down: 100},
+		"two.exe":                         {Up: 5, Down: 50},
+		"other.exe":                       {Up: 1000, Down: 1000},
+		"off.exe":                         {Up: 1000, Down: 1000},
+		"direct.exe":                      {Up: 1000, Down: 1000},
+	}
+	if up, down := ruleBytes(cfg, rigSub, stats); up != 15 || down != 150 {
+		t.Fatalf("bytes of the subscription's rules: %d up, %d down", up, down)
 	}
 
-	ft.set(engine.RelayHealth{Dead: 2, Since: base.Add(-2 * time.Second)})
-	if tick(base) {
-		t.Fatal("two dead relays started a check")
+	g := &subGroup{}
+	t0 := time.Now()
+	at := func(ms int) time.Time { return t0.Add(time.Duration(ms) * time.Millisecond) }
+	ev := g.evidence(at(0), engine.RelayHealth{}, 100, 100) // the first reading only sets the base
+	if !ev.SilentSince.IsZero() || !ev.LastUse.IsZero() {
+		t.Fatalf("first reading: %+v", ev)
 	}
-	ft.set(engine.RelayHealth{Dead: 3, Since: base.Add(-2 * time.Second)})
-	if !tick(base) {
-		t.Fatal("three dead relays did not start a check")
+	ev = g.evidence(at(250), engine.RelayHealth{}, 150, 300) // up and down: answered
+	if !ev.SilentSince.IsZero() || !ev.LastUse.Equal(at(250)) {
+		t.Fatalf("answered traffic: %+v", ev)
 	}
-	if active() != 0 {
-		t.Fatal("one failed check switched the server")
+	ev = g.evidence(at(500), engine.RelayHealth{}, 200, 300)
+	ev = g.evidence(at(750), engine.RelayHealth{}, 200, 300) // nothing moved
+	ev = g.evidence(at(2750), engine.RelayHealth{}, 260, 300)
+	if !ev.SilentSince.Equal(at(500)) || !ev.SilentLast.Equal(at(2750)) || !ev.LastUse.Equal(at(2750)) {
+		t.Fatalf("bytes up into silence: %+v", ev)
 	}
-	// New dead relays right after: no second early check within 15 s.
-	ft.set(engine.RelayHealth{Dead: 5, Since: base.Add(time.Second)})
-	if tick(base.Add(5 * time.Second)) {
-		t.Fatal("a second early check within 15 s")
+	ev = g.evidence(at(3000), engine.RelayHealth{}, 260, 301)
+	if !ev.SilentSince.IsZero() || !ev.SilentLast.IsZero() {
+		t.Fatalf("a byte came down: %+v", ev)
 	}
-	// The regular re-check after the 10 s backoff fails too: switch.
-	tick(base.Add(16 * time.Second))
-	if active() != 1 {
-		t.Fatal("two failed checks did not switch the server")
+	// An upload the server is reading: megabytes go up and the answer
+	// comes when it ends. That is not silence.
+	g.evidence(at(3100), engine.RelayHealth{}, 261, 301)
+	ev = g.evidence(at(5200), engine.RelayHealth{}, 260+silentLimit, 301)
+	if !ev.SilentSince.Equal(at(3100)) || !ev.SilentLast.Equal(at(5200)) {
+		t.Fatalf("256 KiB sent into silence do not count: %+v", ev)
 	}
+	ev = g.evidence(at(5300), engine.RelayHealth{}, 261+silentLimit, 301)
+	if !ev.SilentSince.IsZero() || !ev.LastUse.Equal(at(5300)) {
+		t.Fatalf("a large upload counts as silence: %+v", ev)
+	}
+	g.evidence(at(5400), engine.RelayHealth{}, 261+silentLimit, 400)
+	// A new capture session counts from zero.
+	g.evidence(at(5500), engine.RelayHealth{}, 400+silentLimit, 400)
+	ev = g.evidence(at(5600), engine.RelayHealth{}, 20, 0)
+	if !ev.SilentSince.IsZero() {
+		t.Fatalf("counters that started over: %+v", ev)
+	}
+	// The engine's relays come through as they are.
+	h := engine.RelayHealth{Waiting: 2, WaitingSince: at(1), Dead: 1, LastDead: at(2), LastGood: at(3), LastAsk: at(9000)}
+	ev = g.evidence(at(5700), h, 20, 0)
+	if !ev.WaitingSince.Equal(at(1)) || !ev.LastDead.Equal(at(2)) || !ev.LastGood.Equal(at(3)) || !ev.LastUse.Equal(at(9000)) {
+		t.Fatalf("relay health: %+v", ev)
+	}
+}
 
-	early := 0
-	for _, e := range logs.Snapshot() {
-		if strings.Contains(e.Error, "проверяю его сейчас") {
-			early++
+// On the backup the primary is probed only while the tunnel is used;
+// three good probes and the shortest stay bring traffic back.
+func TestProbesReturnToPrimary(t *testing.T) {
+	r := newFoRig(t, fastFo())
+	r.set(failover.Frozen, false)
+	now := time.Now()
+	r.ft.set(engine.RelayHealth{Dead: 1, LastDead: now, LastAsk: now})
+	r.tick(time.Now())
+	if r.active() != 1 {
+		t.Fatal("no switch to the backup")
+	}
+	switchedAt := time.Now()
+	// The tunnel is used, and the backup answers.
+	use := func() {
+		n := time.Now()
+		r.ft.set(engine.RelayHealth{LastGood: n, LastAsk: n})
+	}
+	// The primary stays down: probes come, less and less often, and
+	// nothing changes.
+	deadline := time.Now().Add(250 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		use()
+		r.tick(time.Now())
+		time.Sleep(5 * time.Millisecond)
+	}
+	if _, probes := r.counts(); probes < 1 || probes > 4 || r.active() != 1 {
+		t.Fatalf("%d probes of a dead primary in 250 ms (first after 30 ms, then pauses of 30, 60, 120 ms), active %d", probes, r.active())
+	}
+	// It comes back.
+	r.set(failover.Frozen, true)
+	deadline = time.Now().Add(5 * time.Second)
+	for r.active() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("no return to the primary")
 		}
+		use()
+		r.tick(time.Now())
+		time.Sleep(5 * time.Millisecond)
 	}
-	if early != 1 {
-		t.Fatalf("%d early check log lines, want 1", early)
+	if d := time.Since(switchedAt); d < 60*time.Millisecond {
+		t.Fatalf("returned after %v, sooner than the shortest stay", d)
 	}
+	r.c.mu.Lock()
+	reason := r.g.fo.Reason
+	r.c.mu.Unlock()
+	if !strings.Contains(reason, "основной сервер снова отвечает") {
+		t.Fatalf("reason %q", reason)
+	}
+	// Back on the primary: no more probes.
+	_, before := r.counts()
+	for i := 0; i < 20; i++ {
+		use()
+		r.tick(time.Now())
+		time.Sleep(5 * time.Millisecond)
+	}
+	if _, after := r.counts(); after != before {
+		t.Fatal("the primary is probed while it carries traffic")
+	}
+}
 
-	// Dead relays opened before the switch belong to the old server.
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	g.fo.SwitchedAt = base.Add(16 * time.Second)
-	if g.earlyCheck(base.Add(40*time.Second), engine.RelayHealth{Dead: 4, Since: base.Add(10 * time.Second)}) {
-		t.Fatal("relays of the previous server counted")
+// Nobody uses the tunnel: the dead primary is left alone.
+func TestNoProbesWhileUnused(t *testing.T) {
+	cfg := fastFo()
+	cfg.UseWithin = 50 * time.Millisecond
+	r := newFoRig(t, cfg)
+	r.set(failover.Frozen, false)
+	now := time.Now()
+	r.ft.set(engine.RelayHealth{Dead: 1, LastDead: now, LastAsk: now})
+	r.tick(time.Now())
+	if r.active() != 1 {
+		t.Fatal("no switch to the backup")
 	}
-	if !g.earlyCheck(base.Add(40*time.Second), engine.RelayHealth{Dead: 4, Since: base.Add(30 * time.Second)}) {
-		t.Fatal("relays of the new server did not count")
+	r.ft.set(engine.RelayHealth{LastAsk: now})
+	time.Sleep(60 * time.Millisecond)
+	_, before := r.counts()
+	for i := 0; i < 30; i++ {
+		r.tick(time.Now())
+		time.Sleep(5 * time.Millisecond)
+	}
+	if _, after := r.counts(); after != before {
+		t.Fatalf("%d probes of the primary with the tunnel unused", after-before)
 	}
 }

@@ -115,9 +115,12 @@ func testProcessesSession(t *testing.T, env *harness.Env, testStart time.Time) {
 		if g := guards(pid); len(g) != 1 {
 			t.Errorf("%d kill-switch guard processes, want 1", len(g))
 		}
-		hit := harness.WaitTunnelHealthy(t, s.Fx, a.Started, 150*time.Second)
-		if hit.Origin != harness.OriginTunnel {
-			t.Errorf("health check came from %s, want the tunnel", hit.Origin)
+		// The session's first request went through the tunnel. Whatever
+		// checks Ashgate made of its own went the same way.
+		for _, h := range s.Fx.Health.Since(a.Started) {
+			if h.Origin != harness.OriginTunnel {
+				t.Errorf("health check came from %s, want the tunnel", h.Origin)
+			}
 		}
 	})
 
@@ -241,9 +244,17 @@ func testProcessesSession(t *testing.T, env *harness.Env, testStart time.Time) {
 		s.Fx.RAW.Set(harness.GateBlackhole)
 		stallAt := time.Now()
 		r := harness.RunClient(s.Client, "get", "-url", harness.URL(harness.TargetTCP), "-n", "200000", "-stall", "8s")
-		noticed := harness.Eventually(150*time.Second, time.Second, func() error {
+		// The client's request went unanswered for 2 s, and so did the
+		// check that this started: the app says so by switching servers.
+		detected := time.Now()
+		noticed := harness.Eventually(60*time.Second, 250*time.Millisecond, func() error {
 			v := a.MustState().Subs[harness.SubName]
-			if v.SwitchedAt.After(before.SwitchedAt) || (v.Reason != "" && v.Reason != before.Reason) {
+			if v.SwitchedAt.After(before.SwitchedAt) {
+				detected = v.SwitchedAt
+				return nil
+			}
+			if v.Reason != "" && v.Reason != before.Reason {
+				detected = time.Now()
 				return nil
 			}
 			return errors.New("no switch or reason yet")
@@ -253,9 +264,13 @@ func testProcessesSession(t *testing.T, env *harness.Env, testStart time.Time) {
 			t.Errorf("the client got data with both servers cut off")
 		}
 		if noticed != nil {
-			t.Errorf("the health check did not notice the dead servers within 150 s")
+			t.Errorf("the dead servers were not noticed within 60 s of a request that got no answer")
 		} else {
-			env.Metric("stall.detect_seconds", time.Since(stallAt).Seconds(), "s", "lower")
+			d := detected.Sub(stallAt)
+			env.Metric("stall.detect_seconds", d.Seconds(), "s", "lower")
+			if d > 10*time.Second {
+				t.Errorf("the stall was noticed after %s, want ≤ 10 s", d.Round(100*time.Millisecond))
+			}
 		}
 		if leak := harness.Filter(pkts, harness.ToTestNet()); len(leak) > 0 {
 			t.Errorf("direct packets while the servers were down:%s", harness.Brief(leak, 10))
@@ -274,6 +289,12 @@ func testProcessesSession(t *testing.T, env *harness.Env, testStart time.Time) {
 		} else {
 			env.Metric("stall.recover_seconds", time.Since(back).Seconds(), "s", "lower")
 		}
+		// The backup carries traffic now. Let it return to the primary
+		// before the next subtests: the return ends open connections once.
+		if _, err := harness.WaitActive(a, s.Client, "XHTTP", 8*time.Minute); err != nil {
+			t.Errorf("no return to the primary after the stall: %v", err)
+		}
+		time.Sleep(2 * time.Second)
 	})
 
 	t.Run("SafeNetworkChange", func(t *testing.T) {

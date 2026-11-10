@@ -68,7 +68,7 @@ func NewSession(t *testing.T, o SessionOpts) *Session {
 		if err := s.App.StartCapture(); err != nil {
 			t.Fatalf("start capture: %v", err)
 		}
-		WaitTunnelHealthy(t, fx, s.App.Started, 150*time.Second)
+		WaitTunnel(t, s.Client, 60*time.Second)
 	}
 	return s
 }

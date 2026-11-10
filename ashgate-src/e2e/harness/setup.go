@@ -237,25 +237,20 @@ func SetRules(t testing.TB, a *App, rules map[string]string, o map[string]RuleOp
 // Bool is a pointer helper.
 func Bool(v bool) *bool { return &v }
 
-// WaitTunnelHealthy waits until a health check reached the 204 responder
-// through the tunnel after since. The first check comes 48–72 s after the
-// window opened (60 s ±20 %).
-func WaitTunnelHealthy(t testing.TB, f *Fixture, since time.Time, timeout time.Duration) Hit {
+// WaitTunnel waits until a request of the proxied client gets its page
+// through the tunnel. Ashgate does not check a tunnel that nobody uses, so
+// a program's request is the first thing that shows the tunnel works.
+func WaitTunnel(t testing.TB, client string, timeout time.Duration) {
 	t.Helper()
-	var hit Hit
 	err := Eventually(timeout, time.Second, func() error {
-		for _, h := range f.Health.Since(since) {
-			if h.Path == "/generate_204" {
-				hit = h
-				return nil
-			}
+		if r := RunClient(client, "get", "-url", URL(TargetTCP), "-n", "1000", "-stall", "5s"); !r.OK {
+			return errors.New(r.String())
 		}
-		return errors.New("no health check reached the test server yet")
+		return nil
 	})
 	if err != nil {
-		t.Fatalf("%v (within %s)", err, timeout)
+		t.Fatalf("no request got through the tunnel within %s: %v", timeout, err)
 	}
-	return hit
 }
 
 // ActiveServer is the active entry label of the subscription.
