@@ -1,0 +1,27 @@
+{
+  "comment": "Shared bypass list for every client. Zones are written as a user would type them; xn--p1ai is the DNS form of рф. Service names are the usual Russian direct-split set (state services, banks, Yandex, VK, MAX).",
+  "zones_unicode": ["ru", "su", "рф"],
+  "zones_ascii": ["ru", "su", "xn--p1ai"],
+  "domains": [
+    "gosuslugi.ru",
+    "nalog.gov.ru",
+    "sberbank.ru",
+    "sber.ru",
+    "vtb.ru",
+    "tbank.ru",
+    "tinkoff.ru",
+    "alfabank.ru",
+    "gazprombank.ru",
+    "raiffeisen.ru",
+    "sovcombank.ru",
+    "pochtabank.ru",
+    "psbank.ru",
+    "rshb.ru",
+    "open.ru",
+    "mkb.ru",
+    "yandex.ru",
+    "ya.ru",
+    "vk.com",
+    "max.ru"
+  ]
+}
