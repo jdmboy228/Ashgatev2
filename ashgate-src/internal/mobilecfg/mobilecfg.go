@@ -147,8 +147,8 @@ const (
 	TagBlock  = "block"
 )
 
-// DNSServers resolve the names of tunneled apps, over HTTPS through the
-// proxy. RawDNS gets the query types Xray's DNS does not answer.
+// DNSServers resolve the names that go through the proxy, over HTTPS
+// through the proxy. RawDNS gets the query types Xray's DNS does not answer.
 var (
 	DNSServers = []string{"https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query"}
 	RawDNS     = "1.1.1.1"
@@ -171,7 +171,8 @@ func DirectDomains() []string {
 // XrayJSON is the Xray document for a profile.
 //
 // Routing, first match wins:
-//  1. port 53 from the TUN goes to Xray's DNS, which asks DNSServers;
+//  1. port 53 from the TUN goes to Xray's DNS: direct names are asked of
+//     the system resolver, all others of DNSServers;
 //  2. Xray's own DNS queries go to the proxy;
 //  3. Russian domains (by the name the app asked for) go direct;
 //  4. Russian addresses go direct;
@@ -216,7 +217,11 @@ func XrayJSON(p Profile) ([]byte, error) {
 	if p.Kind == KindHTTP {
 		rules = append(rules, map[string]any{"type": "field", "inboundTag": []string{TagTun}, "network": "udp", "outboundTag": TagBlock})
 	}
-	servers := make([]any, 0, len(DNSServers))
+	// As on the desktop: names that go direct are resolved by the system
+	// resolver (Ashgate is outside the tunnel, so that is the network's
+	// DNS, and Russian sites give their local answers); every other name
+	// is resolved by DNSServers through the proxy and never falls back.
+	servers := []any{map[string]any{"address": "localhost", "domains": DirectDomains(), "skipFallback": true}}
 	for _, s := range DNSServers {
 		servers = append(servers, s)
 	}

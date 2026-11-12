@@ -82,12 +82,32 @@ jobs:
         with:
           gradle-version: "8.10.2"
 
+      # The same key for every build (secrets ANDROID_KEYSTORE_BASE64 and
+      # ANDROID_KEYSTORE_PASSWORD), so an update installs over the old app
+      # and keeps its profiles.
+      - name: Signing key
+        env:
+          KEYSTORE: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          if [ -z "$KEYSTORE" ]; then echo "::error::secret ANDROID_KEYSTORE_BASE64 is not set"; exit 1; fi
+          printf '%s' "$KEYSTORE" | base64 -d > "$RUNNER_TEMP/ashgate.p12"
+          echo "ANDROID_KEYSTORE_FILE=$RUNNER_TEMP/ashgate.p12" >> "$GITHUB_ENV"
+
       - name: APK
         working-directory: android
-        run: gradle --no-daemon assembleDebug
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: gradle --no-daemon assembleRelease
+
+      # The certificate's SHA-256 is public; a different one means a different key.
+      - name: Signature
+        run: |
+          apksigner="$(ls "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -1)"
+          "$apksigner" verify --print-certs android/app/build/outputs/apk/release/app-release.apk | tee certs.txt
+          grep -q "SHA-256 digest: 0a030808a89c00f3db1f73400deae24cb493b6bf9e1c12734f2aec96f24b1ebf" certs.txt
 
       - uses: actions/upload-artifact@v4
         with:
           name: ashgate-android-apk
-          path: android/app/build/outputs/apk/debug/app-debug.apk
+          path: android/app/build/outputs/apk/release/app-release.apk
           if-no-files-found: error

@@ -243,11 +243,18 @@ func TestDNSThroughTunnel(t *testing.T) {
 			t.Fatalf("%s: dns tag = %v", name, dns["tag"])
 		}
 		servers := dns["servers"].([]any)
-		if len(servers) == 0 {
-			t.Fatalf("%s: no DNS servers", name)
+		if len(servers) < 2 {
+			t.Fatalf("%s: DNS servers = %v", name, servers)
 		}
-		for _, s := range servers {
-			// "localhost" and "+local" servers would use the network's DNS.
+		// The system resolver answers only the names that go direct: the
+		// same list as the routing rule, and no fallback to it or from it.
+		local := servers[0].(map[string]any)
+		direct := d["routing"].(map[string]any)["rules"].([]any)[2].(map[string]any)["domain"]
+		if local["address"] != "localhost" || local["skipFallback"] != true || !reflect.DeepEqual(local["domains"], direct) {
+			t.Fatalf("%s: system resolver entry = %v", name, local)
+		}
+		// Every other name goes to DoH, which leaves through the proxy.
+		for _, s := range servers[1:] {
 			text, ok := s.(string)
 			if !ok || !strings.HasPrefix(text, "https://") || strings.Contains(text, "local") {
 				t.Fatalf("%s: DNS server %v does not go through the proxy", name, s)
