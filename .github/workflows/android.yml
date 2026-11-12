@@ -74,6 +74,7 @@ jobs:
           # -checklinkname=0: Xray's dependency anet reaches into package net
           # on Android, which the linker refuses since Go 1.23.
           export ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME"
+          mkdir -p ../android/app/libs
           gomobile bind -target=android/arm64,android/arm -androidapi 24 -javapkg io.ashgate \
             -trimpath -ldflags "-s -w -checklinkname=0" -o ../android/app/libs/ashgate.aar ./mobile
 
