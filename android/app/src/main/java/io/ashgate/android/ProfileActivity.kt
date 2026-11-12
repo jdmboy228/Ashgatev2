@@ -62,8 +62,8 @@ class ProfileActivity : Activity() {
             findViewById<Button>(R.id.delete).apply {
                 visibility = View.VISIBLE
                 setOnClickListener {
-                    val wasSelected = Store.selectedId(this@ProfileActivity) == id
-                    Store.delete(this@ProfileActivity, id!!)
+                    val wasSelected = Store.selectedId(this@ProfileActivity) == this@ProfileActivity.id
+                    Store.delete(this@ProfileActivity, this@ProfileActivity.id!!)
                     if (wasSelected) reconnect()
                     finish()
                 }
