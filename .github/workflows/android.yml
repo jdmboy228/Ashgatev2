@@ -63,16 +63,19 @@ jobs:
         env:
           ASHGATE_GEODATA: ${{ github.workspace }}/android/app/src/main/assets
         run: |
-          go test ./internal/mobilecfg/ ./internal/subs/ ./mobile/
+          go test ./internal/mobilecfg/ ./internal/subs/
+          go test -v ./mobile/
           go test ./internal/vless/ -run 'Parse|ClientJSON|Outbound|TLSPinned|Fingerprint|Normalize|UnknownType'
 
       - name: Go core (AAR)
         working-directory: ashgate-src
         run: |
           go install golang.org/x/mobile/cmd/gomobile golang.org/x/mobile/cmd/gobind
+          # -checklinkname=0: Xray's dependency anet reaches into package net
+          # on Android, which the linker refuses since Go 1.23.
           export ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME"
           gomobile bind -target=android/arm64,android/arm -androidapi 24 -javapkg io.ashgate \
-            -trimpath -ldflags "-s -w" -o ../android/app/libs/ashgate.aar ./mobile
+            -trimpath -ldflags "-s -w -checklinkname=0" -o ../android/app/libs/ashgate.aar ./mobile
 
       - uses: gradle/actions/setup-gradle@v4
         with:
