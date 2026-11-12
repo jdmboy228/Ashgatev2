@@ -2,6 +2,7 @@ package vless
 
 import (
 	"bytes"
+	"io"
 
 	applog "github.com/xtls/xray-core/app/log"
 	xraylog "github.com/xtls/xray-core/common/log"
@@ -45,6 +46,16 @@ func loadAndStart(raw []byte) (*instance, error) {
 	}
 	if err := inst.Start(); err != nil {
 		_ = inst.Close()
+		return nil, err
+	}
+	return inst, nil
+}
+
+// Run starts Xray with a ready JSON document. Closing the result stops it.
+// The Android core uses it; the desktop goes through Listen.
+func Run(raw []byte) (io.Closer, error) {
+	inst, err := loadAndStart(raw)
+	if err != nil {
 		return nil, err
 	}
 	return inst, nil

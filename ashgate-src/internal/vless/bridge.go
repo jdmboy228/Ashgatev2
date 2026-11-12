@@ -291,6 +291,102 @@ func ClientJSON(c ClientConfig) ([]byte, error) {
 	if c.User == "" || (c.Published.Port != 0 && c.Published.User == "") {
 		return nil, errors.New("VLESS: локальный прокси без логина")
 	}
+	proxy, err := outbound(c.Server, c.ServerPort, p)
+	if err != nil {
+		return nil, err
+	}
+	private := map[string]any{
+		"tag":      tagAshgate,
+		"listen":   "127.0.0.1",
+		"port":     c.Port,
+		"protocol": "socks",
+		"settings": socksSettings(c.User, c.Pass),
+	}
+	if len(c.Routing.Direct) > 0 {
+		// Route by the name the program asked for (TLS SNI, HTTP Host,
+		// QUIC); the connection still goes to the IP it chose.
+		private["sniffing"] = map[string]any{"enabled": true, "destOverride": []string{"http", "tls", "quic"}, "routeOnly": true}
+	}
+	inbounds := []any{private}
+	if pub := c.Published; pub.Port != 0 {
+		inbounds = append(inbounds, map[string]any{
+			"tag": "published", "listen": "127.0.0.1", "port": pub.Port,
+			"protocol": "socks", "settings": socksSettings(pub.User, pub.Pass),
+		})
+		if pub.Port < 65535 {
+			inbounds = append(inbounds, map[string]any{
+				"tag": "published-http", "listen": "127.0.0.1", "port": pub.Port + 1,
+				"protocol": "http", "settings": httpSettings(pub.User, pub.Pass),
+			})
+		}
+	}
+	outbounds := []any{proxy}
+	var rules []any
+	doc := map[string]any{
+		"log":      map[string]any{"loglevel": "info"},
+		"inbounds": inbounds,
+		// Xray closes a connection idle for 300 s by default, which drops
+		// quiet SSH and IMAP sessions: 30 minutes. After one side finishes,
+		// Xray's default gives the other side 1 s of silence, which cuts a
+		// slow answer to a half-closed request: 2 s and 5 s, as V2Ray had.
+		"policy": map[string]any{"levels": map[string]any{"0": map[string]any{
+			"connIdle": 1800, "uplinkOnly": 2, "downlinkOnly": 5,
+		}}},
+	}
+	if len(c.Routing.DNS) > 0 {
+		dnsOut := map[string]any{"tag": tagDNS, "protocol": "dns"}
+		if host, port, err := net.SplitHostPort(c.Routing.Raw); err == nil && net.ParseIP(host) != nil {
+			// A and AAAA go to Xray's DNS below. Other types (HTTPS, SRV,
+			// TXT, MX) go as they are to Raw, over TCP through the tunnel:
+			// to the original server they would reach the provider, and
+			// refused they break SRV and TXT lookups of every program
+			// once Windows' own DNS goes this way.
+			portNum, _ := net.LookupPort("tcp", port)
+			dnsOut["settings"] = map[string]any{
+				"rewriteNetwork": "tcp", "rewriteAddress": host, "rewritePort": portNum,
+				"rules": []any{
+					map[string]any{"action": "hijack", "qType": "1,28"},
+					map[string]any{"action": "direct"},
+				},
+			}
+			dnsOut["streamSettings"] = map[string]any{"sockopt": map[string]any{"dialerProxy": tagProxy}}
+		} else {
+			// Other query types would otherwise go to the original server
+			// outside Xray's DNS.
+			dnsOut["settings"] = map[string]any{"nonIPQuery": "reject"}
+		}
+		outbounds = append(outbounds, dnsOut)
+		rules = append(rules, map[string]any{"type": "field", "inboundTag": []string{tagAshgate}, "port": "53", "outboundTag": tagDNS})
+		servers := []any{}
+		if len(c.Routing.Direct) > 0 {
+			servers = append(servers, map[string]any{"address": "localhost", "domains": domainRules(c.Routing.Direct), "skipFallback": true})
+		}
+		for _, s := range c.Routing.DNS {
+			servers = append(servers, s)
+		}
+		doc["dns"] = map[string]any{"servers": servers, "queryStrategy": "UseIP"}
+	}
+	if len(c.Routing.Direct) > 0 {
+		outbounds = append(outbounds, map[string]any{"tag": tagDirect, "protocol": "freedom"})
+		rules = append(rules, map[string]any{"type": "field", "inboundTag": []string{tagAshgate}, "domain": domainRules(c.Routing.Direct), "outboundTag": tagDirect})
+	}
+	doc["outbounds"] = outbounds
+	if len(rules) > 0 {
+		doc["routing"] = map[string]any{"domainStrategy": "AsIs", "rules": rules}
+	}
+	return json.Marshal(doc)
+}
+
+// Outbound is Xray's VLESS outbound for one server, tagged "proxy". The
+// desktop bridge and the Android core build their documents around it.
+func Outbound(server string, port int, p Params) (map[string]any, error) {
+	if err := p.Normalize(); err != nil {
+		return nil, err
+	}
+	return outbound(server, port, p)
+}
+
+func outbound(server string, port int, p Params) (map[string]any, error) {
 	vuser := map[string]any{
 		"id":         p.UUID,
 		"encryption": "none",
@@ -383,97 +479,18 @@ func ClientJSON(c ClientConfig) ([]byte, error) {
 			}
 		}
 	}
-	private := map[string]any{
-		"tag":      tagAshgate,
-		"listen":   "127.0.0.1",
-		"port":     c.Port,
-		"protocol": "socks",
-		"settings": socksSettings(c.User, c.Pass),
-	}
-	if len(c.Routing.Direct) > 0 {
-		// Route by the name the program asked for (TLS SNI, HTTP Host,
-		// QUIC); the connection still goes to the IP it chose.
-		private["sniffing"] = map[string]any{"enabled": true, "destOverride": []string{"http", "tls", "quic"}, "routeOnly": true}
-	}
-	inbounds := []any{private}
-	if pub := c.Published; pub.Port != 0 {
-		inbounds = append(inbounds, map[string]any{
-			"tag": "published", "listen": "127.0.0.1", "port": pub.Port,
-			"protocol": "socks", "settings": socksSettings(pub.User, pub.Pass),
-		})
-		if pub.Port < 65535 {
-			inbounds = append(inbounds, map[string]any{
-				"tag": "published-http", "listen": "127.0.0.1", "port": pub.Port + 1,
-				"protocol": "http", "settings": httpSettings(pub.User, pub.Pass),
-			})
-		}
-	}
-	outbounds := []any{map[string]any{
+	return map[string]any{
 		"tag":      tagProxy,
 		"protocol": "vless",
 		"settings": map[string]any{
 			"vnext": []any{map[string]any{
-				"address": c.Server,
-				"port":    c.ServerPort,
+				"address": server,
+				"port":    port,
 				"users":   []any{vuser},
 			}},
 		},
 		"streamSettings": stream,
-	}}
-	var rules []any
-	doc := map[string]any{
-		"log":      map[string]any{"loglevel": "info"},
-		"inbounds": inbounds,
-		// Xray closes a connection idle for 300 s by default, which drops
-		// quiet SSH and IMAP sessions: 30 minutes. After one side finishes,
-		// Xray's default gives the other side 1 s of silence, which cuts a
-		// slow answer to a half-closed request: 2 s and 5 s, as V2Ray had.
-		"policy": map[string]any{"levels": map[string]any{"0": map[string]any{
-			"connIdle": 1800, "uplinkOnly": 2, "downlinkOnly": 5,
-		}}},
-	}
-	if len(c.Routing.DNS) > 0 {
-		dnsOut := map[string]any{"tag": tagDNS, "protocol": "dns"}
-		if host, port, err := net.SplitHostPort(c.Routing.Raw); err == nil && net.ParseIP(host) != nil {
-			// A and AAAA go to Xray's DNS below. Other types (HTTPS, SRV,
-			// TXT, MX) go as they are to Raw, over TCP through the tunnel:
-			// to the original server they would reach the provider, and
-			// refused they break SRV and TXT lookups of every program
-			// once Windows' own DNS goes this way.
-			portNum, _ := net.LookupPort("tcp", port)
-			dnsOut["settings"] = map[string]any{
-				"rewriteNetwork": "tcp", "rewriteAddress": host, "rewritePort": portNum,
-				"rules": []any{
-					map[string]any{"action": "hijack", "qType": "1,28"},
-					map[string]any{"action": "direct"},
-				},
-			}
-			dnsOut["streamSettings"] = map[string]any{"sockopt": map[string]any{"dialerProxy": tagProxy}}
-		} else {
-			// Other query types would otherwise go to the original server
-			// outside Xray's DNS.
-			dnsOut["settings"] = map[string]any{"nonIPQuery": "reject"}
-		}
-		outbounds = append(outbounds, dnsOut)
-		rules = append(rules, map[string]any{"type": "field", "inboundTag": []string{tagAshgate}, "port": "53", "outboundTag": tagDNS})
-		servers := []any{}
-		if len(c.Routing.Direct) > 0 {
-			servers = append(servers, map[string]any{"address": "localhost", "domains": domainRules(c.Routing.Direct), "skipFallback": true})
-		}
-		for _, s := range c.Routing.DNS {
-			servers = append(servers, s)
-		}
-		doc["dns"] = map[string]any{"servers": servers, "queryStrategy": "UseIP"}
-	}
-	if len(c.Routing.Direct) > 0 {
-		outbounds = append(outbounds, map[string]any{"tag": tagDirect, "protocol": "freedom"})
-		rules = append(rules, map[string]any{"type": "field", "inboundTag": []string{tagAshgate}, "domain": domainRules(c.Routing.Direct), "outboundTag": tagDirect})
-	}
-	doc["outbounds"] = outbounds
-	if len(rules) > 0 {
-		doc["routing"] = map[string]any{"domainStrategy": "AsIs", "rules": rules}
-	}
-	return json.Marshal(doc)
+	}, nil
 }
 
 // domainRules turns plain domains into Xray rules that also match

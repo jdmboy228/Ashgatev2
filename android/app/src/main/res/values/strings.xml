@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Ashgate</string>
+    <string name="profile">Профиль</string>
+    <string name="apps">Приложения</string>
+    <string name="connect">Подключить</string>
+    <string name="disconnect">Отключить</string>
+    <string name="state_off">Отключено</string>
+    <string name="state_starting">Подключение…</string>
+    <string name="state_on">Подключено</string>
+    <string name="profiles">Профили</string>
+    <string name="add">Добавить</string>
+    <string name="no_profiles">Профилей нет. Добавьте ссылку vless://, подписку или прокси.</string>
+    <string name="edit_hint">Удерживайте профиль, чтобы изменить его.</string>
+    <string name="apps_count">Приложения: %d</string>
+    <string name="need_profile">Выберите профиль</string>
+    <string name="need_apps">Выберите приложения, которые пойдут через туннель</string>
+    <string name="no_vpn_permission">Нет разрешения на VPN</string>
+    <string name="kind_vless">VLESS</string>
+    <string name="kind_socks5">SOCKS5</string>
+    <string name="kind_http">HTTP</string>
+    <string name="link_hint">Ссылка vless:// или адрес подписки 3x-ui</string>
+    <string name="name_hint">Название</string>
+    <string name="host_hint">Адрес</string>
+    <string name="port_hint">Порт</string>
+    <string name="user_hint">Логин (если есть)</string>
+    <string name="pass_hint">Пароль (если есть)</string>
+    <string name="save">Сохранить</string>
+    <string name="delete">Удалить</string>
+    <string name="sub_failed">Не удалось загрузить подписку</string>
+    <string name="channel">Подключение</string>
+</resources>

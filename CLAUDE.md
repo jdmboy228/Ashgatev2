@@ -34,6 +34,18 @@ The app is in `ashgate-src/` (Go module `ashgate`). The installer is `installer.
   loop set their hooks on their own controller (`controller.fo`, see `foRig` in
   `gui/subs_test.go`) after stopping its loop; package-level hooks raced under `-race`.
 
+## Android (2026-11-12, branch `android-mvp`)
+
+- The app is `android/` (Kotlin, package `io.ashgate.android`); its Go core is
+  `ashgate-src/mobile` (bound with gomobile) and `ashgate-src/internal/mobilecfg` (profiles and
+  the Xray document). See `android/README.md`.
+- Xray's own TUN inbound reads the VpnService descriptor (`xray.tun.fd`); there is no local
+  SOCKS or HTTP port. Ashgate is never in the allowed apps, so its sockets need no `protect()`.
+- Never install the Android SDK, NDK or Gradle here. The APK and all Android tests run only in
+  `.github/workflows/android.yml` (no Gradle wrapper in the repo; CI pins Gradle).
+- Locally only `go test ./internal/mobilecfg/` runs, with the `-overlay` stubs below (the stub
+  for `xray.go` also needs `Run`). `mobile/router_test.go` imports Xray: CI only.
+
 ## E2E progress (2026-11-08)
 
 - 0.9.3 (PR #2, branch `audit-0.9.3`, includes 0.9.2 from PR #1): VLESS TCP in-process

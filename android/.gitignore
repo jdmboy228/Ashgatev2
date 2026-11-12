@@ -1,0 +1,7 @@
+.gradle/
+build/
+local.properties
+# Built in CI: the Go core and Xray's geodata.
+app/libs/*.aar
+app/libs/*.jar
+app/src/main/assets/*.dat

@@ -1,0 +1,89 @@
+# Builds the Android app (android/) and runs its tests. The Android SDK, NDK
+# and Gradle exist only here, never on the development server.
+#
+# Run it by hand (workflow_dispatch). GitHub only offers that for a workflow
+# on the default branch, so until this file is merged the branch's own pushes
+# build too; drop the push trigger at merge.
+name: android
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [android-mvp]
+    paths:
+      - "android/**"
+      - "ashgate-src/mobile/**"
+      - "ashgate-src/internal/mobilecfg/**"
+      - "ashgate-src/internal/vless/**"
+      - "ashgate-src/internal/subs/**"
+      - "ashgate-src/go.mod"
+      - ".github/workflows/android.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: ashgate-src/go.mod
+          cache-dependency-path: ashgate-src/go.sum
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # Xray's geoip:ru and geosite:category-ru come from these files; they
+      # ship inside the APK. Pinned releases, checked by hash.
+      - name: Geodata
+        working-directory: android/app/src/main
+        run: |
+          mkdir -p assets && cd assets
+          curl -fsSL --retry 3 -o geoip.dat https://github.com/v2fly/geoip/releases/download/202611080027/geoip.dat
+          curl -fsSL --retry 3 -o geosite.dat https://github.com/v2fly/domain-list-community/releases/download/20261110034535/dlc.dat
+          sha256sum -c <<'SUMS'
+          eedb24b3b9fcba27e06b92c0428dab90d9496083091ae4cf39e11387fd99d0e2  geoip.dat
+          6cc4decf520dbfd96e1e3750661976eb31d2a5381090b8768cb2ab1528201fcf  geosite.dat
+          SUMS
+
+      # Links, subscriptions and proxies; the Xray document; and the real
+      # Xray router with the geodata above (mobile/router_test.go).
+      - name: Tests
+        working-directory: ashgate-src
+        env:
+          ASHGATE_GEODATA: ${{ github.workspace }}/android/app/src/main/assets
+        run: |
+          go test ./internal/mobilecfg/ ./internal/subs/ ./mobile/
+          go test ./internal/vless/ -run 'Parse|ClientJSON|Outbound|TLSPinned|Fingerprint|Normalize|UnknownType'
+
+      - name: Go core (AAR)
+        working-directory: ashgate-src
+        run: |
+          go install golang.org/x/mobile/cmd/gomobile golang.org/x/mobile/cmd/gobind
+          export ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME"
+          gomobile bind -target=android/arm64,android/arm -androidapi 24 -javapkg io.ashgate \
+            -trimpath -ldflags "-s -w" -o ../android/app/libs/ashgate.aar ./mobile
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.10.2"
+
+      - name: APK
+        working-directory: android
+        run: gradle --no-daemon assembleDebug
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ashgate-android-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
