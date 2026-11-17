@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Ashgate «Тишина». Все размеры 1:1 из Figma (1 px = 1 dp). Шрифты в sp. -->
+<resources>
+    <!-- Общие -->
+    <dimen name="ag_screen_h">24dp</dimen>              <!-- боковые поля контента -->
+    <dimen name="ag_hairline">1dp</dimen>
+    <dimen name="ag_appbar_h">56dp</dimen>
+    <dimen name="ag_appbar_start">16dp</dimen>
+    <dimen name="ag_back_touch">40dp</dimen>
+    <dimen name="ag_back_icon">24dp</dimen>
+
+    <!-- Главная кнопка -->
+    <dimen name="ag_button_h">60dp</dimen>
+    <dimen name="ag_button_radius">30dp</dimen>
+    <dimen name="ag_button_icon">22dp</dimen>
+    <dimen name="ag_button_icon_gap">10dp</dimen>
+    <dimen name="ag_button_bottom">18dp</dimen>         <!-- над системной полосой жестов -->
+
+    <!-- Главная: центр -->
+    <dimen name="ag_center_top">150dp</dimen>           <!-- от низа статус-бара до логотипа -->
+    <dimen name="ag_logo">40dp</dimen>
+    <dimen name="ag_logo_to_status">40dp</dimen>
+    <dimen name="ag_status_dot">7dp</dimen>
+    <dimen name="ag_dot_to_label">8dp</dimen>
+    <dimen name="ag_status_to_title">14dp</dimen>
+    <dimen name="ag_title_to_sub">10dp</dimen>
+    <dimen name="ag_glow_size">200dp</dimen>
+    <dimen name="ag_glow_blur">100dp</dimen>
+
+    <!-- Главная: строки -->
+    <dimen name="ag_main_row_h">60dp</dimen>
+    <dimen name="ag_chevron">20dp</dimen>
+    <dimen name="ag_value_to_chevron">8dp</dimen>
+    <dimen name="ag_no_chevron_end">9dp</dimen>         <!-- «напрямую» кончается на 9dp левее края -->
+    <dimen name="ag_lines_to_button">32dp</dimen>
+
+    <!-- Заголовок экранов Приложения / Профили -->
+    <dimen name="ag_head_top">12dp</dimen>
+    <dimen name="ag_head_gap">8dp</dimen>
+    <dimen name="ag_head_bottom">24dp</dimen>
+
+    <!-- Списки -->
+    <dimen name="ag_app_row_h">60dp</dimen>
+    <dimen name="ag_app_icon">32dp</dimen>
+    <dimen name="ag_icon_to_name">16dp</dimen>
+    <dimen name="ag_check_circle">24dp</dimen>
+    <dimen name="ag_check_ring">1.5dp</dimen>
+    <dimen name="ag_check_mark">18dp</dimen>
+    <dimen name="ag_caption_row_h">40dp</dimen>
+    <dimen name="ag_caption_top">20dp</dimen>
+    <dimen name="ag_caption_bottom">6dp</dimen>
+    <dimen name="ag_profile_row_h">66dp</dimen>
+    <dimen name="ag_profile_name_to_meta">3dp</dimen>
+    <dimen name="ag_profile_text_to_check">12dp</dimen>
+    <dimen name="ag_selected_check">24dp</dimen>
+
+    <!-- Шрифты -->
+    <dimen name="ag_ts_display">36sp</dimen>
+    <dimen name="ag_ts_screen_title">34sp</dimen>
+    <dimen name="ag_ts_button">17sp</dimen>
+    <dimen name="ag_ts_profile_name">17sp</dimen>
+    <dimen name="ag_ts_subline">16sp</dimen>
+    <dimen name="ag_ts_app_name">16sp</dimen>
+    <dimen name="ag_ts_body">15sp</dimen>               <!-- подписи/значения строк, подзаголовки -->
+    <dimen name="ag_ts_status">12sp</dimen>
+    <dimen name="ag_ts_caption">11sp</dimen>            <!-- подписи групп и мета профиля -->
+</resources>

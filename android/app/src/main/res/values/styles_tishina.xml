@@ -1,0 +1,137 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Shared pieces of the «Тишина» screens. Fonts are set in code (Fonts.kt): minSdk 24 has no XML fonts. -->
+<resources>
+    <style name="Hairline">
+        <item name="android:layout_width">match_parent</item>
+        <item name="android:layout_height">@dimen/ag_hairline</item>
+        <item name="android:background">@color/ag_hairline</item>
+    </style>
+
+    <!-- Main screen rows: label left, value right, chevron. -->
+    <style name="MainRow">
+        <item name="android:layout_width">match_parent</item>
+        <item name="android:layout_height">@dimen/ag_main_row_h</item>
+        <item name="android:orientation">horizontal</item>
+        <item name="android:gravity">center_vertical</item>
+        <item name="android:background">?android:attr/selectableItemBackground</item>
+        <item name="android:clickable">true</item>
+        <item name="android:focusable">true</item>
+    </style>
+    <style name="MainRowLabel">
+        <item name="android:layout_width">wrap_content</item>
+        <item name="android:layout_height">wrap_content</item>
+        <item name="android:includeFontPadding">false</item>
+        <item name="android:singleLine">true</item>
+        <item name="android:textColor">@color/ag_text2</item>
+        <item name="android:textSize">@dimen/ag_ts_body</item>
+    </style>
+    <style name="MainRowValue">
+        <item name="android:layout_width">0dp</item>
+        <item name="android:layout_height">wrap_content</item>
+        <item name="android:layout_weight">1</item>
+        <item name="android:layout_marginLeft">16dp</item>
+        <item name="android:ellipsize">end</item>
+        <item name="android:gravity">right</item>
+        <item name="android:includeFontPadding">false</item>
+        <item name="android:singleLine">true</item>
+        <item name="android:textColor">@color/ag_text1</item>
+        <item name="android:textSize">@dimen/ag_ts_body</item>
+    </style>
+    <style name="MainRowChevron">
+        <item name="android:layout_width">@dimen/ag_chevron</item>
+        <item name="android:layout_height">@dimen/ag_chevron</item>
+        <item name="android:layout_marginLeft">@dimen/ag_value_to_chevron</item>
+        <item name="android:importantForAccessibility">no</item>
+        <item name="android:src">@drawable/ic_chevron_right</item>
+    </style>
+
+    <!-- The orange button at the bottom of the main and profiles screens. -->
+    <style name="MainButton">
+        <item name="android:layout_width">match_parent</item>
+        <item name="android:layout_height">@dimen/ag_button_h</item>
+        <item name="android:layout_marginBottom">@dimen/ag_button_bottom</item>
+        <item name="android:orientation">horizontal</item>
+        <item name="android:gravity">center</item>
+        <item name="android:background">@drawable/bg_button</item>
+        <item name="android:clickable">true</item>
+        <item name="android:focusable">true</item>
+    </style>
+    <style name="MainButtonIcon">
+        <item name="android:layout_width">@dimen/ag_button_icon</item>
+        <item name="android:layout_height">@dimen/ag_button_icon</item>
+        <item name="android:importantForAccessibility">no</item>
+    </style>
+    <style name="MainButtonText">
+        <item name="android:layout_width">wrap_content</item>
+        <item name="android:layout_height">wrap_content</item>
+        <item name="android:layout_marginLeft">@dimen/ag_button_icon_gap</item>
+        <item name="android:includeFontPadding">false</item>
+        <item name="android:singleLine">true</item>
+        <item name="android:textColor">@color/ag_on_accent</item>
+        <item name="android:textSize">@dimen/ag_ts_button</item>
+    </style>
+
+    <!-- Apps and Profiles: back bar, title, subtitle, group caption. -->
+    <style name="AppBar">
+        <item name="android:layout_width">match_parent</item>
+        <item name="android:layout_height">@dimen/ag_appbar_h</item>
+        <item name="android:paddingLeft">@dimen/ag_appbar_start</item>
+        <item name="android:paddingRight">@dimen/ag_screen_h</item>
+    </style>
+    <style name="BackButton">
+        <item name="android:layout_width">@dimen/ag_back_touch</item>
+        <item name="android:layout_height">@dimen/ag_back_touch</item>
+        <item name="android:layout_gravity">center_vertical</item>
+        <item name="android:background">?android:attr/selectableItemBackgroundBorderless</item>
+        <item name="android:contentDescription">@string/back</item>
+        <item name="android:scaleType">center</item>
+        <item name="android:src">@drawable/ic_back</item>
+    </style>
+    <style name="ScreenTitle">
+        <item name="android:layout_width">match_parent</item>
+        <item name="android:layout_height">wrap_content</item>
+        <item name="android:layout_marginLeft">@dimen/ag_screen_h</item>
+        <item name="android:layout_marginRight">@dimen/ag_screen_h</item>
+        <item name="android:layout_marginTop">@dimen/ag_head_top</item>
+        <item name="android:includeFontPadding">false</item>
+        <item name="android:letterSpacing">-0.02</item>
+        <item name="android:singleLine">true</item>
+        <item name="android:textColor">@color/ag_text1</item>
+        <item name="android:textSize">@dimen/ag_ts_screen_title</item>
+    </style>
+    <style name="ScreenSub">
+        <item name="android:layout_width">match_parent</item>
+        <item name="android:layout_height">wrap_content</item>
+        <item name="android:layout_marginLeft">@dimen/ag_screen_h</item>
+        <item name="android:layout_marginRight">@dimen/ag_screen_h</item>
+        <item name="android:layout_marginTop">@dimen/ag_head_gap</item>
+        <item name="android:layout_marginBottom">@dimen/ag_head_bottom</item>
+        <item name="android:includeFontPadding">false</item>
+        <item name="android:textColor">@color/ag_text2</item>
+        <item name="android:textSize">@dimen/ag_ts_body</item>
+    </style>
+    <style name="ScreenList">
+        <item name="android:layout_width">match_parent</item>
+        <item name="android:layout_height">0dp</item>
+        <item name="android:layout_weight">1</item>
+        <item name="android:paddingLeft">@dimen/ag_screen_h</item>
+        <item name="android:paddingRight">@dimen/ag_screen_h</item>
+        <item name="android:clipToPadding">false</item>
+        <item name="android:divider">@null</item>
+        <item name="android:dividerHeight">0dp</item>
+        <item name="android:listSelector">@android:color/transparent</item>
+        <item name="android:scrollbarStyle">outsideOverlay</item>
+    </style>
+    <!-- «ОСТАЛЬНЫЕ · 48», «ПОДПИСКА 3X-UI», «СВОИ»: a 40dp block, the text 20 from its top. -->
+    <style name="GroupCaption">
+        <item name="android:layout_width">match_parent</item>
+        <item name="android:layout_height">@dimen/ag_caption_row_h</item>
+        <item name="android:paddingTop">@dimen/ag_caption_top</item>
+        <item name="android:paddingBottom">@dimen/ag_caption_bottom</item>
+        <item name="android:includeFontPadding">false</item>
+        <item name="android:letterSpacing">0.08</item>
+        <item name="android:singleLine">true</item>
+        <item name="android:textColor">@color/ag_text3</item>
+        <item name="android:textSize">@dimen/ag_ts_caption</item>
+    </style>
+</resources>

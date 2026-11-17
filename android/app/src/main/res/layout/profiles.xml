@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Profiles screen, «Тишина» (specs/profiles.md): the list scrolls under the pinned button. -->
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:fitsSystemWindows="true">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:orientation="vertical">
+
+        <include layout="@layout/screen_head" />
+
+        <ListView
+            android:id="@+id/list"
+            style="@style/ScreenList"
+            android:paddingBottom="102dp" />
+
+        <!-- No profiles yet: shown in place of the list. -->
+        <TextView
+            android:id="@+id/empty"
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1"
+            android:paddingLeft="@dimen/ag_screen_h"
+            android:paddingRight="@dimen/ag_screen_h"
+            android:paddingTop="8dp"
+            android:includeFontPadding="false"
+            android:text="@string/no_profiles"
+            android:textColor="@color/ag_text2"
+            android:textSize="@dimen/ag_ts_body"
+            android:visibility="gone" />
+    </LinearLayout>
+
+    <LinearLayout
+        android:id="@+id/add"
+        style="@style/MainButton"
+        android:layout_gravity="bottom"
+        android:layout_marginLeft="@dimen/ag_screen_h"
+        android:layout_marginRight="@dimen/ag_screen_h">
+
+        <ImageView
+            style="@style/MainButtonIcon"
+            android:src="@drawable/ic_add" />
+
+        <TextView
+            android:id="@+id/add_text"
+            style="@style/MainButtonText"
+            android:text="@string/add_profile" />
+    </LinearLayout>
+</FrameLayout>

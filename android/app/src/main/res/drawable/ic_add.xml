@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Exported from Figma node, Ashgate «Тишина». Source SVG: icons/ic_add.svg -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="22dp" android:height="22dp"
+    android:viewportWidth="22" android:viewportHeight="22">
+    <path
+        android:pathData="M11 2.97913C11.3797 2.97913 11.6875 3.28693 11.6875 3.66663V10.3125H18.3333C18.713 10.3125 19.0208 10.6203 19.0208 11C19.0208 11.3797 18.713 11.6875 18.3333 11.6875H11.6875V18.3333C11.6875 18.713 11.3797 19.0208 11 19.0208C10.6203 19.0208 10.3125 18.713 10.3125 18.3333V11.6875H3.66663C3.28693 11.6875 2.97913 11.3797 2.97913 11C2.97913 10.6203 3.28693 10.3125 3.66663 10.3125H10.3125V3.66663C10.3125 3.28693 10.6203 2.97913 11 2.97913Z"
+        android:fillColor="#1B1006" />
+</vector>

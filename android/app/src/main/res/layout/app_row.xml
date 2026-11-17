@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- One app: icon 32, name, check circle 24; 60dp, no dividers. -->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="@dimen/ag_app_row_h"
+    android:background="?android:attr/selectableItemBackground"
+    android:gravity="center_vertical"
+    android:orientation="horizontal">
+
+    <ImageView
+        android:id="@+id/icon"
+        android:layout_width="@dimen/ag_app_icon"
+        android:layout_height="@dimen/ag_app_icon"
+        android:importantForAccessibility="no" />
+
+    <TextView
+        android:id="@+id/name"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_marginLeft="@dimen/ag_icon_to_name"
+        android:layout_marginRight="@dimen/ag_icon_to_name"
+        android:layout_weight="1"
+        android:ellipsize="end"
+        android:includeFontPadding="false"
+        android:singleLine="true"
+        android:textSize="@dimen/ag_ts_app_name" />
+
+    <ImageView
+        android:id="@+id/check"
+        android:layout_width="@dimen/ag_check_circle"
+        android:layout_height="@dimen/ag_check_circle"
+        android:importantForAccessibility="no" />
+</LinearLayout>

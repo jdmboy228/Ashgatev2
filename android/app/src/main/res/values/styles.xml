@@ -1,9 +1,21 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- «Тишина» has only a dark theme, so values-night is the same. -->
 <resources>
-    <color name="accent">#E2452A</color>
-    <style name="AppTheme" parent="android:Theme.Material.Light.DarkActionBar">
-        <item name="android:colorPrimary">#E2452A</item>
-        <item name="android:colorPrimaryDark">#B5341E</item>
-        <item name="android:colorAccent">@color/accent</item>
+    <color name="accent">@color/ag_accent</color>
+    <style name="AppTheme" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/ag_bg</item>
+        <item name="android:statusBarColor">@color/ag_bg</item>
+        <item name="android:navigationBarColor">@color/ag_bg</item>
+        <item name="android:colorAccent">@color/ag_accent</item>
+        <item name="android:colorPrimary">@color/ag_bg</item>
+        <item name="android:colorPrimaryDark">@color/ag_bg</item>
+    </style>
+    <!-- The profile form is not in the design: it keeps its ActionBar, in the design's colors. -->
+    <style name="AppTheme.Form" parent="android:Theme.Material">
+        <item name="android:windowBackground">@color/ag_bg</item>
+        <item name="android:statusBarColor">@color/ag_bg</item>
+        <item name="android:navigationBarColor">@color/ag_bg</item>
+        <item name="android:colorPrimary">@color/ag_bg</item>
+        <item name="android:colorAccent">@color/ag_accent</item>
     </style>
 </resources>

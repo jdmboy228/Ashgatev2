@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Back bar, title and subtitle of the Apps and Profiles screens (specs/apps.md, «Верх»). -->
+<merge xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <FrameLayout style="@style/AppBar">
+
+        <ImageButton
+            android:id="@+id/back"
+            style="@style/BackButton" />
+    </FrameLayout>
+
+    <TextView
+        android:id="@+id/title"
+        style="@style/ScreenTitle" />
+
+    <TextView
+        android:id="@+id/sub"
+        style="@style/ScreenSub" />
+</merge>

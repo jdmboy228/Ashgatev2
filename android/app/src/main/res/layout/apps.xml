@@ -1,7 +1,14 @@
 <?xml version="1.0" encoding="utf-8"?>
-<ListView xmlns:android="http://schemas.android.com/apk/res/android"
-    android:id="@+id/list"
+<!-- Apps screen, «Тишина» (specs/apps.md). -->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:choiceMode="multipleChoice"
-    android:fitsSystemWindows="true" />
+    android:fitsSystemWindows="true"
+    android:orientation="vertical">
+
+    <include layout="@layout/screen_head" />
+
+    <ListView
+        android:id="@+id/list"
+        style="@style/ScreenList" />
+</LinearLayout>

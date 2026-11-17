@@ -35,7 +35,11 @@
         <activity
             android:name=".ProfileActivity"
             android:label="@string/profile"
+            android:theme="@style/AppTheme.Form"
             android:windowSoftInputMode="adjustResize" />
+        <activity
+            android:name=".ProfilesActivity"
+            android:label="@string/profiles" />
         <activity
             android:name=".AppsActivity"
             android:label="@string/apps" />

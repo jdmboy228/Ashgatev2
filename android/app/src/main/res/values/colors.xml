@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Ashgate «Тишина». Формат Android: #AARRGGBB. Источник: tokens.json -->
+<resources>
+    <color name="ag_bg">#FF0C0D10</color>
+    <color name="ag_text1">#FFF4F5F7</color>
+    <color name="ag_text2">#7AFFFFFF</color>          <!-- 48 % белого -->
+    <color name="ag_text2_strong">#B8FFFFFF</color>   <!-- 72 % белого -->
+    <color name="ag_text3">#4DFFFFFF</color>          <!-- 30 % белого -->
+    <color name="ag_hairline">#14FFFFFF</color>       <!-- 8 % белого -->
+    <color name="ag_ring_off">#38FFFFFF</color>       <!-- 22 % белого -->
+    <color name="ag_accent">#FFF47A2C</color>         <!-- только главная кнопка и логотип -->
+    <color name="ag_on_accent">#FF1B1006</color>
+    <color name="ag_success">#FF5FD38D</color>
+    <color name="ag_glow">#1A5FD38D</color>           <!-- success, 10 % -->
+    <!-- derived: в макете не нарисован, нужен для существующих ошибок -->
+    <color name="ag_error">#FFFF99A4</color>
+    <!-- нажатие на строки/кнопку назад: в макете нет, системный ripple на тёмном фоне -->
+    <color name="ag_ripple">#1FFFFFFF</color>         <!-- derived -->
+</resources>

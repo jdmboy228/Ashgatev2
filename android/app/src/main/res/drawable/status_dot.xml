@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The status dot; its color is set in code to match the status word. -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="oval">
+    <solid android:color="@color/ag_success" />
+    <size android:width="@dimen/ag_status_dot" android:height="@dimen/ag_status_dot" />
+</shape>

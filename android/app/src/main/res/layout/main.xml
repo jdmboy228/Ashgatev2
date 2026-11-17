@@ -1,74 +1,165 @@
 <?xml version="1.0" encoding="utf-8"?>
-<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+<!-- Main screen, «Тишина» (specs/main.md): status in the middle, three rows and the button at the bottom. -->
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:fitsSystemWindows="true"
-    android:orientation="vertical"
-    android:padding="16dp">
+    android:fitsSystemWindows="true">
 
-    <TextView
-        android:id="@+id/status"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:gravity="center"
-        android:paddingTop="16dp"
-        android:textAppearance="?android:attr/textAppearanceLarge" />
-
-    <TextView
-        android:id="@+id/error"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:gravity="center"
-        android:paddingTop="8dp"
-        android:textColor="@color/accent"
+    <!-- The green glow behind the status, only when connected; its gradient is set in code. -->
+    <View
+        android:id="@+id/glow"
+        android:layout_width="400dp"
+        android:layout_height="400dp"
+        android:layout_gravity="center_horizontal"
+        android:layout_marginTop="10dp"
         android:visibility="gone" />
 
-    <Button
-        android:id="@+id/toggle"
+    <ScrollView
         android:layout_width="match_parent"
-        android:layout_height="56dp"
-        android:layout_marginTop="16dp"
-        android:layout_marginBottom="16dp" />
+        android:layout_height="match_parent"
+        android:fillViewport="true">
 
-    <LinearLayout
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:gravity="center_vertical"
-        android:orientation="horizontal">
-
-        <TextView
-            android:layout_width="0dp"
+        <LinearLayout
+            android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_weight="1"
-            android:text="@string/profiles"
-            android:textAppearance="?android:attr/textAppearanceMedium" />
+            android:orientation="vertical"
+            android:paddingLeft="@dimen/ag_screen_h"
+            android:paddingRight="@dimen/ag_screen_h">
 
-        <Button
-            android:id="@+id/add"
-            style="?android:attr/borderlessButtonStyle"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="@string/add"
-            android:textColor="@color/accent" />
-    </LinearLayout>
+            <ImageView
+                android:layout_width="@dimen/ag_logo"
+                android:layout_height="@dimen/ag_logo"
+                android:layout_gravity="center_horizontal"
+                android:layout_marginTop="@dimen/ag_center_top"
+                android:importantForAccessibility="no"
+                android:src="@drawable/ashgate_logo" />
 
-    <ListView
-        android:id="@+id/list"
-        android:layout_width="match_parent"
-        android:layout_height="0dp"
-        android:layout_weight="1"
-        android:choiceMode="singleChoice" />
+            <LinearLayout
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_gravity="center_horizontal"
+                android:layout_marginTop="@dimen/ag_logo_to_status"
+                android:gravity="center_vertical"
+                android:orientation="horizontal">
 
-    <TextView
-        android:id="@+id/hint"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:paddingTop="8dp"
-        android:paddingBottom="8dp"
-        android:textAppearance="?android:attr/textAppearanceSmall" />
+                <View
+                    android:id="@+id/dot"
+                    android:layout_width="@dimen/ag_status_dot"
+                    android:layout_height="@dimen/ag_status_dot"
+                    android:background="@drawable/status_dot" />
 
-    <Button
-        android:id="@+id/apps"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content" />
-</LinearLayout>
+                <TextView
+                    android:id="@+id/status"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginLeft="@dimen/ag_dot_to_label"
+                    android:includeFontPadding="false"
+                    android:letterSpacing="0.08"
+                    android:textSize="@dimen/ag_ts_status" />
+            </LinearLayout>
+
+            <TextView
+                android:id="@+id/title"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="@dimen/ag_status_to_title"
+                android:gravity="center_horizontal"
+                android:includeFontPadding="false"
+                android:letterSpacing="-0.02"
+                android:textColor="@color/ag_text1"
+                android:textSize="@dimen/ag_ts_display" />
+
+            <!-- The app count, or the notice / tunnel error when off. -->
+            <TextView
+                android:id="@+id/sub"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="@dimen/ag_title_to_sub"
+                android:ellipsize="end"
+                android:gravity="center_horizontal"
+                android:includeFontPadding="false"
+                android:maxLines="3"
+                android:textColor="@color/ag_text2"
+                android:textSize="@dimen/ag_ts_subline" />
+
+            <Space
+                android:layout_width="match_parent"
+                android:layout_height="0dp"
+                android:layout_weight="1"
+                android:minHeight="24dp" />
+
+            <View style="@style/Hairline" />
+
+            <LinearLayout
+                android:id="@+id/row_profile"
+                style="@style/MainRow">
+
+                <TextView
+                    android:id="@+id/label_profile"
+                    style="@style/MainRowLabel"
+                    android:text="@string/profile" />
+
+                <TextView
+                    android:id="@+id/profile"
+                    style="@style/MainRowValue" />
+
+                <ImageView style="@style/MainRowChevron" />
+            </LinearLayout>
+
+            <View style="@style/Hairline" />
+
+            <LinearLayout
+                android:id="@+id/row_apps"
+                style="@style/MainRow">
+
+                <TextView
+                    android:id="@+id/label_apps"
+                    style="@style/MainRowLabel"
+                    android:text="@string/apps" />
+
+                <TextView
+                    android:id="@+id/apps"
+                    style="@style/MainRowValue" />
+
+                <ImageView style="@style/MainRowChevron" />
+            </LinearLayout>
+
+            <View style="@style/Hairline" />
+
+            <!-- Not a button: Russian sites always go direct (the core's rule). -->
+            <LinearLayout
+                style="@style/MainRow"
+                android:background="@null"
+                android:clickable="false"
+                android:focusable="false">
+
+                <TextView
+                    android:id="@+id/label_russia"
+                    style="@style/MainRowLabel"
+                    android:text="@string/row_russia" />
+
+                <TextView
+                    android:id="@+id/russia"
+                    style="@style/MainRowValue"
+                    android:layout_marginRight="@dimen/ag_no_chevron_end"
+                    android:text="@string/row_russia_value" />
+            </LinearLayout>
+
+            <View style="@style/Hairline" />
+
+            <LinearLayout
+                android:id="@+id/toggle"
+                style="@style/MainButton"
+                android:layout_marginTop="@dimen/ag_lines_to_button">
+
+                <ImageView
+                    style="@style/MainButtonIcon"
+                    android:src="@drawable/ic_power" />
+
+                <TextView
+                    android:id="@+id/toggle_text"
+                    style="@style/MainButtonText" />
+            </LinearLayout>
+        </LinearLayout>
+    </ScrollView>
+</FrameLayout>

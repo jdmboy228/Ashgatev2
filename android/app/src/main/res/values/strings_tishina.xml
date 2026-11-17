@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Новые строки для «Тишины». Существующие строки (state_on, connect, disconnect, profile, apps,
+     profiles, no_profiles, need_profile, need_apps, no_vpn_permission …) НЕ дублировать — использовать их.
+     Пометка derived = в макете такого текста нет, он выведен минимально для открытого состояния. -->
+<resources>
+    <!-- Главная: заголовок по состоянию -->
+    <string name="title_on">Туннель включён</string>
+    <string name="title_starting">Туннель включается</string>          <!-- derived -->
+    <string name="title_off">Туннель выключен</string>                 <!-- derived -->
+
+    <!-- Главная: строка под заголовком. В макете «6 приложений идут через Швецию»;
+         склонять название профиля автоматически нельзя, поэтому «через туннель». -->
+    <plurals name="sub_on">
+        <item quantity="one">%d приложение идёт через туннель</item>
+        <item quantity="few">%d приложения идут через туннель</item>
+        <item quantity="many">%d приложений идут через туннель</item>
+        <item quantity="other">%d приложения идут через туннель</item>
+    </plurals>
+    <plurals name="sub_off">                                              <!-- derived -->
+        <item quantity="one">%d приложение пойдёт через туннель</item>
+        <item quantity="few">%d приложения пойдут через туннель</item>
+        <item quantity="many">%d приложений пойдут через туннель</item>
+        <item quantity="other">%d приложения пойдут через туннель</item>
+    </plurals>
+
+    <!-- Главная: строки -->
+    <string name="row_russia">Россия</string>
+    <string name="row_russia_value">напрямую</string>
+    <string name="apps_of">%1$d из %2$d</string>
+
+    <!-- Приложения -->
+    <string name="apps_sub">Через туннель идут только отмеченные</string>
+    <string name="apps_rest">ОСТАЛЬНЫЕ · %d</string>
+
+    <!-- Профили -->
+    <string name="profiles_sub">Удерживайте профиль, чтобы изменить</string>
+    <string name="add_profile">Добавить профиль</string>
+
+    <!-- Доступность -->
+    <string name="back">Назад</string>                                  <!-- derived, contentDescription -->
+</resources>

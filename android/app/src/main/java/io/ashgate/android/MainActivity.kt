@@ -4,26 +4,29 @@ import android.Manifest
 import android.app.Activity
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.drawable.GradientDrawable
 import android.net.VpnService
 import android.os.Build
 import android.os.Bundle
 import android.view.View
-import android.widget.ArrayAdapter
-import android.widget.Button
-import android.widget.ListView
 import android.widget.TextView
 import io.ashgate.android.TunnelService.State
-import org.json.JSONObject
+import java.util.Locale
+import kotlin.concurrent.thread
 
-/** Status, the connect button, the profile list and the way to the app picker. */
+/** Status, the connect button, and the ways to the profiles and the app picker. */
 class MainActivity : Activity() {
+    private lateinit var glow: View
+    private lateinit var dot: View
     private lateinit var status: TextView
-    private lateinit var error: TextView
-    private lateinit var toggle: Button
-    private lateinit var list: ListView
-    private lateinit var hint: TextView
-    private lateinit var apps: Button
-    private var profiles: List<JSONObject> = emptyList()
+    private lateinit var title: TextView
+    private lateinit var sub: TextView
+    private lateinit var profile: TextView
+    private lateinit var apps: TextView
+    private lateinit var toggleText: TextView
+
+    /** Apps with a launcher icon, counted in the background; null until then. */
+    private var appsTotal: Int? = null
 
     /** A check before connecting that failed; shown until the next try. */
     private var notice: String? = null
@@ -31,40 +34,52 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.main)
+        glow = findViewById(R.id.glow)
+        dot = findViewById(R.id.dot)
         status = findViewById(R.id.status)
-        error = findViewById(R.id.error)
-        toggle = findViewById(R.id.toggle)
-        list = findViewById(R.id.list)
-        hint = findViewById(R.id.hint)
+        title = findViewById(R.id.title)
+        sub = findViewById(R.id.sub)
+        profile = findViewById(R.id.profile)
         apps = findViewById(R.id.apps)
+        toggleText = findViewById(R.id.toggle_text)
 
-        toggle.setOnClickListener {
+        Fonts.set(Fonts.monoSemibold(this), status)
+        Fonts.set(Fonts.extrabold(this), title, toggleText)
+        Fonts.set(Fonts.medium(this), sub, findViewById(R.id.label_profile), findViewById(R.id.label_apps),
+            findViewById(R.id.label_russia))
+        Fonts.set(Fonts.bold(this), profile, apps, findViewById(R.id.russia))
+
+        // Blur needs API 31, so the glow is a radial gradient fading out to its edge.
+        glow.background = GradientDrawable().apply {
+            gradientType = GradientDrawable.RADIAL_GRADIENT
+            gradientRadius = 200 * resources.displayMetrics.density
+            colors = intArrayOf(0x1A5FD38D, 0x0D5FD38D, 0x005FD38D)
+        }
+
+        findViewById<View>(R.id.toggle).setOnClickListener {
             if (TunnelService.state == State.OFF) connect() else TunnelService.disconnect(this)
         }
-        findViewById<Button>(R.id.add).setOnClickListener {
-            startActivity(Intent(this, ProfileActivity::class.java))
+        findViewById<View>(R.id.row_profile).setOnClickListener {
+            startActivity(Intent(this, ProfilesActivity::class.java))
         }
-        apps.setOnClickListener { startActivity(Intent(this, AppsActivity::class.java)) }
-        list.setOnItemClickListener { _, _, position, _ ->
-            val id = profiles[position].getString("id")
-            if (id == Store.selectedId(this)) return@setOnItemClickListener
-            Store.select(this, id)
-            // A running tunnel moves to the new profile.
-            if (TunnelService.state != State.OFF) TunnelService.connect(this)
-        }
-        list.setOnItemLongClickListener { _, _, position, _ ->
-            startActivity(
-                Intent(this, ProfileActivity::class.java).putExtra("id", profiles[position].getString("id")),
-            )
-            true
+        findViewById<View>(R.id.row_apps).setOnClickListener {
+            startActivity(Intent(this, AppsActivity::class.java))
         }
     }
 
     override fun onStart() {
         super.onStart()
         TunnelService.listener = { runOnUiThread { showState() } }
-        showProfiles()
+        showRows()
         showState()
+        // The same list the app picker shows; reading it takes a moment.
+        thread {
+            val total = AppsActivity.launcherApps(this).size
+            runOnUiThread {
+                appsTotal = total
+                showRows()
+            }
+        }
     }
 
     override fun onStop() {
@@ -72,39 +87,50 @@ class MainActivity : Activity() {
         super.onStop()
     }
 
-    private fun showProfiles() {
-        profiles = Store.profiles(this)
-        list.adapter = ArrayAdapter(
-            this, android.R.layout.simple_list_item_single_choice, profiles.map(::title),
-        )
-        val selected = profiles.indexOfFirst { it.getString("id") == Store.selectedId(this) }
-        if (selected >= 0) list.setItemChecked(selected, true)
-        hint.setText(if (profiles.isEmpty()) R.string.no_profiles else R.string.edit_hint)
-        apps.text = getString(R.string.apps_count, Store.apps(this).size)
-    }
-
-    private fun title(p: JSONObject): String {
-        val kind = when (p.optString("kind")) {
-            "vless" -> "VLESS XHTTP"
-            "socks5" -> "SOCKS5"
-            else -> "HTTP"
-        }
-        return "${p.optString("name")} · $kind"
+    private fun showRows() {
+        profile.text = Store.selected(this)?.optString("name") ?: getString(R.string.need_profile)
+        val n = Store.apps(this).size
+        apps.text = appsTotal?.let { getString(R.string.apps_of, n, it) } ?: n.toString()
     }
 
     private fun showState() {
         val state = TunnelService.state
-        status.setText(
+        val word = getString(
             when (state) {
                 State.OFF -> R.string.state_off
                 State.STARTING -> R.string.state_starting
                 State.ON -> R.string.state_on
             },
         )
-        toggle.setText(if (state == State.OFF) R.string.connect else R.string.disconnect)
+        status.text = word.uppercase(Locale("ru"))
+        val color = getColor(
+            when (state) {
+                State.OFF -> R.color.ag_text3
+                State.STARTING -> R.color.ag_text2
+                State.ON -> R.color.ag_success
+            },
+        )
+        status.setTextColor(color)
+        (dot.background.mutate() as GradientDrawable).setColor(color)
+        glow.visibility = if (state == State.ON) View.VISIBLE else View.GONE
+        title.setText(
+            when (state) {
+                State.OFF -> R.string.title_off
+                State.STARTING -> R.string.title_starting
+                State.ON -> R.string.title_on
+            },
+        )
+        toggleText.setText(if (state == State.OFF) R.string.connect else R.string.disconnect)
+
+        val n = Store.apps(this).size
         val message = if (state == State.OFF) notice ?: TunnelService.error else null
-        error.text = message
-        error.visibility = if (message == null) View.GONE else View.VISIBLE
+        sub.text = when {
+            message != null -> message
+            state != State.OFF -> resources.getQuantityString(R.plurals.sub_on, n, n)
+            Store.profiles(this).isEmpty() -> getString(R.string.no_profiles)
+            else -> resources.getQuantityString(R.plurals.sub_off, n, n)
+        }
+        sub.setTextColor(getColor(if (message != null) R.color.ag_error else R.color.ag_text2))
     }
 
     private fun connect() {
