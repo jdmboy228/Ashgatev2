@@ -14,152 +14,163 @@
         android:layout_marginTop="10dp"
         android:visibility="gone" />
 
-    <ScrollView
+    <!-- The button is pinned under the scrolling part, so it stays on screen
+         on short phones; on tall ones the layout is the same as before. -->
+    <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="match_parent"
-        android:fillViewport="true">
+        android:orientation="vertical">
 
-        <LinearLayout
+        <ScrollView
             android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:orientation="vertical"
-            android:paddingLeft="@dimen/ag_screen_h"
-            android:paddingRight="@dimen/ag_screen_h">
-
-            <ImageView
-                android:layout_width="@dimen/ag_logo"
-                android:layout_height="@dimen/ag_logo"
-                android:layout_gravity="center_horizontal"
-                android:layout_marginTop="@dimen/ag_center_top"
-                android:importantForAccessibility="no"
-                android:src="@drawable/ashgate_logo" />
+            android:layout_height="0dp"
+            android:layout_weight="1"
+            android:fillViewport="true">
 
             <LinearLayout
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:layout_gravity="center_horizontal"
-                android:layout_marginTop="@dimen/ag_logo_to_status"
-                android:gravity="center_vertical"
-                android:orientation="horizontal">
-
-                <View
-                    android:id="@+id/dot"
-                    android:layout_width="@dimen/ag_status_dot"
-                    android:layout_height="@dimen/ag_status_dot"
-                    android:background="@drawable/status_dot" />
-
-                <TextView
-                    android:id="@+id/status"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:layout_marginLeft="@dimen/ag_dot_to_label"
-                    android:includeFontPadding="false"
-                    android:letterSpacing="0.08"
-                    android:textSize="@dimen/ag_ts_status" />
-            </LinearLayout>
-
-            <TextView
-                android:id="@+id/title"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:layout_marginTop="@dimen/ag_status_to_title"
-                android:gravity="center_horizontal"
-                android:includeFontPadding="false"
-                android:letterSpacing="-0.02"
-                android:textColor="@color/ag_text1"
-                android:textSize="@dimen/ag_ts_display" />
-
-            <!-- The app count, or the notice / tunnel error when off. -->
-            <TextView
-                android:id="@+id/sub"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="@dimen/ag_title_to_sub"
-                android:ellipsize="end"
-                android:gravity="center_horizontal"
-                android:includeFontPadding="false"
-                android:maxLines="3"
-                android:textColor="@color/ag_text2"
-                android:textSize="@dimen/ag_ts_subline" />
-
-            <Space
-                android:layout_width="match_parent"
-                android:layout_height="0dp"
-                android:layout_weight="1"
-                android:minHeight="24dp" />
-
-            <View style="@style/Hairline" />
-
-            <LinearLayout
-                android:id="@+id/row_profile"
-                style="@style/MainRow">
-
-                <TextView
-                    android:id="@+id/label_profile"
-                    style="@style/MainRowLabel"
-                    android:text="@string/profile" />
-
-                <TextView
-                    android:id="@+id/profile"
-                    style="@style/MainRowValue" />
-
-                <ImageView style="@style/MainRowChevron" />
-            </LinearLayout>
-
-            <View style="@style/Hairline" />
-
-            <LinearLayout
-                android:id="@+id/row_apps"
-                style="@style/MainRow">
-
-                <TextView
-                    android:id="@+id/label_apps"
-                    style="@style/MainRowLabel"
-                    android:text="@string/apps" />
-
-                <TextView
-                    android:id="@+id/apps"
-                    style="@style/MainRowValue" />
-
-                <ImageView style="@style/MainRowChevron" />
-            </LinearLayout>
-
-            <View style="@style/Hairline" />
-
-            <!-- Not a button: Russian sites always go direct (the core's rule). -->
-            <LinearLayout
-                style="@style/MainRow"
-                android:background="@null"
-                android:clickable="false"
-                android:focusable="false">
-
-                <TextView
-                    android:id="@+id/label_russia"
-                    style="@style/MainRowLabel"
-                    android:text="@string/row_russia" />
-
-                <TextView
-                    android:id="@+id/russia"
-                    style="@style/MainRowValue"
-                    android:layout_marginRight="@dimen/ag_no_chevron_end"
-                    android:text="@string/row_russia_value" />
-            </LinearLayout>
-
-            <View style="@style/Hairline" />
-
-            <LinearLayout
-                android:id="@+id/toggle"
-                style="@style/MainButton"
-                android:layout_marginTop="@dimen/ag_lines_to_button">
+                android:orientation="vertical"
+                android:paddingLeft="@dimen/ag_screen_h"
+                android:paddingRight="@dimen/ag_screen_h">
 
                 <ImageView
-                    style="@style/MainButtonIcon"
-                    android:src="@drawable/ic_power" />
+                    android:layout_width="@dimen/ag_logo"
+                    android:layout_height="@dimen/ag_logo"
+                    android:layout_gravity="center_horizontal"
+                    android:layout_marginTop="@dimen/ag_center_top"
+                    android:importantForAccessibility="no"
+                    android:src="@drawable/ashgate_logo" />
+
+                <LinearLayout
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_gravity="center_horizontal"
+                    android:layout_marginTop="@dimen/ag_logo_to_status"
+                    android:gravity="center_vertical"
+                    android:orientation="horizontal">
+
+                    <View
+                        android:id="@+id/dot"
+                        android:layout_width="@dimen/ag_status_dot"
+                        android:layout_height="@dimen/ag_status_dot"
+                        android:background="@drawable/status_dot" />
+
+                    <TextView
+                        android:id="@+id/status"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:layout_marginLeft="@dimen/ag_dot_to_label"
+                        android:includeFontPadding="false"
+                        android:letterSpacing="0.08"
+                        android:textSize="@dimen/ag_ts_status" />
+                </LinearLayout>
 
                 <TextView
-                    android:id="@+id/toggle_text"
-                    style="@style/MainButtonText" />
+                    android:id="@+id/title"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="@dimen/ag_status_to_title"
+                    android:gravity="center_horizontal"
+                    android:includeFontPadding="false"
+                    android:letterSpacing="-0.02"
+                    android:textColor="@color/ag_text1"
+                    android:textSize="@dimen/ag_ts_display" />
+
+                <!-- The app count, or the notice / tunnel error when off. -->
+                <TextView
+                    android:id="@+id/sub"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="@dimen/ag_title_to_sub"
+                    android:ellipsize="end"
+                    android:gravity="center_horizontal"
+                    android:includeFontPadding="false"
+                    android:maxLines="3"
+                    android:textColor="@color/ag_text2"
+                    android:textSize="@dimen/ag_ts_subline" />
+
+                <Space
+                    android:layout_width="match_parent"
+                    android:layout_height="0dp"
+                    android:layout_weight="1"
+                    android:minHeight="24dp" />
+
+                <View style="@style/Hairline" />
+
+                <LinearLayout
+                    android:id="@+id/row_profile"
+                    style="@style/MainRow">
+
+                    <TextView
+                        android:id="@+id/label_profile"
+                        style="@style/MainRowLabel"
+                        android:text="@string/profile" />
+
+                    <TextView
+                        android:id="@+id/profile"
+                        style="@style/MainRowValue" />
+
+                    <ImageView style="@style/MainRowChevron" />
+                </LinearLayout>
+
+                <View style="@style/Hairline" />
+
+                <LinearLayout
+                    android:id="@+id/row_apps"
+                    style="@style/MainRow">
+
+                    <TextView
+                        android:id="@+id/label_apps"
+                        style="@style/MainRowLabel"
+                        android:text="@string/apps" />
+
+                    <TextView
+                        android:id="@+id/apps"
+                        style="@style/MainRowValue" />
+
+                    <ImageView style="@style/MainRowChevron" />
+                </LinearLayout>
+
+                <View style="@style/Hairline" />
+
+                <!-- Not a button: Russian sites always go direct (the core's rule). -->
+                <LinearLayout
+                    style="@style/MainRow"
+                    android:background="@null"
+                    android:clickable="false"
+                    android:focusable="false">
+
+                    <TextView
+                        android:id="@+id/label_russia"
+                        style="@style/MainRowLabel"
+                        android:text="@string/row_russia" />
+
+                    <TextView
+                        android:id="@+id/russia"
+                        style="@style/MainRowValue"
+                        android:layout_marginRight="@dimen/ag_no_chevron_end"
+                        android:text="@string/row_russia_value" />
+                </LinearLayout>
+
+                <View style="@style/Hairline" />
             </LinearLayout>
+        </ScrollView>
+
+        <LinearLayout
+            android:id="@+id/toggle"
+            style="@style/MainButton"
+            android:layout_marginLeft="@dimen/ag_screen_h"
+            android:layout_marginRight="@dimen/ag_screen_h"
+            android:layout_marginTop="@dimen/ag_lines_to_button">
+
+            <ImageView
+                style="@style/MainButtonIcon"
+                android:src="@drawable/ic_power" />
+
+            <TextView
+                android:id="@+id/toggle_text"
+                style="@style/MainButtonText" />
         </LinearLayout>
-    </ScrollView>
+    </LinearLayout>
 </FrameLayout>
