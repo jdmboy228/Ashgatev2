@@ -97,7 +97,8 @@ jobs:
         working-directory: android
         env:
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-        run: gradle --no-daemon assembleRelease
+        # JVM unit tests (app/src/test) first, then the signed APK.
+        run: gradle --no-daemon testReleaseUnitTest assembleRelease
 
       # The certificate's SHA-256 is public; a different one means a different key.
       - name: Signature
@@ -111,3 +112,41 @@ jobs:
           name: ashgate-android-apk
           path: android/app/build/outputs/apk/release/app-release.apk
           if-no-files-found: error
+
+  # Installs the APK on an emulator and goes through it like a user: adds a
+  # (fake) profile, picks an app, connects, checks the VPN interface is up,
+  # disconnects, then taps around at random. Any crash or ANR fails the run.
+  # Android 11 x86_64 images run the APK's ARM Go core through translation.
+  smoke:
+    needs: apk
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ashgate-android-apk
+          path: apk
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 30
+          target: google_apis
+          arch: x86_64
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none -no-snapshot
+          script: bash android/ci/smoke.sh apk/app-release.apk smoke-out
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: smoke-screenshots
+          path: smoke-out
+          if-no-files-found: ignore
