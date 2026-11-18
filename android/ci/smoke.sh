@@ -78,7 +78,8 @@ tap id "$PKG:id/link"
 adb shell "input text '$LINK'"
 # Hide the soft keyboard if it is up (BACK without it would close the form).
 if adb shell dumpsys input_method | grep -q "mInputShown=true"; then adb shell input keyevent KEYCODE_BACK; sleep 1; fi
-tap text "Сохранить"
+# Material buttons are all caps on screen ("СОХРАНИТЬ"), so go by id.
+tap id "$PKG:id/save"
 expect text "server.example"
 shot 2-profiles
 adb shell input keyevent KEYCODE_BACK
