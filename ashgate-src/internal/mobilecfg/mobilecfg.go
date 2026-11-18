@@ -41,7 +41,37 @@ type Profile struct {
 var (
 	errNotXHTTP     = errors.New("Поддерживается только VLESS через XHTTP")
 	errNoEncryption = errors.New("Ссылка без защиты (security=none): UUID и трафик шли бы открытым текстом. Нужна ссылка с reality или tls")
+	errPlainExtra   = errors.New("Поле extra отправляет загрузку без защиты (downloadSettings). Нужен reality или tls")
 )
+
+// checkLink refuses what cannot be used or would travel unencrypted. The
+// download leg of XHTTP has its own security, set in extra.downloadSettings;
+// the struct reads extra the way Xray does.
+func checkLink(v vless.Params) error {
+	if v.Network != "xhttp" {
+		return errNotXHTTP
+	}
+	if v.Security == "none" {
+		return errNoEncryption
+	}
+	if len(v.Extra) == 0 {
+		return nil
+	}
+	var extra struct {
+		DownloadSettings *struct {
+			Security string `json:"security"`
+		} `json:"downloadSettings"`
+	}
+	if err := json.Unmarshal(v.Extra, &extra); err != nil {
+		return errPlainExtra
+	}
+	if d := extra.DownloadSettings; d != nil {
+		if s := strings.ToLower(d.Security); s != "tls" && s != "reality" {
+			return errPlainExtra
+		}
+	}
+	return nil
+}
 
 // FromLink reads a vless:// link. Only XHTTP is accepted.
 func FromLink(link string) (Profile, error) {
@@ -50,11 +80,8 @@ func FromLink(link string) (Profile, error) {
 	if err != nil {
 		return Profile{}, err
 	}
-	if p.Params.Network != "xhttp" {
-		return Profile{}, errNotXHTTP
-	}
-	if p.Params.Security == "none" {
-		return Profile{}, errNoEncryption
+	if err := checkLink(p.Params); err != nil {
+		return Profile{}, err
 	}
 	host, port, err := splitAddress(p.Address)
 	if err != nil {
@@ -175,11 +202,24 @@ var (
 	}
 )
 
+// LANRanges are private and link-local addresses. They mean something only
+// on the phone's own network, so they never go to the proxy.
+var LANRanges = []string{
+	"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16",
+	"fc00::/7", "fe80::/10",
+}
+
 // MTU of the TUN. VpnService must be given the same value.
 const MTU = 1500
 
+// DNSLevel is the policy level of the DNS outbound. Xray keeps a DNS flow
+// open after answering it until the flow idles out, and the phone's resolver
+// uses a new port for each query, so these flows get a short idle time.
+const DNSLevel = 1
+
 // DirectDomains are the desktop's direct list (.ru, .рф, .su, Russian
-// services) as Xray rules, plus geosite:category-ru.
+// services) as Xray rules, plus geosite:category-ru. Only names go direct:
+// a Russian address without such a name goes through the proxy.
 func DirectDomains() []string {
 	c := config.Config{DirectDomains: config.DefaultDirectDomains}
 	var out []string
@@ -198,7 +238,7 @@ func DirectDomains() []string {
 //  3. encrypted DNS of the apps (DoT on 853, Russian DoH resolvers) goes
 //     to the proxy;
 //  4. Russian domains (by the name the app asked for) go direct;
-//  5. Russian addresses go direct;
+//  5. addresses of the local network go direct;
 //  6. an HTTP proxy cannot carry UDP, so the rest of UDP is dropped;
 //  7. everything else goes to the proxy.
 func XrayJSON(p Profile) ([]byte, error) {
@@ -224,6 +264,7 @@ func XrayJSON(p Profile) ([]byte, error) {
 		// the original server they could leave the tunnel.
 		"settings": map[string]any{
 			"rewriteNetwork": "tcp", "rewriteAddress": RawDNS, "rewritePort": 53,
+			"userLevel": DNSLevel,
 			"rules": []any{
 				map[string]any{"action": "hijack", "qType": "1,28"},
 				map[string]any{"action": "direct"},
@@ -238,7 +279,7 @@ func XrayJSON(p Profile) ([]byte, error) {
 		map[string]any{"type": "field", "inboundTag": []string{TagTun}, "domain": RussianResolverDomains, "outboundTag": TagProxy},
 		map[string]any{"type": "field", "inboundTag": []string{TagTun}, "ip": RussianResolverIPs, "outboundTag": TagProxy},
 		map[string]any{"type": "field", "inboundTag": []string{TagTun}, "domain": DirectDomains(), "outboundTag": TagDirect},
-		map[string]any{"type": "field", "inboundTag": []string{TagTun}, "ip": []string{"geoip:ru"}, "outboundTag": TagDirect},
+		map[string]any{"type": "field", "inboundTag": []string{TagTun}, "ip": LANRanges, "outboundTag": TagDirect},
 	}
 	if p.Kind == KindHTTP {
 		rules = append(rules, map[string]any{"type": "field", "inboundTag": []string{TagTun}, "network": "udp", "outboundTag": TagBlock})
@@ -267,9 +308,10 @@ func XrayJSON(p Profile) ([]byte, error) {
 		"routing": map[string]any{"domainStrategy": "AsIs", "rules": rules},
 		// As on the desktop: quiet connections live 30 minutes, and a
 		// half-closed one gets a few seconds to finish.
-		"policy": map[string]any{"levels": map[string]any{"0": map[string]any{
-			"connIdle": 1800, "uplinkOnly": 2, "downlinkOnly": 5,
-		}}},
+		"policy": map[string]any{"levels": map[string]any{
+			"0":                    map[string]any{"connIdle": 1800, "uplinkOnly": 2, "downlinkOnly": 5},
+			strconv.Itoa(DNSLevel): map[string]any{"connIdle": 30},
+		}},
 	}
 	return json.Marshal(doc)
 }
@@ -281,11 +323,8 @@ func proxyOutbound(p Profile) (map[string]any, error) {
 		if err != nil {
 			return nil, err
 		}
-		if parsed.Params.Network != "xhttp" {
-			return nil, errNotXHTTP
-		}
-		if parsed.Params.Security == "none" {
-			return nil, errNoEncryption
+		if err := checkLink(parsed.Params); err != nil {
+			return nil, err
 		}
 		host, port, err := splitAddress(parsed.Address)
 		if err != nil {

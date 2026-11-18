@@ -8,6 +8,11 @@
 
     <include layout="@layout/screen_head" />
 
+    <TextView
+        android:id="@+id/note"
+        style="@style/ScreenSub"
+        android:text="@string/apps_note" />
+
     <ListView
         android:id="@+id/list"
         style="@style/ScreenList" />

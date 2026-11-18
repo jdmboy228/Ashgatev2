@@ -3,6 +3,7 @@ package io.ashgate.android
 import android.app.Activity
 import android.os.Bundle
 import android.view.View
+import android.view.WindowManager
 import android.widget.Button
 import android.widget.EditText
 import android.widget.RadioGroup
@@ -30,6 +31,10 @@ class ProfileActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Reopened by the system with the Keystore failing: back to the main screen's message.
+        if (!Store.usable(this)) return finish()
+        // The form shows the link and the password: not in Recents or screenshots.
+        window.setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE)
         setContentView(R.layout.profile)
         kind = findViewById(R.id.kind)
         link = findViewById(R.id.link)
@@ -110,7 +115,7 @@ class ProfileActivity : Activity() {
                 // instead of added a second time.
                 val saved = Store.profiles(this)
                     .mapNotNull { p -> ProfileInput.serverKey(p.optString("link"))?.let { it to p.getString("id") } }
-                    .toMap()
+                    .groupBy({ it.first }, { it.second })
                 val ids = ProfileInput.ids(saved, found.map { ProfileInput.serverKey(it.optString("link")) }, id)
                 found.forEachIndexed { i, p -> ids[i]?.let { p.put("id", it) } }
                 found.forEach { Store.put(this, it) }

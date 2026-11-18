@@ -44,6 +44,8 @@ class MainActivity : Activity() {
     /** Between onStart and onStop: a late state callback must not start the pulse on a hidden screen. */
     private var visible = false
 
+    private val onState: () -> Unit = { runOnUiThread { showState(animate = true) } }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.main)
@@ -73,46 +75,66 @@ class MainActivity : Activity() {
         findViewById<View>(R.id.toggle).onClick {
             if (TunnelService.state == State.OFF) connect() else TunnelService.disconnect(this)
         }
-        findViewById<View>(R.id.row_profile).onClick {
-            startActivity(Intent(this, ProfilesActivity::class.java))
-        }
-        findViewById<View>(R.id.row_apps).onClick {
-            startActivity(Intent(this, AppsActivity::class.java))
-        }
+        findViewById<View>(R.id.row_profile).onClick { open(ProfilesActivity::class.java) }
+        findViewById<View>(R.id.row_apps).onClick { open(AppsActivity::class.java) }
+    }
+
+    private fun open(screen: Class<out Activity>) {
+        if (Store.isOpen) startActivity(Intent(this, screen)) else loadInBackground()
     }
 
     override fun onStart() {
         super.onStart()
         visible = true
-        TunnelService.listener = { runOnUiThread { showState(animate = true) } }
-        // A notice whose cause was fixed on another screen (a profile or apps picked) goes away.
-        if (notice == getString(R.string.need_profile) && Store.selected(this) != null ||
-            notice == getString(R.string.need_apps) && Store.apps(this).isNotEmpty()
-        ) {
-            notice = null
-        }
-        if (Store.takeWiped(this)) notice = getString(R.string.store_wiped)
+        TunnelService.listener = onState
         showRows()
         showState(animate = false)
-        // The same list the app picker shows; reading it takes a moment.
+        loadInBackground()
+    }
+
+    /** Opening the saved data (the Keystore) and listing the apps both take a moment. */
+    private fun loadInBackground() {
         thread {
-            val total = AppsActivity.launcherApps(this).size
+            val usable = Store.usable(this)
+            // The same list the app picker shows.
+            val total = try {
+                AppsActivity.launcherApps(this).size
+            } catch (e: Exception) {
+                null
+            }
             runOnUiThread {
-                appsTotal = total
+                if (total != null) appsTotal = total
+                val unavailable = getString(R.string.store_unavailable)
+                if (!usable) {
+                    notice = unavailable
+                } else {
+                    // A notice whose cause was fixed elsewhere (a profile or apps picked) goes away.
+                    if (notice == unavailable ||
+                        notice == getString(R.string.need_profile) && Store.selected(this) != null ||
+                        notice == getString(R.string.need_apps) && Store.apps(this).isNotEmpty()
+                    ) {
+                        notice = null
+                    }
+                    if (Store.takeWiped(this)) notice = getString(R.string.store_wiped)
+                }
                 showRows()
+                showState(animate = false)
             }
         }
     }
 
     override fun onStop() {
         visible = false
-        TunnelService.listener = null
+        // A newer main screen may already have put its own listener here.
+        if (TunnelService.listener === onState) TunnelService.listener = null
         pulse?.cancel()
         pulse = null
+        dot.alpha = 1f
         super.onStop()
     }
 
     private fun showRows() {
+        if (!Store.isOpen) return
         profile.text = Store.selected(this)?.optString("name") ?: getString(R.string.need_profile)
         val n = Store.apps(this).size
         apps.text = appsTotal?.let { getString(R.string.apps_of, n, it) } ?: n.toString()
@@ -160,15 +182,17 @@ class MainActivity : Activity() {
         )
         swap(toggleText, getString(if (state == State.OFF) R.string.connect else R.string.disconnect), null, animate)
 
-        val n = Store.apps(this).size
         val message = when (state) {
             State.OFF -> notice ?: TunnelService.error
             // Why the tunnel is down while the picked apps are cut off.
             State.BLOCKED -> TunnelService.error ?: getString(R.string.blocked_note)
             else -> null
         }
+        // Until the saved data is open only a message can be shown.
+        val n = if (Store.isOpen) Store.apps(this).size else 0
         val text = when {
             message != null -> message
+            !Store.isOpen -> return
             state != State.OFF -> RuPlural.pick(resources.getStringArray(R.array.sub_on), n).format(n)
             Store.profiles(this).isEmpty() -> getString(R.string.no_profiles)
             else -> RuPlural.pick(resources.getStringArray(R.array.sub_off), n).format(n)
@@ -245,6 +269,7 @@ class MainActivity : Activity() {
     }
 
     private fun connect() {
+        if (!Store.isOpen) return loadInBackground()
         notice = when {
             Store.selected(this) == null -> getString(R.string.need_profile)
             Store.apps(this).isEmpty() -> getString(R.string.need_apps)
@@ -257,8 +282,14 @@ class MainActivity : Activity() {
             // For the "connected" notification; the tunnel works without it.
             requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 0)
         }
-        val consent = VpnService.prepare(this)
-        if (consent != null) startActivityForResult(consent, 1) else TunnelService.connect(this)
+        try {
+            val consent = VpnService.prepare(this)
+            if (consent != null) startActivityForResult(consent, 1) else TunnelService.connect(this)
+        } catch (e: Exception) {
+            // Some firmwares have no consent screen, or fail in prepare().
+            notice = getString(R.string.no_vpn_permission)
+            showState(animate = true)
+        }
     }
 
     @Deprecated("Deprecated in Java")

@@ -3,8 +3,10 @@ package io.ashgate.android
 import android.app.Activity
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ResolveInfo
 import android.graphics.drawable.Drawable
 import android.os.Bundle
+import android.util.LruCache
 import android.view.View
 import android.view.ViewGroup
 import android.widget.BaseAdapter
@@ -12,13 +14,18 @@ import android.widget.ImageView
 import android.widget.ListView
 import android.widget.TextView
 import io.ashgate.android.TunnelService.State
+import java.util.concurrent.Executors
 import kotlin.concurrent.thread
 
 /** The apps that go through the tunnel: every app with a launcher icon, with a check. */
 class AppsActivity : Activity() {
     private var before: Set<String> = emptySet()
 
-    private class App(val pkg: String, val label: String, val icon: Drawable)
+    private class App(val pkg: String, val label: String, val info: ResolveInfo)
+
+    /** Icons are read for the rows on screen, one at a time; a few screens of them are kept. */
+    private val iconLoader = Executors.newSingleThreadExecutor()
+    private val icons = LruCache<String, Drawable>(64)
 
     companion object {
         /** Apps with a launcher icon, without Ashgate itself. Slow: call off the main thread. */
@@ -30,17 +37,31 @@ class AppsActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Reopened by the system with the Keystore failing: back to the main screen's message.
+        if (!Store.usable(this)) return finish()
         setContentView(R.layout.apps)
         findViewById<View>(R.id.back).onClick { finish() }
         findViewById<TextView>(R.id.title).apply { setText(R.string.apps); typeface = Fonts.extrabold(context) }
         findViewById<TextView>(R.id.sub).apply { setText(R.string.apps_sub); typeface = Fonts.medium(context) }
+        Fonts.set(Fonts.medium(this), findViewById(R.id.note))
         val list = findViewById<ListView>(R.id.list)
         before = Store.apps(this)
         val chosen = before.toMutableSet()
-        // Reading labels and icons of every app takes a moment.
+        // Reading the label of every app takes a moment.
         thread {
-            val apps = launcherApps(this)
-                .map { App(it.activityInfo.packageName, it.loadLabel(packageManager).toString(), it.loadIcon(packageManager)) }
+            val found = try {
+                launcherApps(this)
+            } catch (e: Exception) {
+                emptyList<ResolveInfo>()
+            }
+            val apps = found
+                .mapNotNull {
+                    try {
+                        App(it.activityInfo.packageName, it.loadLabel(packageManager).toString(), it)
+                    } catch (e: Exception) {
+                        null // Being uninstalled right now.
+                    }
+                }
                 // Picked apps first, then by name.
                 .sortedWith(compareBy({ it.pkg !in chosen }, { it.label.lowercase() }))
             runOnUiThread {
@@ -56,6 +77,31 @@ class AppsActivity : Activity() {
                     adapter.notifyDataSetChanged()
                     pop(row.findViewById(R.id.check))
                 }
+            }
+        }
+    }
+
+    override fun onDestroy() {
+        iconLoader.shutdownNow()
+        super.onDestroy()
+    }
+
+    private fun showIcon(view: ImageView, app: App) {
+        view.tag = app.pkg
+        val known = icons.get(app.pkg)
+        view.setImageDrawable(known)
+        if (known != null || iconLoader.isShutdown) return
+        iconLoader.execute {
+            // The row may have scrolled away and now show another app.
+            if (view.tag != app.pkg) return@execute
+            val icon = try {
+                app.info.loadIcon(packageManager)
+            } catch (e: Exception) {
+                return@execute
+            }
+            runOnUiThread {
+                icons.put(app.pkg, icon)
+                if (view.tag == app.pkg) view.setImageDrawable(icon)
             }
         }
     }
@@ -117,7 +163,7 @@ class AppsActivity : Activity() {
             val v = convertView ?: layoutInflater.inflate(R.layout.app_row, parent, false)
             val app = getItem(position) as App
             val on = app.pkg in chosen
-            v.findViewById<ImageView>(R.id.icon).setImageDrawable(app.icon)
+            showIcon(v.findViewById(R.id.icon), app)
             v.findViewById<TextView>(R.id.name).apply {
                 text = app.label
                 typeface = if (on) Fonts.semibold(this@AppsActivity) else Fonts.medium(this@AppsActivity)

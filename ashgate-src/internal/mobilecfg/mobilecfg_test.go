@@ -3,6 +3,8 @@ package mobilecfg
 import (
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
+	"net/url"
 	"reflect"
 	"strings"
 	"testing"
@@ -227,8 +229,12 @@ func TestRouting(t *testing.T) {
 		if rule(5)["outboundTag"] != TagDirect {
 			t.Fatalf("%s: rule 5 = %v", name, rule(5))
 		}
-		if r := rule(6); !reflect.DeepEqual(r["ip"], []any{"geoip:ru"}) || r["outboundTag"] != TagDirect {
+		// Only the local network goes direct by address: no geoip:ru.
+		if r := rule(6); !contains(r["ip"].([]any), "192.168.0.0/16") || !contains(r["ip"].([]any), "fc00::/7") || r["outboundTag"] != TagDirect {
 			t.Fatalf("%s: rule 6 = %v", name, r)
+		}
+		if strings.Contains(fmt.Sprint(rules), "geoip:") {
+			t.Fatalf("%s: a geoip rule is left: %v", name, rules)
 		}
 		// Nothing else is direct.
 		for i := range rules {
@@ -273,6 +279,45 @@ func TestRejectsUnencryptedLink(t *testing.T) {
 	got, err := FromSubscription([]byte(body))
 	if err != nil || len(got) != 1 || got[0].Link != xhttpLink {
 		t.Fatalf("subscription kept %+v, %v", got, err)
+	}
+}
+
+// The download leg of XHTTP may not drop the encryption the link promises.
+func TestRejectsPlainDownload(t *testing.T) {
+	link := func(extra string) string { return xhttpLink + "&extra=" + url.QueryEscape(extra) }
+	for _, extra := range []string{
+		`{"downloadSettings":{"address":"192.0.2.1","port":80,"network":"xhttp"}}`,
+		`{"downloadSettings":{"address":"192.0.2.1","port":80,"network":"xhttp","security":"none"}}`,
+		`{"DownloadSettings":{"security":"NONE"}}`,
+		`{"downloadSettings":{"security":1}}`,
+	} {
+		raw := strings.Replace(link(extra), "#Test%20XHTTP", "", 1)
+		if _, err := FromLink(raw); err != errPlainExtra {
+			t.Errorf("%s: err = %v", extra, err)
+		}
+		if _, err := XrayJSON(Profile{Kind: KindVLESS, Link: raw}); err != errPlainExtra {
+			t.Errorf("saved %s: err = %v", extra, err)
+		}
+	}
+	for _, extra := range []string{`{"xPaddingBytes":"100-1000"}`, `{"downloadSettings":{"security":"TLS"}}`, `{"downloadSettings":{"security":"reality"}}`} {
+		if _, err := FromLink(strings.Replace(link(extra), "#Test%20XHTTP", "", 1)); err != nil {
+			t.Errorf("%s: %v", extra, err)
+		}
+	}
+}
+
+// DNS flows stay open until they idle out, so theirs is short.
+func TestDNSFlowsIdleOutQuickly(t *testing.T) {
+	for name, p := range profiles(t) {
+		levels := doc(t, p)["policy"].(map[string]any)["levels"].(map[string]any)
+		if levels["0"].(map[string]any)["connIdle"] != float64(1800) || levels["1"].(map[string]any)["connIdle"] != float64(30) {
+			t.Fatalf("%s: levels = %v", name, levels)
+		}
+		for _, o := range outbounds(t, p) {
+			if o["tag"] == TagDNS && o["settings"].(map[string]any)["userLevel"] != float64(DNSLevel) {
+				t.Fatalf("%s: dns outbound = %v", name, o)
+			}
+		}
 	}
 }
 

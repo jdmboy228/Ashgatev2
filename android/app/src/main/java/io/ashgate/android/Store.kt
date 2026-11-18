@@ -2,12 +2,16 @@ package io.ashgate.android
 
 import android.content.Context
 import android.content.SharedPreferences
+import android.security.keystore.KeyPermanentlyInvalidatedException
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKeys
 import org.json.JSONArray
 import org.json.JSONObject
 import java.security.KeyStore
+import java.security.UnrecoverableKeyException
 import java.util.UUID
+import javax.crypto.Cipher
+import javax.crypto.SecretKey
 
 /**
  * Everything the app saves: profiles (with their keys and passwords), the
@@ -18,19 +22,35 @@ import java.util.UUID
  * host/port/user/pass) plus an "id" added here.
  */
 object Store {
+    /** The Keystore is failing right now; the saved data is untouched. */
+    class Unavailable : Exception()
+
+    @Volatile
     private var cached: SharedPreferences? = null
 
     /** Set when saved data could not be decrypted and was wiped; the main screen says so once. */
     @Volatile
     private var wiped = false
 
-    @Synchronized
-    private fun prefs(ctx: Context): SharedPreferences {
-        cached?.let { return it }
-        // Twice: the Keystore sometimes fails right after boot.
-        val p = tryOpen(ctx) ?: tryOpen(ctx) ?: wipeAndOpen(ctx)
-        cached = p
-        return p
+    /** True once the data is open: reading it no longer touches the Keystore. */
+    val isOpen: Boolean get() = cached != null
+
+    /** Opens the data if needed; false while the Keystore is failing. Slow the first time. */
+    fun usable(ctx: Context): Boolean = try {
+        prefs(ctx)
+        true
+    } catch (e: Unavailable) {
+        false
+    }
+
+    private fun prefs(ctx: Context): SharedPreferences =
+        cached ?: synchronized(this) { cached ?: openOrWipe(ctx).also { cached = it } }
+
+    // Twice: the Keystore sometimes fails right after boot.
+    private fun openOrWipe(ctx: Context): SharedPreferences = tryOpen(ctx) ?: tryOpen(ctx) ?: run {
+        if (!fileIsLost()) throw Unavailable()
+        // The Keystore works now, so a failure from here on is the file's.
+        tryOpen(ctx) ?: wipeAndOpen(ctx)
     }
 
     private fun tryOpen(ctx: Context): SharedPreferences? = try {
@@ -40,10 +60,30 @@ object Store {
     }
 
     /**
+     * Whether the file failed to open for good: the key is gone or dead, or
+     * it works and the file still does not open. A Keystore that fails on
+     * its own may recover, so then nothing may be deleted.
+     */
+    private fun fileIsLost(): Boolean {
+        try {
+            val store = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+            val key = store.getKey(MASTER_KEY, null) as SecretKey? ?: return true
+            Cipher.getInstance("AES/GCM/NoPadding").apply { init(Cipher.ENCRYPT_MODE, key) }.doFinal(ByteArray(16))
+            return true
+        } catch (e: KeyPermanentlyInvalidatedException) {
+            return true
+        } catch (e: UnrecoverableKeyException) {
+            return true
+        } catch (e: Exception) {
+            return false
+        }
+    }
+
+    /**
      * The key in the Keystore is gone or does not fit the file: the data was
-     * moved to a new phone (the key never moves), or the Keystore broke.
+     * moved to a new phone (the key never moves), or the key broke.
      * Nothing in the file can be read again, so start over instead of
-     * crashing on every launch.
+     * failing on every launch.
      */
     private fun wipeAndOpen(ctx: Context): SharedPreferences {
         ctx.applicationContext.deleteSharedPreferences(FILE)
@@ -52,7 +92,7 @@ object Store {
         } catch (e: Exception) {
         }
         wiped = true
-        return open(ctx)
+        return tryOpen(ctx) ?: throw Unavailable()
     }
 
     private fun open(ctx: Context): SharedPreferences {

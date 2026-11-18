@@ -33,5 +33,8 @@
     <string name="retry">Повторить</string>
     <string name="vpn_revoked">VPN отключён системой или другим VPN-приложением</string>
     <string name="store_wiped">Сохранённые профили не удалось прочитать (перенос на другой телефон или сбой хранилища ключей). Добавьте их заново.</string>
+    <string name="store_unavailable">Хранилище ключей сейчас недоступно. Профили не удалены, попробуйте ещё раз.</string>
+    <string name="tunnel_down_note">Выбранные приложения идут мимо туннеля</string>
     <string name="channel">Подключение</string>
+    <string name="channel_alerts">Предупреждения</string>
 </resources>

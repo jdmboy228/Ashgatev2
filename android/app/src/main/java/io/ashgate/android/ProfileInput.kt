@@ -36,16 +36,14 @@ object ProfileInput {
     /**
      * Ids for imported servers: a server that is already saved keeps its id
      * (so it is replaced, and stays selected), a new one gets null (a new id).
-     * [existing] maps saved server keys to ids. [edited] is the id of the
-     * profile being edited, which the first imported server takes.
+     * [existing] maps saved server keys to ids, several when a subscription
+     * lists one server more than once: they are used in order. [edited] is
+     * the id of the profile being edited, which the first imported server takes.
      */
-    fun ids(existing: Map<String, String>, incoming: List<String?>, edited: String?): List<String?> {
-        val taken = mutableSetOf<String>()
-        edited?.let { taken.add(it) }
+    fun ids(existing: Map<String, List<String>>, incoming: List<String?>, edited: String?): List<String?> {
+        val free = existing.mapValues { (_, ids) -> ArrayDeque(ids.filter { it != edited }) }
         return incoming.mapIndexed { i, key ->
-            if (i == 0 && edited != null) return@mapIndexed edited
-            val id = key?.let { existing[it] }
-            if (id != null && taken.add(id)) id else null
+            if (i == 0 && edited != null) edited else key?.let { free[it]?.removeFirstOrNull() }
         }
     }
 }

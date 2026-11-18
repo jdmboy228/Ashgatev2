@@ -4,8 +4,10 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
@@ -14,9 +16,11 @@ import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
 import io.ashgate.mobile.Mobile
+import org.json.JSONObject
 import java.io.File
 import java.util.concurrent.Executors
-import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.TimeUnit
 
 /**
  * The tunnel. Only the apps the user picked are routed into the TUN
@@ -39,6 +43,18 @@ class TunnelService : VpnService() {
     companion object {
         private const val DISCONNECT = "io.ashgate.android.DISCONNECT"
         private const val RETRY = "io.ashgate.android.RETRY"
+        private const val NOTE_TUNNEL = 1
+        private const val NOTE_DOWN = 2
+
+        /** Changes that come together (a network flapping, quick taps) make one restart. */
+        private const val RESTART_DELAY_MS = 1000L
+
+        /**
+         * One thread for every instance of the service, as the Go core is one
+         * per process: connects and disconnects never overlap, even when a
+         * new instance starts while the old one is being cleaned up.
+         */
+        private val worker = Executors.newSingleThreadScheduledExecutor()
 
         @Volatile
         var state = State.OFF
@@ -68,24 +84,40 @@ class TunnelService : VpnService() {
         }
     }
 
-    // One thread: connects and disconnects never overlap.
-    private val worker = Executors.newSingleThreadExecutor()
-
-    /** The VPN interface; touched only on [worker]. */
+    /** The VPN interface; touched only on [worker], like the fields below. */
     private var tun: ParcelFileDescriptor? = null
 
     /** The real network Ashgate (outside the tunnel) uses; a change restarts Xray. */
     private var network: Network? = null
     private var watching: ConnectivityManager.NetworkCallback? = null
+    private var installs: BroadcastReceiver? = null
+
+    /** The restart waiting to run, and whether it must rebuild the interface too. */
+    private var restart: ScheduledFuture<*>? = null
+    private var restartFull = false
+
+    /** Set once this instance is cleaned up: what it scheduled no longer runs. */
+    private var destroyed = false
+
+    /** The newest start request, so that stopping never drops one that just came. */
+    @Volatile
+    private var lastStartId = 0
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action == DISCONNECT) {
-            worker.execute { stop(null) }
-        } else {
-            // Also RETRY from the notification, and the system's start of an always-on VPN.
-            worker.execute { start() }
+        lastStartId = startId
+        val disconnect = intent?.action == DISCONNECT
+        worker.execute {
+            when {
+                disconnect -> stop(null)
+                // Also RETRY from the notification, the system's start of an
+                // always-on VPN, and its restart after the process died (no intent).
+                tun == null -> start()
+                else -> restartSoon(full = true)
+            }
         }
-        return START_NOT_STICKY
+        // If the process dies the interface goes with it and the picked apps
+        // are outside the tunnel: the system must bring the service back.
+        return START_STICKY
     }
 
     override fun onRevoke() {
@@ -95,20 +127,51 @@ class TunnelService : VpnService() {
 
     /** Runs on [worker]; a callback that arrives after onDestroy is dropped. */
     private fun later(block: () -> Unit) {
-        try {
-            worker.execute(block)
-        } catch (e: RejectedExecutionException) {
-        }
+        worker.execute { if (!destroyed) block() }
     }
 
     override fun onDestroy() {
         worker.execute {
+            destroyed = true
+            cancelRestart()
             unwatch()
             close()
             set(State.OFF, error)
         }
-        worker.shutdown()
         super.onDestroy()
+    }
+
+    /** One restart for everything that happens within [RESTART_DELAY_MS]. Runs on [worker]. */
+    private fun restartSoon(full: Boolean) {
+        restartFull = restartFull || full
+        if (restart != null) return
+        restart = worker.schedule(
+            Runnable {
+                if (destroyed) return@Runnable
+                restart = null
+                // A blocked tunnel may lack a working interface: build it again.
+                val rebuild = restartFull || state == State.BLOCKED
+                restartFull = false
+                if (rebuild) start() else guarded { restartXray() }
+            },
+            RESTART_DELAY_MS,
+            TimeUnit.MILLISECONDS,
+        )
+    }
+
+    private fun cancelRestart() {
+        restart?.cancel(false)
+        restart = null
+        restartFull = false
+    }
+
+    /** Saved data that cannot be read must not end the process, and the tunnel with it. */
+    private inline fun guarded(block: () -> Unit) {
+        try {
+            block()
+        } catch (e: Exception) {
+            fail(getString(R.string.store_unavailable))
+        }
     }
 
     /**
@@ -118,6 +181,10 @@ class TunnelService : VpnService() {
      * outside the tunnel.
      */
     private fun start() {
+        guarded { bringUp() }
+    }
+
+    private fun bringUp() {
         set(State.STARTING)
         val profile = Store.selected(this) ?: return fail(getString(R.string.need_profile))
         val builder = Builder()
@@ -154,8 +221,20 @@ class TunnelService : VpnService() {
         val old = tun
         tun = fd
         closeQuietly(old)
+        runXray(profile, fd)
+    }
+
+    /** A new Xray on the interface that is up, which stays: nothing leaks meanwhile. */
+    private fun restartXray() {
+        val fd = tun ?: return
+        set(State.STARTING)
+        val profile = Store.selected(this) ?: return fail(getString(R.string.need_profile))
+        runXray(profile, fd)
+    }
+
+    private fun runXray(profile: JSONObject, fd: ParcelFileDescriptor) {
         try {
-            // Stops the previous Xray, if any, and starts one on the new interface.
+            // Stops the previous Xray, if any, and starts one on this interface.
             Mobile.start(profile.toString(), fd.fd.toLong(), geodata().path)
         } catch (e: Exception) {
             return fail(e.message ?: e.javaClass.simpleName)
@@ -179,11 +258,15 @@ class TunnelService : VpnService() {
     }
 
     private fun stop(reason: String?) {
+        val wasUp = tun != null
+        cancelRestart()
         unwatch()
         close()
         set(State.OFF, reason)
         stopForeground(STOP_FOREGROUND_REMOVE)
-        stopSelf()
+        // Not asked for by the user: the picked apps are outside the tunnel now.
+        if (reason != null && wasUp) notifyDown()
+        stopSelf(lastStartId)
     }
 
     private fun close() {
@@ -202,17 +285,22 @@ class TunnelService : VpnService() {
     /**
      * Restarts Xray when the real network changes (Wi-Fi to mobile data and
      * back): connections of the old network would hang until they time out.
-     * The restart keeps the interface (see [start]), so nothing leaks.
+     * The restart keeps the interface (see [restartXray]), so nothing leaks.
+     * It also rebuilds the tunnel when a picked app is installed: the
+     * interface admits apps by uid, and a new install has a new one.
      */
     private fun watch() {
+        watchInstalls()
         if (watching != null) return
         val manager = getSystemService(ConnectivityManager::class.java)
+        // The callback first reports the current network, which is no change.
+        network = manager.activeNetwork
         val callback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(n: Network) {
                 later {
                     val previous = network
                     network = n
-                    if (watching != null && previous != null && previous != n && state != State.OFF) start()
+                    if (watching != null && previous != n && state != State.OFF) restartSoon(full = false)
                 }
             }
         }
@@ -224,7 +312,30 @@ class TunnelService : VpnService() {
         }
     }
 
+    private fun watchInstalls() {
+        if (installs != null) return
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context, intent: Intent) {
+                // An update keeps the uid.
+                if (intent.getBooleanExtra(Intent.EXTRA_REPLACING, false)) return
+                val pkg = intent.data?.schemeSpecificPart ?: return
+                later {
+                    if (tun != null && pkg in Store.apps(this@TunnelService)) restartSoon(full = true)
+                }
+            }
+        }
+        val filter = IntentFilter(Intent.ACTION_PACKAGE_ADDED).apply { addDataScheme("package") }
+        if (Build.VERSION.SDK_INT >= 33) {
+            registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            registerReceiver(receiver, filter)
+        }
+        installs = receiver
+    }
+
     private fun unwatch() {
+        installs?.let { unregisterReceiver(it) }
+        installs = null
         val callback = watching ?: return
         watching = null
         network = null
@@ -250,25 +361,45 @@ class TunnelService : VpnService() {
         return dir
     }
 
+    @Suppress("DEPRECATION")
+    private fun notificationBuilder(channel: String, name: Int, importance: Int): Notification.Builder {
+        if (Build.VERSION.SDK_INT < 26) return Notification.Builder(this)
+        getSystemService(NotificationManager::class.java)
+            .createNotificationChannel(NotificationChannel(channel, getString(name), importance))
+        return Notification.Builder(this, channel)
+    }
+
+    /** Back to the main screen that is already open, instead of a second one on top. */
+    private fun openApp(): PendingIntent = PendingIntent.getActivity(
+        this,
+        0,
+        Intent(this, MainActivity::class.java)
+            .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP),
+        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+    )
+
+    /** The tunnel ended without the user asking; the app may not be on screen. */
+    private fun notifyDown() {
+        val notification = notificationBuilder("alerts", R.string.channel_alerts, NotificationManager.IMPORTANCE_DEFAULT)
+            .setSmallIcon(R.drawable.ic_stat)
+            .setContentTitle(getString(R.string.title_off))
+            .setContentText(getString(R.string.tunnel_down_note))
+            .setContentIntent(openApp())
+            .setAutoCancel(true)
+            .build()
+        getSystemService(NotificationManager::class.java).notify(NOTE_DOWN, notification)
+    }
+
     private fun foreground(blocked: Boolean) {
-        val manager = getSystemService(NotificationManager::class.java)
-        val builder = if (Build.VERSION.SDK_INT >= 26) {
-            manager.createNotificationChannel(
-                NotificationChannel("tunnel", getString(R.string.channel), NotificationManager.IMPORTANCE_LOW),
-            )
-            Notification.Builder(this, "tunnel")
-        } else {
-            @Suppress("DEPRECATION")
-            Notification.Builder(this)
-        }
+        getSystemService(NotificationManager::class.java).cancel(NOTE_DOWN)
+        val builder = notificationBuilder("tunnel", R.string.channel, NotificationManager.IMPORTANCE_LOW)
         val flags = PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        val open = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), flags)
         val off = PendingIntent.getService(
             this, 1, Intent(this, TunnelService::class.java).setAction(DISCONNECT), flags,
         )
         builder
             .setSmallIcon(R.drawable.ic_stat)
-            .setContentIntent(open)
+            .setContentIntent(openApp())
             .setOngoing(true)
         if (blocked) {
             val retry = PendingIntent.getService(
@@ -286,9 +417,9 @@ class TunnelService : VpnService() {
             .build()
         try {
             if (Build.VERSION.SDK_INT >= 34) {
-                startForeground(1, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SYSTEM_EXEMPTED)
+                startForeground(NOTE_TUNNEL, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SYSTEM_EXEMPTED)
             } else {
-                startForeground(1, notification)
+                startForeground(NOTE_TUNNEL, notification)
             }
         } catch (e: Exception) {
             // The system keeps a connected VpnService alive without it.

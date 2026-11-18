@@ -59,7 +59,7 @@ func TestRouter(t *testing.T) {
 		domain  string // the sniffed name, if any
 		want    string
 	}
-	// russian is a geoip:ru address outside Yandex DNS (77.88.8.0/24 goes through the proxy).
+	// russian is an address in Russia outside Yandex DNS.
 	const foreign, russian, yandexDNS = "1.1.1.1", "87.250.250.242", "77.88.8.8"
 	common := []conn{
 		{"a foreign site", mobilecfg.TagTun, xnet.Network_TCP, foreign, 443, "example.com", mobilecfg.TagProxy},
@@ -70,7 +70,10 @@ func TestRouter(t *testing.T) {
 		{".su", mobilecfg.TagTun, xnet.Network_TCP, foreign, 443, "example.su", mobilecfg.TagDirect},
 		{".рф", mobilecfg.TagTun, xnet.Network_TCP, foreign, 443, "example.xn--p1ai", mobilecfg.TagDirect},
 		{"geosite:category-ru", mobilecfg.TagTun, xnet.Network_TCP, foreign, 443, "vk.com", mobilecfg.TagDirect},
-		{"a Russian address", mobilecfg.TagTun, xnet.Network_TCP, russian, 443, "", mobilecfg.TagDirect},
+		{"a Russian address without a name", mobilecfg.TagTun, xnet.Network_TCP, russian, 443, "", mobilecfg.TagProxy},
+		{"a Russian address with a foreign name", mobilecfg.TagTun, xnet.Network_TCP, russian, 443, "example.com", mobilecfg.TagProxy},
+		{"a local address", mobilecfg.TagTun, xnet.Network_TCP, "192.168.1.10", 443, "", mobilecfg.TagDirect},
+		{"a local IPv6 address", mobilecfg.TagTun, xnet.Network_TCP, "fd00::10", 443, "", mobilecfg.TagDirect},
 		{"a name that only ends like .ru", mobilecfg.TagTun, xnet.Network_TCP, foreign, 443, "example.guru", mobilecfg.TagProxy},
 		{"DNS over UDP", mobilecfg.TagTun, xnet.Network_UDP, foreign, 53, "", mobilecfg.TagDNS},
 		{"DNS over TCP", mobilecfg.TagTun, xnet.Network_TCP, foreign, 53, "", mobilecfg.TagDNS},

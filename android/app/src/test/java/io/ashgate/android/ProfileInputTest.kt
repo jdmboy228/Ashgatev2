@@ -53,7 +53,7 @@ class ProfileInputTest {
 
     @Test
     fun reimportReusesIds() {
-        val saved = mapOf("a@one:443" to "id-1", "b@two:443" to "id-2")
+        val saved = mapOf("a@one:443" to listOf("id-1"), "b@two:443" to listOf("id-2"))
         // The same subscription again, with one new server: nothing is added twice.
         assertEquals(
             listOf("id-1", null, "id-2"),
@@ -63,13 +63,19 @@ class ProfileInputTest {
 
     @Test
     fun aServerListedTwiceGetsOneId() {
-        val saved = mapOf("a@one:443" to "id-1")
+        val saved = mapOf("a@one:443" to listOf("id-1"))
         assertEquals(listOf("id-1", null), ProfileInput.ids(saved, listOf("a@one:443", "a@one:443"), null))
     }
 
     @Test
+    fun aServerListedTwiceDoesNotGrowOnReimport() {
+        val saved = mapOf("a@one:443" to listOf("id-1", "id-2"))
+        assertEquals(listOf("id-1", "id-2"), ProfileInput.ids(saved, listOf("a@one:443", "a@one:443"), null))
+    }
+
+    @Test
     fun editedProfileKeepsItsId() {
-        val saved = mapOf("a@one:443" to "id-1", "b@two:443" to "id-2")
+        val saved = mapOf("a@one:443" to listOf("id-1"), "b@two:443" to listOf("id-2"))
         assertEquals(
             listOf("id-9", "id-2"),
             ProfileInput.ids(saved, listOf("x@new:443", "b@two:443"), "id-9"),
@@ -80,6 +86,6 @@ class ProfileInputTest {
 
     @Test
     fun proxiesWithoutKeysAreNew() {
-        assertEquals(listOf(null), ProfileInput.ids(mapOf("a@one:443" to "id-1"), listOf(null), null))
+        assertEquals(listOf(null), ProfileInput.ids(mapOf("a@one:443" to listOf("id-1")), listOf(null), null))
     }
 }

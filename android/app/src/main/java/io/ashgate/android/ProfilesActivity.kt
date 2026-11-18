@@ -16,10 +16,15 @@ import org.json.JSONObject
 class ProfilesActivity : Activity() {
     private lateinit var list: ListView
     private var profiles: List<JSONObject> = emptyList()
+
+    /** Read once per refresh: every read decrypts, and each row needs it. */
+    private var selectedId: String? = null
     private val adapter = Adapter()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Reopened by the system with the Keystore failing: back to the main screen's message.
+        if (!Store.usable(this)) return finish()
         setContentView(R.layout.profiles)
         findViewById<View>(R.id.back).onClick { finish() }
         findViewById<TextView>(R.id.title).apply { setText(R.string.profiles); typeface = Fonts.extrabold(context) }
@@ -32,8 +37,9 @@ class ProfilesActivity : Activity() {
         list.adapter = adapter
         list.setOnItemClickListener { _, row, position, _ ->
             val id = profiles[position].getString("id")
-            if (id == Store.selectedId(this)) return@setOnItemClickListener
+            if (id == selectedId) return@setOnItemClickListener
             Store.select(this, id)
+            selectedId = id
             adapter.notifyDataSetChanged()
             // The check fades in on the picked profile.
             row.findViewById<View>(R.id.check).apply {
@@ -60,6 +66,7 @@ class ProfilesActivity : Activity() {
         super.onResume()
         // After adding, editing or deleting a profile.
         profiles = Store.profiles(this)
+        selectedId = Store.selectedId(this)
         adapter.notifyDataSetChanged()
     }
 
@@ -80,7 +87,7 @@ class ProfilesActivity : Activity() {
         override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
             val v = convertView ?: layoutInflater.inflate(R.layout.profile_row, parent, false)
             val p = profiles[position]
-            val selected = p.getString("id") == Store.selectedId(this@ProfilesActivity)
+            val selected = p.getString("id") == selectedId
             // Hairlines only between rows.
             v.findViewById<View>(R.id.divider).visibility = if (position == 0) View.GONE else View.VISIBLE
             v.findViewById<TextView>(R.id.name).apply {
