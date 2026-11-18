@@ -16,7 +16,9 @@ android {
         // 64-bit ARM only: nearly every phone in use runs it (32-bit-only
         // phones are left out); a second copy of the Go core for
         // armeabi-v7a doubled the APK.
-        ndk { abiFilters += listOf("arm64-v8a") }
+        // CI also builds one with -Pashgate.abis=x86_64 for the emulator test.
+        val abis = (project.findProperty("ashgate.abis") as String?)?.split(",") ?: listOf("arm64-v8a")
+        ndk { abiFilters += abis }
     }
     // The Go core is stored compressed in the APK (half the download) and
     // unpacked once at install.

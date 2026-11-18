@@ -78,7 +78,8 @@ jobs:
           # on Android, which the linker refuses since Go 1.23.
           export ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME"
           mkdir -p ../android/app/libs
-          gomobile bind -target=android/arm64 -androidapi 24 -javapkg io.ashgate \
+          # amd64 only feeds the emulator APK below; the release packs arm64.
+          gomobile bind -target=android/arm64,android/amd64 -androidapi 24 -javapkg io.ashgate \
             -trimpath -ldflags "-s -w -checklinkname=0" -o ../android/app/libs/ashgate.aar ./mobile
 
       - uses: gradle/actions/setup-gradle@v4
@@ -100,26 +101,41 @@ jobs:
         working-directory: android
         env:
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-        # JVM unit tests (app/src/test) first, then the signed APK.
-        run: gradle --no-daemon testReleaseUnitTest assembleRelease
+        # JVM unit tests (app/src/test) first, then the signed APK (arm64).
+        # Then the same release build with the x86_64 core for the emulator:
+        # translated ARM Go code dies there on a CPU-ID instruction that
+        # real phones handle.
+        run: |
+          gradle --no-daemon testReleaseUnitTest assembleRelease
+          mkdir -p dist
+          cp app/build/outputs/apk/release/app-release.apk dist/app-release.apk
+          gradle --no-daemon assembleRelease -Pashgate.abis=x86_64
+          cp app/build/outputs/apk/release/app-release.apk dist/app-smoke-x86_64.apk
 
       # The certificate's SHA-256 is public; a different one means a different key.
       - name: Signature
         run: |
           apksigner="$(ls "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -1)"
-          "$apksigner" verify --print-certs android/app/build/outputs/apk/release/app-release.apk | tee certs.txt
+          "$apksigner" verify --print-certs android/dist/app-release.apk | tee certs.txt
           grep -q "SHA-256 digest: 0a030808a89c00f3db1f73400deae24cb493b6bf9e1c12734f2aec96f24b1ebf" certs.txt
 
       - uses: actions/upload-artifact@v4
         with:
           name: ashgate-android-apk
-          path: android/app/build/outputs/apk/release/app-release.apk
+          path: android/dist/app-release.apk
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ashgate-android-smoke-apk
+          path: android/dist/app-smoke-x86_64.apk
           if-no-files-found: error
 
   # Installs the APK on an emulator and goes through it like a user: adds a
   # (fake) profile, picks an app, connects, checks the VPN interface is up,
   # disconnects, then taps around at random. Any crash or ANR fails the run.
-  # Android 11 x86_64 images run the APK's ARM Go core through translation.
+  # It runs the x86_64 build of the same release (same code, R8 and
+  # geodata; only the Go core's CPU differs).
   smoke:
     needs: apk
     runs-on: ubuntu-latest
@@ -129,7 +145,7 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
-          name: ashgate-android-apk
+          name: ashgate-android-smoke-apk
           path: apk
 
       - name: Enable KVM
@@ -145,7 +161,7 @@ jobs:
           arch: x86_64
           disable-animations: true
           emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none -no-snapshot
-          script: bash android/ci/smoke.sh apk/app-release.apk smoke-out
+          script: bash android/ci/smoke.sh apk/app-smoke-x86_64.apk smoke-out
 
       - uses: actions/upload-artifact@v4
         if: always()
