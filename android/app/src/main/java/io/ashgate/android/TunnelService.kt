@@ -8,12 +8,15 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
+import android.net.Network
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
 import io.ashgate.mobile.Mobile
 import java.io.File
 import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
 
 /**
  * The tunnel. Only the apps the user picked are routed into the TUN
@@ -25,10 +28,17 @@ import java.util.concurrent.Executors
  * itself (its TUN inbound); there is no local proxy port.
  */
 class TunnelService : VpnService() {
-    enum class State { OFF, STARTING, ON }
+    /**
+     * BLOCKED: the tunnel failed after it was up, or a reconnect failed. The
+     * VPN interface stays, without Xray behind it, so the picked apps have
+     * no network at all instead of going around the tunnel. Only
+     * «Отключить» (or a working reconnect) ends it.
+     */
+    enum class State { OFF, STARTING, ON, BLOCKED }
 
     companion object {
         private const val DISCONNECT = "io.ashgate.android.DISCONNECT"
+        private const val RETRY = "io.ashgate.android.RETRY"
 
         @Volatile
         var state = State.OFF
@@ -60,23 +70,40 @@ class TunnelService : VpnService() {
 
     // One thread: connects and disconnects never overlap.
     private val worker = Executors.newSingleThreadExecutor()
+
+    /** The VPN interface; touched only on [worker]. */
     private var tun: ParcelFileDescriptor? = null
+
+    /** The real network Ashgate (outside the tunnel) uses; a change restarts Xray. */
+    private var network: Network? = null
+    private var watching: ConnectivityManager.NetworkCallback? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == DISCONNECT) {
             worker.execute { stop(null) }
         } else {
+            // Also RETRY from the notification, and the system's start of an always-on VPN.
             worker.execute { start() }
         }
         return START_NOT_STICKY
     }
 
     override fun onRevoke() {
-        worker.execute { stop(null) }
+        // The system has already taken the interface away (another VPN app, or the user in settings).
+        later { stop(getString(R.string.vpn_revoked)) }
+    }
+
+    /** Runs on [worker]; a callback that arrives after onDestroy is dropped. */
+    private fun later(block: () -> Unit) {
+        try {
+            worker.execute(block)
+        } catch (e: RejectedExecutionException) {
+        }
     }
 
     override fun onDestroy() {
         worker.execute {
+            unwatch()
             close()
             set(State.OFF, error)
         }
@@ -84,10 +111,15 @@ class TunnelService : VpnService() {
         super.onDestroy()
     }
 
+    /**
+     * Brings the tunnel up, or moves a running one to the current profile and
+     * apps. The new interface is established before the old one is closed:
+     * Android swaps them in one step, so the picked apps never have a moment
+     * outside the tunnel.
+     */
     private fun start() {
-        close()
         set(State.STARTING)
-        val profile = Store.selected(this) ?: return stop(getString(R.string.need_profile))
+        val profile = Store.selected(this) ?: return fail(getString(R.string.need_profile))
         val builder = Builder()
             .setSession(getString(R.string.app_name))
             .setMtu(Mobile.Mtu.toInt())
@@ -97,6 +129,7 @@ class TunnelService : VpnService() {
             .addRoute("::", 0)
             // Any address works: Xray answers port 53 itself, through the tunnel.
             .addDnsServer("1.1.1.1")
+        // false = take the meteredness of the real network (true would always say metered).
         if (Build.VERSION.SDK_INT >= 29) builder.setMetered(false)
         var allowed = 0
         for (pkg in Store.apps(this)) {
@@ -109,19 +142,44 @@ class TunnelService : VpnService() {
             }
         }
         // With no allowed app the VPN would take every app, Ashgate included.
-        if (allowed == 0) return stop(getString(R.string.need_apps))
+        if (allowed == 0) return fail(getString(R.string.need_apps))
+        var fd: ParcelFileDescriptor? = null
         try {
-            val fd = builder.establish() ?: return stop(getString(R.string.no_vpn_permission))
-            tun = fd
+            fd = builder.establish()
+        } catch (e: Exception) {
+            return fail(e.message ?: e.javaClass.simpleName)
+        }
+        // null: the VPN permission was taken away, and the old interface with it.
+        if (fd == null) return stop(getString(R.string.no_vpn_permission))
+        val old = tun
+        tun = fd
+        closeQuietly(old)
+        try {
+            // Stops the previous Xray, if any, and starts one on the new interface.
             Mobile.start(profile.toString(), fd.fd.toLong(), geodata().path)
         } catch (e: Exception) {
-            return stop(e.message ?: e.javaClass.simpleName)
+            return fail(e.message ?: e.javaClass.simpleName)
         }
-        foreground()
+        watch()
+        foreground(blocked = false)
         set(State.ON)
     }
 
+    /**
+     * A start that failed. If the VPN interface is up, it stays up without
+     * Xray: the picked apps are cut off rather than sent around the tunnel.
+     * With no interface yet nothing can leak, so the service just ends.
+     */
+    private fun fail(reason: String) {
+        if (tun == null) return stop(reason)
+        Mobile.stop()
+        watch() // a new network retries by itself
+        foreground(blocked = true)
+        set(State.BLOCKED, reason)
+    }
+
     private fun stop(reason: String?) {
+        unwatch()
         close()
         set(State.OFF, reason)
         stopForeground(STOP_FOREGROUND_REMOVE)
@@ -130,11 +188,50 @@ class TunnelService : VpnService() {
 
     private fun close() {
         Mobile.stop()
+        closeQuietly(tun)
+        tun = null
+    }
+
+    private fun closeQuietly(fd: ParcelFileDescriptor?) {
         try {
-            tun?.close()
+            fd?.close()
         } catch (e: Exception) {
         }
-        tun = null
+    }
+
+    /**
+     * Restarts Xray when the real network changes (Wi-Fi to mobile data and
+     * back): connections of the old network would hang until they time out.
+     * The restart keeps the interface (see [start]), so nothing leaks.
+     */
+    private fun watch() {
+        if (watching != null) return
+        val manager = getSystemService(ConnectivityManager::class.java)
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(n: Network) {
+                later {
+                    val previous = network
+                    network = n
+                    if (watching != null && previous != null && previous != n && state != State.OFF) start()
+                }
+            }
+        }
+        try {
+            manager.registerDefaultNetworkCallback(callback)
+            watching = callback
+        } catch (e: Exception) {
+            // Too many callbacks registered system-wide; the tunnel works without it.
+        }
+    }
+
+    private fun unwatch() {
+        val callback = watching ?: return
+        watching = null
+        network = null
+        try {
+            getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(callback)
+        } catch (e: Exception) {
+        }
     }
 
     /** Copies geoip.dat and geosite.dat out of the APK once per installed build. */
@@ -153,7 +250,7 @@ class TunnelService : VpnService() {
         return dir
     }
 
-    private fun foreground() {
+    private fun foreground(blocked: Boolean) {
         val manager = getSystemService(NotificationManager::class.java)
         val builder = if (Build.VERSION.SDK_INT >= 26) {
             manager.createNotificationChannel(
@@ -169,12 +266,22 @@ class TunnelService : VpnService() {
         val off = PendingIntent.getService(
             this, 1, Intent(this, TunnelService::class.java).setAction(DISCONNECT), flags,
         )
-        val notification = builder
+        builder
             .setSmallIcon(R.drawable.ic_stat)
-            .setContentTitle(getString(R.string.state_on))
-            .setContentText(Store.selected(this)?.optString("name"))
             .setContentIntent(open)
             .setOngoing(true)
+        if (blocked) {
+            val retry = PendingIntent.getService(
+                this, 2, Intent(this, TunnelService::class.java).setAction(RETRY), flags,
+            )
+            builder.setContentTitle(getString(R.string.state_blocked))
+                .setContentText(getString(R.string.blocked_note))
+                .addAction(Notification.Action.Builder(null, getString(R.string.retry), retry).build())
+        } else {
+            builder.setContentTitle(getString(R.string.state_on))
+                .setContentText(Store.selected(this)?.optString("name"))
+        }
+        val notification = builder
             .addAction(Notification.Action.Builder(null, getString(R.string.disconnect), off).build())
             .build()
         try {

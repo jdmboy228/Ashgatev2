@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -37,7 +38,10 @@ type Profile struct {
 	Pass string `json:"pass,omitempty"`
 }
 
-var errNotXHTTP = errors.New("Поддерживается только VLESS через XHTTP")
+var (
+	errNotXHTTP     = errors.New("Поддерживается только VLESS через XHTTP")
+	errNoEncryption = errors.New("Ссылка без защиты (security=none): UUID и трафик шли бы открытым текстом. Нужна ссылка с reality или tls")
+)
 
 // FromLink reads a vless:// link. Only XHTTP is accepted.
 func FromLink(link string) (Profile, error) {
@@ -48,6 +52,9 @@ func FromLink(link string) (Profile, error) {
 	}
 	if p.Params.Network != "xhttp" {
 		return Profile{}, errNotXHTTP
+	}
+	if p.Params.Security == "none" {
+		return Profile{}, errNoEncryption
 	}
 	host, port, err := splitAddress(p.Address)
 	if err != nil {
@@ -154,6 +161,20 @@ var (
 	RawDNS     = "1.1.1.1"
 )
 
+// Encrypted DNS of the apps (DoT, or DoH to a Russian resolver, which the
+// direct rules would otherwise match) goes through the proxy, so "Private
+// DNS" set to a Russian provider does not take every name around the tunnel.
+var (
+	DoTPort                = "853"
+	RussianResolverDomains = []string{"domain:dns.yandex.net", "domain:dns.yandex.ru"}
+	RussianResolverIPs     = []string{
+		"77.88.8.0/24",
+		"2a02:6b8::feed:0ff", "2a02:6b8:0:1::feed:0ff",
+		"2a02:6b8::feed:bad", "2a02:6b8:0:1::feed:bad",
+		"2a02:6b8::feed:a11", "2a02:6b8:0:1::feed:a11",
+	}
+)
+
 // MTU of the TUN. VpnService must be given the same value.
 const MTU = 1500
 
@@ -174,10 +195,12 @@ func DirectDomains() []string {
 //  1. port 53 from the TUN goes to Xray's DNS: direct names are asked of
 //     the system resolver, all others of DNSServers;
 //  2. Xray's own DNS queries go to the proxy;
-//  3. Russian domains (by the name the app asked for) go direct;
-//  4. Russian addresses go direct;
-//  5. an HTTP proxy cannot carry UDP, so the rest of UDP is dropped;
-//  6. everything else goes to the proxy.
+//  3. encrypted DNS of the apps (DoT on 853, Russian DoH resolvers) goes
+//     to the proxy;
+//  4. Russian domains (by the name the app asked for) go direct;
+//  5. Russian addresses go direct;
+//  6. an HTTP proxy cannot carry UDP, so the rest of UDP is dropped;
+//  7. everything else goes to the proxy.
 func XrayJSON(p Profile) ([]byte, error) {
 	proxy, err := proxyOutbound(p)
 	if err != nil {
@@ -211,6 +234,9 @@ func XrayJSON(p Profile) ([]byte, error) {
 	rules := []any{
 		map[string]any{"type": "field", "inboundTag": []string{TagTun}, "port": "53", "outboundTag": TagDNS},
 		map[string]any{"type": "field", "inboundTag": []string{TagDNSIn}, "outboundTag": TagProxy},
+		map[string]any{"type": "field", "inboundTag": []string{TagTun}, "port": DoTPort, "outboundTag": TagProxy},
+		map[string]any{"type": "field", "inboundTag": []string{TagTun}, "domain": RussianResolverDomains, "outboundTag": TagProxy},
+		map[string]any{"type": "field", "inboundTag": []string{TagTun}, "ip": RussianResolverIPs, "outboundTag": TagProxy},
 		map[string]any{"type": "field", "inboundTag": []string{TagTun}, "domain": DirectDomains(), "outboundTag": TagDirect},
 		map[string]any{"type": "field", "inboundTag": []string{TagTun}, "ip": []string{"geoip:ru"}, "outboundTag": TagDirect},
 	}
@@ -226,7 +252,10 @@ func XrayJSON(p Profile) ([]byte, error) {
 		servers = append(servers, s)
 	}
 	doc := map[string]any{
-		"log":      map[string]any{"loglevel": "warning"},
+		// No logs at all: Xray's access log is on by default and gomobile
+		// sends the console to logcat, which would keep every site and the
+		// server's address. Start errors still come back as errors.
+		"log":      map[string]any{"access": "none", "error": "none", "loglevel": "none"},
 		"dns":      map[string]any{"tag": TagDNSIn, "servers": servers, "queryStrategy": "UseIP"},
 		"inbounds": []any{tun},
 		"outbounds": []any{
@@ -255,6 +284,9 @@ func proxyOutbound(p Profile) (map[string]any, error) {
 		if parsed.Params.Network != "xhttp" {
 			return nil, errNotXHTTP
 		}
+		if parsed.Params.Security == "none" {
+			return nil, errNoEncryption
+		}
 		host, port, err := splitAddress(parsed.Address)
 		if err != nil {
 			return nil, err
@@ -280,15 +312,21 @@ func proxyOutbound(p Profile) (map[string]any, error) {
 	}
 }
 
-// Mask hides the profile's secrets (UUID, keys, password) in a message, in
-// case an Xray error quotes them. Values under 4 characters could match
-// ordinary words and are left alone.
+// Mask hides the profile's secrets (UUID, keys, password) and the server's
+// address in a message, in case an Xray error quotes them: the message is
+// shown on screen and ends up in screenshots. Values under 4 characters
+// could match ordinary words and are left alone.
 func (p Profile) Mask(msg string) string {
-	secrets := []string{p.Pass}
+	secrets := []string{p.Pass, p.User, p.Host}
 	if parsed, err := vless.ParseLink(p.Link); err == nil {
 		v := parsed.Params
-		secrets = append(secrets, v.UUID, strings.ReplaceAll(v.UUID, "-", ""), v.PublicKey, v.ShortID)
+		secrets = append(secrets, v.UUID, strings.ReplaceAll(v.UUID, "-", ""), v.PublicKey, v.ShortID, v.SNI, v.Host)
+		if host, _, err := net.SplitHostPort(parsed.Address); err == nil {
+			secrets = append(secrets, host)
+		}
 	}
+	// Longest first, so a shorter value never cuts a longer one in half.
+	sort.Slice(secrets, func(i, j int) bool { return len(secrets[i]) > len(secrets[j]) })
 	for _, s := range secrets {
 		if len(s) >= 4 {
 			msg = strings.ReplaceAll(msg, s, "***")

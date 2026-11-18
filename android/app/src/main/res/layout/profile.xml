@@ -96,6 +96,16 @@
                 android:inputType="textPassword" />
         </LinearLayout>
 
+        <!-- Shown with the proxy fields: these protocols carry no encryption. -->
+        <TextView
+            android:id="@+id/proxy_note"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:paddingTop="8dp"
+            android:text="@string/proxy_note"
+            android:textColor="@color/ag_text2"
+            android:visibility="gone" />
+
         <TextView
             android:id="@+id/error"
             android:layout_width="match_parent"

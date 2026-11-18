@@ -59,7 +59,8 @@ func TestRouter(t *testing.T) {
 		domain  string // the sniffed name, if any
 		want    string
 	}
-	const foreign, russian = "1.1.1.1", "77.88.8.8"
+	// russian is a geoip:ru address outside Yandex DNS (77.88.8.0/24 goes through the proxy).
+	const foreign, russian, yandexDNS = "1.1.1.1", "87.250.250.242", "77.88.8.8"
 	common := []conn{
 		{"a foreign site", mobilecfg.TagTun, xnet.Network_TCP, foreign, 443, "example.com", mobilecfg.TagProxy},
 		{"a foreign address without a name", mobilecfg.TagTun, xnet.Network_TCP, foreign, 443, "", mobilecfg.TagProxy},
@@ -73,7 +74,16 @@ func TestRouter(t *testing.T) {
 		{"a name that only ends like .ru", mobilecfg.TagTun, xnet.Network_TCP, foreign, 443, "example.guru", mobilecfg.TagProxy},
 		{"DNS over UDP", mobilecfg.TagTun, xnet.Network_UDP, foreign, 53, "", mobilecfg.TagDNS},
 		{"DNS over TCP", mobilecfg.TagTun, xnet.Network_TCP, foreign, 53, "", mobilecfg.TagDNS},
-		{"DNS to a Russian server", mobilecfg.TagTun, xnet.Network_UDP, russian, 53, "", mobilecfg.TagDNS},
+		{"DNS to a Russian server", mobilecfg.TagTun, xnet.Network_UDP, yandexDNS, 53, "", mobilecfg.TagDNS},
+		// Encrypted DNS never leaves the tunnel, even to a Russian resolver.
+		{"DoT to a foreign resolver", mobilecfg.TagTun, xnet.Network_TCP, foreign, 853, "", mobilecfg.TagProxy},
+		{"DoT to a Russian resolver", mobilecfg.TagTun, xnet.Network_TCP, yandexDNS, 853, "", mobilecfg.TagProxy},
+		{"DoT by a Russian name", mobilecfg.TagTun, xnet.Network_TCP, russian, 853, "common.dot.dns.yandex.net", mobilecfg.TagProxy},
+		{"DoQ to a Russian resolver", mobilecfg.TagTun, xnet.Network_UDP, yandexDNS, 853, "", mobilecfg.TagProxy},
+		{"DoH to a Russian resolver's address", mobilecfg.TagTun, xnet.Network_TCP, yandexDNS, 443, "", mobilecfg.TagProxy},
+		{"DoH to a Russian resolver's name", mobilecfg.TagTun, xnet.Network_TCP, russian, 443, "common.dot.dns.yandex.net", mobilecfg.TagProxy},
+		{"DoH to Yandex DNS over IPv6", mobilecfg.TagTun, xnet.Network_TCP, "2a02:6b8::feed:0ff", 443, "", mobilecfg.TagProxy},
+		{"another Yandex site stays direct", mobilecfg.TagTun, xnet.Network_TCP, russian, 443, "ya.ru", mobilecfg.TagDirect},
 		{"Xray's own DNS query", mobilecfg.TagDNSIn, xnet.Network_TCP, foreign, 443, "", mobilecfg.TagProxy},
 	}
 	for name, tc := range map[string]struct {

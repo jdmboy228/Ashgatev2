@@ -6,6 +6,7 @@ import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKeys
 import org.json.JSONArray
 import org.json.JSONObject
+import java.security.KeyStore
 import java.util.UUID
 
 /**
@@ -19,18 +20,66 @@ import java.util.UUID
 object Store {
     private var cached: SharedPreferences? = null
 
+    /** Set when saved data could not be decrypted and was wiped; the main screen says so once. */
+    @Volatile
+    private var wiped = false
+
     @Synchronized
     private fun prefs(ctx: Context): SharedPreferences {
         cached?.let { return it }
+        // Twice: the Keystore sometimes fails right after boot.
+        val p = tryOpen(ctx) ?: tryOpen(ctx) ?: wipeAndOpen(ctx)
+        cached = p
+        return p
+    }
+
+    private fun tryOpen(ctx: Context): SharedPreferences? = try {
+        open(ctx)
+    } catch (e: Exception) {
+        null
+    }
+
+    /**
+     * The key in the Keystore is gone or does not fit the file: the data was
+     * moved to a new phone (the key never moves), or the Keystore broke.
+     * Nothing in the file can be read again, so start over instead of
+     * crashing on every launch.
+     */
+    private fun wipeAndOpen(ctx: Context): SharedPreferences {
+        ctx.applicationContext.deleteSharedPreferences(FILE)
+        try {
+            KeyStore.getInstance("AndroidKeyStore").apply { load(null) }.deleteEntry(MASTER_KEY)
+        } catch (e: Exception) {
+        }
+        wiped = true
+        return open(ctx)
+    }
+
+    private fun open(ctx: Context): SharedPreferences {
         val p = EncryptedSharedPreferences.create(
-            "ashgate",
+            FILE,
             MasterKeys.getOrCreate(MasterKeys.AES256_GCM_SPEC),
             ctx.applicationContext,
             EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
             EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM,
         )
-        cached = p
+        // A wrong key can open the file and fail only on the first read.
+        p.getString("profiles", null)
+        p.getStringSet("apps", null)
         return p
+    }
+
+    private const val FILE = "ashgate"
+
+    /** The alias MasterKeys.getOrCreate(AES256_GCM_SPEC) uses. */
+    private const val MASTER_KEY = "_androidx_security_master_key_"
+
+    /** True once after the saved data had to be wiped. */
+    fun takeWiped(ctx: Context): Boolean {
+        prefs(ctx)
+        if (!wiped) return false
+        wiped = false
+        return true
     }
 
     fun profiles(ctx: Context): MutableList<JSONObject> {
@@ -43,6 +92,7 @@ object Store {
     }
 
     /** Adds a profile, or replaces the one with the same id. */
+    @Synchronized
     fun put(ctx: Context, profile: JSONObject) {
         val list = profiles(ctx)
         if (!profile.has("id")) profile.put("id", UUID.randomUUID().toString())
@@ -52,6 +102,7 @@ object Store {
         if (selectedId(ctx) == null) select(ctx, profile.getString("id"))
     }
 
+    @Synchronized
     fun delete(ctx: Context, id: String) {
         val list = profiles(ctx).filter { it.getString("id") != id }
         save(ctx, list)

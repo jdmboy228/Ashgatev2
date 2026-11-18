@@ -14,15 +14,17 @@
         </intent>
     </queries>
 
-    <!-- No backups: profiles hold server keys and passwords.
-         Cleartext is allowed because 3x-ui subscriptions are often plain http. -->
+    <!-- No backups and no device-to-device transfer: profiles hold server keys and
+         passwords, and their Keystore key never moves anyway. No cleartext: a plain
+         http:// subscription would show its servers' keys to the network. -->
     <application
         android:allowBackup="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
         android:fullBackupContent="false"
         android:icon="@drawable/ic_launcher"
         android:label="@string/app_name"
         android:theme="@style/AppTheme"
-        android:usesCleartextTraffic="true">
+        android:usesCleartextTraffic="false">
 
         <activity
             android:name=".MainActivity"

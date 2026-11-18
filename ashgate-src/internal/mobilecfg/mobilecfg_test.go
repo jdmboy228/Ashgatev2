@@ -198,40 +198,81 @@ func TestRouting(t *testing.T) {
 		}
 		rules := d["routing"].(map[string]any)["rules"].([]any)
 		rule := func(i int) map[string]any { return rules[i].(map[string]any) }
+		tun := []any{TagTun}
 
 		// DNS first: no later rule may send port 53 direct.
-		if r := rule(0); r["port"] != "53" || r["outboundTag"] != TagDNS || !reflect.DeepEqual(r["inboundTag"], []any{TagTun}) || len(r) != 4 {
+		if r := rule(0); r["port"] != "53" || r["outboundTag"] != TagDNS || !reflect.DeepEqual(r["inboundTag"], tun) || len(r) != 4 {
 			t.Fatalf("%s: rule 0 = %v", name, r)
 		}
 		// Xray's own DNS queries leave through the proxy.
 		if r := rule(1); r["outboundTag"] != TagProxy || !reflect.DeepEqual(r["inboundTag"], []any{TagDNSIn}) || len(r) != 3 {
 			t.Fatalf("%s: rule 1 = %v", name, r)
 		}
-		domains := rule(2)["domain"].([]any)
+		// Encrypted DNS of the apps goes through the proxy, before any direct rule.
+		if r := rule(2); r["port"] != "853" || r["outboundTag"] != TagProxy || !reflect.DeepEqual(r["inboundTag"], tun) || len(r) != 4 {
+			t.Fatalf("%s: rule 2 (DoT) = %v", name, r)
+		}
+		if r := rule(3); !contains(r["domain"].([]any), "domain:dns.yandex.net") || r["outboundTag"] != TagProxy {
+			t.Fatalf("%s: rule 3 (DoH names) = %v", name, r)
+		}
+		if r := rule(4); !contains(r["ip"].([]any), "77.88.8.0/24") || r["outboundTag"] != TagProxy {
+			t.Fatalf("%s: rule 4 (DoH addresses) = %v", name, r)
+		}
+		domains := rule(5)["domain"].([]any)
 		for _, want := range []string{"domain:ru", "domain:su", "domain:xn--p1ai", "geosite:category-ru"} {
 			if !contains(domains, want) {
 				t.Errorf("%s: %s is not direct", name, want)
 			}
 		}
-		if rule(2)["outboundTag"] != TagDirect {
-			t.Fatalf("%s: rule 2 = %v", name, rule(2))
+		if rule(5)["outboundTag"] != TagDirect {
+			t.Fatalf("%s: rule 5 = %v", name, rule(5))
 		}
-		if r := rule(3); !reflect.DeepEqual(r["ip"], []any{"geoip:ru"}) || r["outboundTag"] != TagDirect {
-			t.Fatalf("%s: rule 3 = %v", name, r)
+		if r := rule(6); !reflect.DeepEqual(r["ip"], []any{"geoip:ru"}) || r["outboundTag"] != TagDirect {
+			t.Fatalf("%s: rule 6 = %v", name, r)
 		}
 		// Nothing else is direct.
-		for i := 4; i < len(rules); i++ {
-			if rule(i)["outboundTag"] == TagDirect {
+		for i := range rules {
+			if i != 5 && i != 6 && rule(i)["outboundTag"] == TagDirect {
 				t.Fatalf("%s: rule %d is direct: %v", name, i, rule(i))
 			}
 		}
 		if p.Kind == KindHTTP {
-			if r := rule(4); r["network"] != "udp" || r["outboundTag"] != TagBlock {
-				t.Fatalf("http: rule 4 = %v", r)
+			if r := rule(7); r["network"] != "udp" || r["outboundTag"] != TagBlock || len(rules) != 8 {
+				t.Fatalf("http: rule 7 = %v (%d rules)", r, len(rules))
 			}
-		} else if len(rules) != 4 {
+		} else if len(rules) != 7 {
 			t.Fatalf("%s: %d rules", name, len(rules))
 		}
+	}
+}
+
+// Xray writes nothing: its access log would keep every site in logcat.
+func TestNoLogs(t *testing.T) {
+	for name, p := range profiles(t) {
+		log := doc(t, p)["log"].(map[string]any)
+		if log["access"] != "none" || log["error"] != "none" || log["loglevel"] != "none" || log["dnsLog"] == true {
+			t.Fatalf("%s: log = %v", name, log)
+		}
+	}
+}
+
+// A link without security would send the UUID and the traffic in the clear.
+func TestRejectsUnencryptedLink(t *testing.T) {
+	plain := "vless://" + fakeUUID + "@server.example:80?type=xhttp&security=none&path=%2Fapi#Plain"
+	missing := "vless://" + fakeUUID + "@server.example:80?type=xhttp&path=%2Fapi#Plain"
+	for _, link := range []string{plain, missing} {
+		if _, err := FromLink(link); err != errNoEncryption {
+			t.Fatalf("%s: err = %v", link, err)
+		}
+		// A profile saved before the check does not start either.
+		if _, err := XrayJSON(Profile{Kind: KindVLESS, Link: link}); err != errNoEncryption {
+			t.Fatalf("saved %s: err = %v", link, err)
+		}
+	}
+	body := plain + "\n" + xhttpLink + "\n"
+	got, err := FromSubscription([]byte(body))
+	if err != nil || len(got) != 1 || got[0].Link != xhttpLink {
+		t.Fatalf("subscription kept %+v, %v", got, err)
 	}
 }
 
@@ -249,7 +290,7 @@ func TestDNSThroughTunnel(t *testing.T) {
 		// The system resolver answers only the names that go direct: the
 		// same list as the routing rule, and no fallback to it or from it.
 		local := servers[0].(map[string]any)
-		direct := d["routing"].(map[string]any)["rules"].([]any)[2].(map[string]any)["domain"]
+		direct := d["routing"].(map[string]any)["rules"].([]any)[5].(map[string]any)["domain"]
 		if local["address"] != "localhost" || local["skipFallback"] != true || !reflect.DeepEqual(local["domains"], direct) {
 			t.Fatalf("%s: system resolver entry = %v", name, local)
 		}
@@ -287,8 +328,20 @@ func TestMask(t *testing.T) {
 	if got := v.Mask("bad id " + fakeUUID + " key " + fakeKey + " sid ab12"); got != "bad id *** key *** sid ***" {
 		t.Fatalf("got %q", got)
 	}
-	s := Profile{Kind: KindSOCKS5, Pass: "secret"}
-	if got := s.Mask("auth secret failed"); got != "auth *** failed" {
+	// The server's address and names never reach the screen (screenshots).
+	msg := "dial tcp server.example:8443: refused; sni www.example.org; host cdn.example.org"
+	if got := v.Mask(msg); got != "dial tcp ***:8443: refused; sni ***; host ***" {
+		t.Fatalf("got %q", got)
+	}
+	ip, err := FromLink(strings.Replace(xhttpLink, "server.example", "198.51.100.7", 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := ip.Mask("dial tcp 198.51.100.7:8443: i/o timeout"); got != "dial tcp ***:8443: i/o timeout" {
+		t.Fatalf("got %q", got)
+	}
+	s := Profile{Kind: KindSOCKS5, Host: "192.0.2.10", Port: 1080, User: "alice", Pass: "secret"}
+	if got := s.Mask("auth alice/secret to 192.0.2.10:1080 failed"); got != "auth ***/*** to ***:1080 failed" {
 		t.Fatalf("got %q", got)
 	}
 }

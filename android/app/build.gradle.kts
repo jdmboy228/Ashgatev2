@@ -45,4 +45,6 @@ dependencies {
     // The Go core with Xray: `gomobile bind` of ashgate-src/mobile, built in CI.
     implementation(files("libs/ashgate.aar"))
     implementation("androidx.security:security-crypto:1.0.0")
+    // JVM unit tests only (src/test); nothing of it goes into the APK.
+    testImplementation("junit:junit:4.13.2")
 }

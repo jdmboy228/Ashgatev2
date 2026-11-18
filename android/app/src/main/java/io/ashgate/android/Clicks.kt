@@ -3,13 +3,10 @@ package io.ashgate.android
 import android.os.SystemClock
 import android.view.View
 
-/** The last accepted tap on any button, shared so two quick taps never open two screens. */
-private var lastClick = 0L
+/** Shared by every button, so two quick taps never open two screens or connect twice. */
+private val taps = Debounce(500) { SystemClock.elapsedRealtime() }
 
-/** A click listener that ignores a second tap within 500 ms (double taps, taps during a transition). */
+/** A click listener that ignores a second tap within 500 ms. */
 fun View.onClick(action: (View) -> Unit) = setOnClickListener {
-    val now = SystemClock.elapsedRealtime()
-    if (now - lastClick < 500) return@setOnClickListener
-    lastClick = now
-    action(it)
+    if (taps.accept()) action(it)
 }

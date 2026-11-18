@@ -42,6 +42,7 @@ class ProfileActivity : Activity() {
         kind.setOnCheckedChangeListener { _, checked ->
             link.visibility = if (checked == R.id.kind_vless) View.VISIBLE else View.GONE
             proxy.visibility = if (checked == R.id.kind_vless) View.GONE else View.VISIBLE
+            findViewById<View>(R.id.proxy_note).visibility = proxy.visibility
         }
         kind.check(
             when (old?.optString("kind")) {
@@ -85,6 +86,7 @@ class ProfileActivity : Activity() {
         val form = listOf(R.id.name, R.id.host, R.id.port, R.id.user, R.id.pass).map(::text)
         // The subscription is downloaded here, so off the main thread.
         thread {
+            var changed = emptySet<String>()
             val failure = try {
                 val found: List<JSONObject> = when {
                     !vless -> listOf(
@@ -94,22 +96,33 @@ class ProfileActivity : Activity() {
                             ),
                         ),
                     )
-                    pasted.startsWith("http://", true) || pasted.startsWith("https://", true) -> {
-                        val arr = JSONArray(Mobile.parseSubscription(download(pasted)))
-                        List(arr.length()) { arr.getJSONObject(it) }
+                    else -> when (ProfileInput.kind(pasted)) {
+                        ProfileInput.Kind.INSECURE_SUBSCRIPTION -> throw Exception(getString(R.string.sub_insecure))
+                        ProfileInput.Kind.SUBSCRIPTION -> {
+                            val arr = JSONArray(Mobile.parseSubscription(download(pasted)))
+                            List(arr.length()) { arr.getJSONObject(it) }
+                        }
+                        ProfileInput.Kind.LINK -> listOf(JSONObject(Mobile.parseLink(pasted)))
                     }
-                    else -> listOf(JSONObject(Mobile.parseLink(pasted)))
                 }
-                // An edited profile keeps its place; a subscription's other servers are added.
-                id?.let { found[0].put("id", it) }
+                // An edited profile keeps its place. A server that is already
+                // saved (the same subscription imported again) is replaced
+                // instead of added a second time.
+                val saved = Store.profiles(this)
+                    .mapNotNull { p -> ProfileInput.serverKey(p.optString("link"))?.let { it to p.getString("id") } }
+                    .toMap()
+                val ids = ProfileInput.ids(saved, found.map { ProfileInput.serverKey(it.optString("link")) }, id)
+                found.forEachIndexed { i, p -> ids[i]?.let { p.put("id", it) } }
                 found.forEach { Store.put(this, it) }
+                changed = found.map { it.getString("id") }.toSet()
                 null
             } catch (e: Exception) {
                 e.message ?: e.javaClass.simpleName
             }
             runOnUiThread {
                 if (failure == null) {
-                    if (id != null && id == Store.selectedId(this)) reconnect()
+                    // The selected profile changed (edited, or replaced by a re-import).
+                    if (Store.selectedId(this)?.let { it in changed } == true) reconnect()
                     finish()
                 } else {
                     save.isEnabled = true

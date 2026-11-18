@@ -41,6 +41,9 @@ class MainActivity : Activity() {
     /** The dot breathes while connecting. */
     private var pulse: ObjectAnimator? = null
 
+    /** Between onStart and onStop: a late state callback must not start the pulse on a hidden screen. */
+    private var visible = false
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.main)
@@ -80,6 +83,7 @@ class MainActivity : Activity() {
 
     override fun onStart() {
         super.onStart()
+        visible = true
         TunnelService.listener = { runOnUiThread { showState(animate = true) } }
         // A notice whose cause was fixed on another screen (a profile or apps picked) goes away.
         if (notice == getString(R.string.need_profile) && Store.selected(this) != null ||
@@ -87,6 +91,7 @@ class MainActivity : Activity() {
         ) {
             notice = null
         }
+        if (Store.takeWiped(this)) notice = getString(R.string.store_wiped)
         showRows()
         showState(animate = false)
         // The same list the app picker shows; reading it takes a moment.
@@ -100,6 +105,7 @@ class MainActivity : Activity() {
     }
 
     override fun onStop() {
+        visible = false
         TunnelService.listener = null
         pulse?.cancel()
         pulse = null
@@ -119,6 +125,7 @@ class MainActivity : Activity() {
                 State.OFF -> R.string.state_off
                 State.STARTING -> R.string.state_starting
                 State.ON -> R.string.state_on
+                State.BLOCKED -> R.string.state_blocked
             },
         )
         swap(status, word.uppercase(Locale("ru")), null, animate)
@@ -128,12 +135,15 @@ class MainActivity : Activity() {
                     State.OFF -> R.color.ag_text3
                     State.STARTING -> R.color.ag_text2
                     State.ON -> R.color.ag_success
+                    State.BLOCKED -> R.color.ag_error
                 },
             ),
             animate,
         )
         // Not when animations are off in the system settings: an endless animation would stay frozen.
-        showPulse(state == State.STARTING && (Build.VERSION.SDK_INT < 26 || ValueAnimator.areAnimatorsEnabled()))
+        showPulse(
+            visible && state == State.STARTING && (Build.VERSION.SDK_INT < 26 || ValueAnimator.areAnimatorsEnabled()),
+        )
         showGlow(state == State.ON, animate)
         swap(
             title,
@@ -142,6 +152,7 @@ class MainActivity : Activity() {
                     State.OFF -> R.string.title_off
                     State.STARTING -> R.string.title_starting
                     State.ON -> R.string.title_on
+                    State.BLOCKED -> R.string.title_blocked
                 },
             ),
             null,
@@ -150,7 +161,12 @@ class MainActivity : Activity() {
         swap(toggleText, getString(if (state == State.OFF) R.string.connect else R.string.disconnect), null, animate)
 
         val n = Store.apps(this).size
-        val message = if (state == State.OFF) notice ?: TunnelService.error else null
+        val message = when (state) {
+            State.OFF -> notice ?: TunnelService.error
+            // Why the tunnel is down while the picked apps are cut off.
+            State.BLOCKED -> TunnelService.error ?: getString(R.string.blocked_note)
+            else -> null
+        }
         val text = when {
             message != null -> message
             state != State.OFF -> resources.getQuantityString(R.plurals.sub_on, n, n)

@@ -25,5 +25,13 @@
     <string name="save">Сохранить</string>
     <string name="delete">Удалить</string>
     <string name="sub_failed">Не удалось загрузить подписку</string>
+    <string name="sub_insecure">Подписка по http:// передала бы ключи серверов открытым текстом. Нужен адрес https://</string>
+    <string name="proxy_note">SOCKS5 и HTTP не шифруют трафик до прокси: провайдер видит адреса сайтов и логин.</string>
+    <string name="state_blocked">Нет соединения</string>
+    <string name="title_blocked">Трафик заблокирован</string>
+    <string name="blocked_note">Выбранные приложения без сети, пока туннель не заработает</string>
+    <string name="retry">Повторить</string>
+    <string name="vpn_revoked">VPN отключён системой или другим VPN-приложением</string>
+    <string name="store_wiped">Сохранённые профили не удалось прочитать (перенос на другой телефон или сбой хранилища ключей). Добавьте их заново.</string>
     <string name="channel">Подключение</string>
 </resources>
