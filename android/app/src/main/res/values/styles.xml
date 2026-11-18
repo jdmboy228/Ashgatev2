@@ -9,6 +9,7 @@
         <item name="android:colorAccent">@color/ag_accent</item>
         <item name="android:colorPrimary">@color/ag_bg</item>
         <item name="android:colorPrimaryDark">@color/ag_bg</item>
+        <item name="android:windowAnimationStyle">@style/ScreenAnimation</item>
     </style>
     <!-- The profile form is not in the design: it keeps its ActionBar, in the design's colors. -->
     <style name="AppTheme.Form" parent="android:Theme.Material">
@@ -17,5 +18,13 @@
         <item name="android:navigationBarColor">@color/ag_bg</item>
         <item name="android:colorPrimary">@color/ag_bg</item>
         <item name="android:colorAccent">@color/ag_accent</item>
+        <item name="android:windowAnimationStyle">@style/ScreenAnimation</item>
+    </style>
+    <!-- Screens slide in from the right and back out to it. Follows the system animation scale. -->
+    <style name="ScreenAnimation" parent="@android:style/Animation.Activity">
+        <item name="android:activityOpenEnterAnimation">@anim/screen_open_enter</item>
+        <item name="android:activityOpenExitAnimation">@anim/screen_open_exit</item>
+        <item name="android:activityCloseEnterAnimation">@anim/screen_close_enter</item>
+        <item name="android:activityCloseExitAnimation">@anim/screen_close_exit</item>
     </style>
 </resources>

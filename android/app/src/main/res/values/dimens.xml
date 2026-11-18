@@ -5,8 +5,8 @@
     <dimen name="ag_screen_h">24dp</dimen>              <!-- боковые поля контента -->
     <dimen name="ag_hairline">1dp</dimen>
     <dimen name="ag_appbar_h">56dp</dimen>
-    <dimen name="ag_appbar_start">16dp</dimen>
-    <dimen name="ag_back_touch">40dp</dimen>
+    <dimen name="ag_appbar_start">12dp</dimen>         <!-- 48dp touch target keeps the icon at x 24 -->
+    <dimen name="ag_back_touch">48dp</dimen>
     <dimen name="ag_back_icon">24dp</dimen>
 
     <!-- Главная кнопка -->

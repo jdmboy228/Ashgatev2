@@ -21,7 +21,7 @@ class ProfilesActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.profiles)
-        findViewById<View>(R.id.back).setOnClickListener { finish() }
+        findViewById<View>(R.id.back).onClick { finish() }
         findViewById<TextView>(R.id.title).apply { setText(R.string.profiles); typeface = Fonts.extrabold(context) }
         findViewById<TextView>(R.id.sub).apply { setText(R.string.profiles_sub); typeface = Fonts.medium(context) }
         Fonts.set(Fonts.medium(this), findViewById(R.id.empty))
@@ -30,21 +30,28 @@ class ProfilesActivity : Activity() {
         list = findViewById(R.id.list)
         list.emptyView = findViewById(R.id.empty)
         list.adapter = adapter
-        list.setOnItemClickListener { _, _, position, _ ->
+        list.setOnItemClickListener { _, row, position, _ ->
             val id = profiles[position].getString("id")
             if (id == Store.selectedId(this)) return@setOnItemClickListener
             Store.select(this, id)
             adapter.notifyDataSetChanged()
+            // The check fades in on the picked profile.
+            row.findViewById<View>(R.id.check).apply {
+                animate().cancel()
+                alpha = 0f
+                animate().alpha(1f).setDuration(200).start()
+            }
             // A running tunnel moves to the new profile.
             if (TunnelService.state != State.OFF) TunnelService.connect(this)
         }
         list.setOnItemLongClickListener { _, _, position, _ ->
+            // A tap on «Назад» or «Добавить» right before would open two screens.
             startActivity(
                 Intent(this, ProfileActivity::class.java).putExtra("id", profiles[position].getString("id")),
             )
             true
         }
-        findViewById<View>(R.id.add).setOnClickListener {
+        findViewById<View>(R.id.add).onClick {
             startActivity(Intent(this, ProfileActivity::class.java))
         }
     }

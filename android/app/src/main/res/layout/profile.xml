@@ -102,7 +102,7 @@
             android:layout_height="wrap_content"
             android:paddingTop="8dp"
             android:paddingBottom="8dp"
-            android:textColor="@color/accent"
+            android:textColor="@color/ag_error"
             android:visibility="gone" />
 
         <Button
@@ -117,7 +117,7 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:text="@string/delete"
-            android:textColor="@color/accent"
+            android:textColor="@color/ag_error"
             android:visibility="gone" />
     </LinearLayout>
 </ScrollView>

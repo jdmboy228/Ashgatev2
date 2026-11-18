@@ -31,7 +31,7 @@ class AppsActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.apps)
-        findViewById<View>(R.id.back).setOnClickListener { finish() }
+        findViewById<View>(R.id.back).onClick { finish() }
         findViewById<TextView>(R.id.title).apply { setText(R.string.apps); typeface = Fonts.extrabold(context) }
         findViewById<TextView>(R.id.sub).apply { setText(R.string.apps_sub); typeface = Fonts.medium(context) }
         val list = findViewById<ListView>(R.id.list)
@@ -46,14 +46,27 @@ class AppsActivity : Activity() {
             runOnUiThread {
                 val adapter = Adapter(apps, chosen)
                 list.adapter = adapter
-                list.setOnItemClickListener { _, _, position, _ ->
+                // The list fades in instead of popping up once it is read.
+                list.alpha = 0f
+                list.animate().alpha(1f).setDuration(200).start()
+                list.setOnItemClickListener { _, row, position, _ ->
                     val app = adapter.getItem(position) as? App ?: return@setOnItemClickListener
                     if (!chosen.remove(app.pkg)) chosen.add(app.pkg)
                     Store.saveApps(this, chosen.toSet())
                     adapter.notifyDataSetChanged()
+                    pop(row.findViewById(R.id.check))
                 }
             }
         }
+    }
+
+    /** The check circle grows back from a little smaller when it flips. */
+    private fun pop(check: View) {
+        check.animate().cancel()
+        check.scaleX = 0.75f
+        check.scaleY = 0.75f
+        check.animate().scaleX(1f).scaleY(1f).setDuration(200)
+            .setInterpolator(android.view.animation.OvershootInterpolator(2f)).start()
     }
 
     override fun onPause() {
