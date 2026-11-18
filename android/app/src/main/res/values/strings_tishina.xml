@@ -10,18 +10,18 @@
 
     <!-- Главная: строка под заголовком. В макете «6 приложений идут через Швецию»;
          склонять название профиля автоматически нельзя, поэтому «через туннель». -->
-    <plurals name="sub_on">
-        <item quantity="one">%d приложение идёт через туннель</item>
-        <item quantity="few">%d приложения идут через туннель</item>
-        <item quantity="many">%d приложений идут через туннель</item>
-        <item quantity="other">%d приложения идут через туннель</item>
-    </plurals>
-    <plurals name="sub_off">                                              <!-- derived -->
-        <item quantity="one">%d приложение пойдёт через туннель</item>
-        <item quantity="few">%d приложения пойдут через туннель</item>
-        <item quantity="many">%d приложений пойдут через туннель</item>
-        <item quantity="other">%d приложения пойдут через туннель</item>
-    </plurals>
+    <!-- one / few / many: picked by RuPlural, not by the phone language. -->
+    <string-array name="sub_on">
+        <item>%d приложение идёт через туннель</item>
+        <item>%d приложения идут через туннель</item>
+        <item>%d приложений идут через туннель</item>
+    </string-array>
+    <!-- derived; one / few / many as above -->
+    <string-array name="sub_off">
+        <item>%d приложение пойдёт через туннель</item>
+        <item>%d приложения пойдут через туннель</item>
+        <item>%d приложений пойдут через туннель</item>
+    </string-array>
 
     <!-- Главная: строки -->
     <string name="row_russia">Россия</string>

@@ -47,6 +47,37 @@ tap() {
   sleep 1
 }
 
+# tap_below BY VALUE: like tap, but scrolls the screen up if the view is
+# under the fold (short emulator screen).
+tap_below() {
+  local xy size w h
+  for _ in 1 2 3 4; do
+    dump
+    if xy=$(python3 "$HERE/ui.py" "$OUT/ui.xml" "$1" "$2"); then
+      # shellcheck disable=SC2086
+      adb shell input tap $xy
+      sleep 1
+      return 0
+    fi
+    size=$(adb shell wm size | tr -d '\r' | awk '{print $NF}')
+    w=${size%x*}; h=${size#*x}
+    adb shell input swipe $((w / 2)) $((h * 6 / 10)) $((w / 2)) $((h * 3 / 10)) 300
+    sleep 1
+  done
+  fail "no view with $1 «$2», even after scrolling"
+}
+
+# Back to the top of a scrolled screen.
+scroll_top() {
+  local size w h
+  size=$(adb shell wm size | tr -d '\r' | awk '{print $NF}')
+  w=${size%x*}; h=${size#*x}
+  for _ in 1 2; do
+    adb shell input swipe $((w / 2)) $((h * 3 / 10)) $((w / 2)) $((h * 7 / 10)) 300
+  done
+  sleep 1
+}
+
 expect() {
   locate "$1" "$2" >/dev/null || fail "expected $1 «$2» on screen"
 }
@@ -71,7 +102,7 @@ expect text "Туннель выключен"
 shot 1-main-off
 
 # A profile: Профиль → Добавить профиль → paste the link → Сохранить.
-tap text "Профиль"
+tap_below text "Профиль"
 expect text "Профили"
 tap text "Добавить профиль"
 tap id "$PKG:id/link"
@@ -85,13 +116,14 @@ shot 2-profiles
 adb shell input keyevent KEYCODE_BACK
 
 # An app: Приложения → the first one in the list.
-tap text "Приложения"
+tap_below text "Приложения"
 expect text "Через туннель идут только отмеченные"
 tap id "$PKG:id/name"
 shot 3-apps
 adb shell input keyevent KEYCODE_BACK
 
 # Connect: the VPN interface comes up with the tunnel's address.
+scroll_top
 tap text "Подключить"
 expect text "ПОДКЛЮЧЕНО"
 expect text "Туннель включён"

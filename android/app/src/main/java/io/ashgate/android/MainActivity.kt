@@ -169,9 +169,9 @@ class MainActivity : Activity() {
         }
         val text = when {
             message != null -> message
-            state != State.OFF -> resources.getQuantityString(R.plurals.sub_on, n, n)
+            state != State.OFF -> RuPlural.pick(resources.getStringArray(R.array.sub_on), n).format(n)
             Store.profiles(this).isEmpty() -> getString(R.string.no_profiles)
-            else -> resources.getQuantityString(R.plurals.sub_off, n, n)
+            else -> RuPlural.pick(resources.getStringArray(R.array.sub_off), n).format(n)
         }
         swap(sub, text, getColor(if (message != null) R.color.ag_error else R.color.ag_text2), animate)
     }
