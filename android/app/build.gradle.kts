@@ -13,8 +13,14 @@ android {
         targetSdk = 34
         versionCode = 1
         versionName = "0.1.0"
-        ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
+        // 64-bit ARM only: nearly every phone in use runs it (32-bit-only
+        // phones are left out); a second copy of the Go core for
+        // armeabi-v7a doubled the APK.
+        ndk { abiFilters += listOf("arm64-v8a") }
     }
+    // The Go core is stored compressed in the APK (half the download) and
+    // unpacked once at install.
+    packaging { jniLibs { useLegacyPackaging = true } }
     // CI signs the release with the keystore from GitHub secrets, so every
     // build has the same signature and installs over the previous one.
     val keystore = System.getenv("ANDROID_KEYSTORE_FILE")
@@ -29,7 +35,10 @@ android {
     }
     buildTypes {
         release {
-            isMinifyEnabled = false
+            // R8 drops unused Kotlin/AndroidX code; proguard-rules.pro keeps
+            // the gomobile bindings the Go core calls through JNI.
+            isMinifyEnabled = true
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
             signingConfig = signingConfigs.findByName("release")
         }
     }
