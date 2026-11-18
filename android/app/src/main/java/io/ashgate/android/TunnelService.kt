@@ -15,6 +15,7 @@ import android.net.Network
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
+import android.util.Log
 import io.ashgate.mobile.Mobile
 import org.json.JSONObject
 import java.io.File
@@ -55,6 +56,17 @@ class TunnelService : VpnService() {
          * new instance starts while the old one is being cleaned up.
          */
         private val worker = Executors.newSingleThreadScheduledExecutor()
+
+        /** The executor would keep an exception to itself. Only its type is logged: messages may quote a server. */
+        private fun onWorker(block: () -> Unit) {
+            worker.execute {
+                try {
+                    block()
+                } catch (e: Exception) {
+                    Log.e("Ashgate", "tunnel task failed: " + e.javaClass.name)
+                }
+            }
+        }
 
         @Volatile
         var state = State.OFF
@@ -106,7 +118,7 @@ class TunnelService : VpnService() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         lastStartId = startId
         val disconnect = intent?.action == DISCONNECT
-        worker.execute {
+        onWorker {
             when {
                 disconnect -> stop(null)
                 // Also RETRY from the notification, the system's start of an
@@ -127,11 +139,11 @@ class TunnelService : VpnService() {
 
     /** Runs on [worker]; a callback that arrives after onDestroy is dropped. */
     private fun later(block: () -> Unit) {
-        worker.execute { if (!destroyed) block() }
+        onWorker { if (!destroyed) block() }
     }
 
     override fun onDestroy() {
-        worker.execute {
+        onWorker {
             destroyed = true
             cancelRestart()
             unwatch()
@@ -252,9 +264,10 @@ class TunnelService : VpnService() {
     private fun fail(reason: String) {
         if (tun == null) return stop(reason)
         Mobile.stop()
+        // First: the screen must say so whatever happens below.
+        set(State.BLOCKED, reason)
         watch() // a new network retries by itself
         foreground(blocked = true)
-        set(State.BLOCKED, reason)
     }
 
     private fun stop(reason: String?) {
@@ -293,8 +306,6 @@ class TunnelService : VpnService() {
         watchInstalls()
         if (watching != null) return
         val manager = getSystemService(ConnectivityManager::class.java)
-        // The callback first reports the current network, which is no change.
-        network = manager.activeNetwork
         val callback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(n: Network) {
                 later {
@@ -305,6 +316,8 @@ class TunnelService : VpnService() {
             }
         }
         try {
+            // The callback first reports the current network, which is no change.
+            network = manager.activeNetwork
             manager.registerDefaultNetworkCallback(callback)
             watching = callback
         } catch (e: Exception) {
@@ -325,12 +338,16 @@ class TunnelService : VpnService() {
             }
         }
         val filter = IntentFilter(Intent.ACTION_PACKAGE_ADDED).apply { addDataScheme("package") }
-        if (Build.VERSION.SDK_INT >= 33) {
-            registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
-        } else {
-            registerReceiver(receiver, filter)
+        try {
+            if (Build.VERSION.SDK_INT >= 33) {
+                registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
+            } else {
+                registerReceiver(receiver, filter)
+            }
+            installs = receiver
+        } catch (e: Exception) {
+            // Too many receivers in the process; the tunnel works without it.
         }
-        installs = receiver
     }
 
     private fun unwatch() {
