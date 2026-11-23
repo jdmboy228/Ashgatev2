@@ -72,7 +72,7 @@ class ProfileActivity : Activity() {
             }
             delete.apply {
                 visibility = View.VISIBLE
-                setOnClickListener {
+                onClick {
                     closed = true
                     val wasSelected = Store.selectedId(this@ProfileActivity) == this@ProfileActivity.id
                     Store.delete(this@ProfileActivity, this@ProfileActivity.id!!)
@@ -81,7 +81,7 @@ class ProfileActivity : Activity() {
                 }
             }
         }
-        save.setOnClickListener { save() }
+        save.onClick { save() }
     }
 
     override fun onDestroy() {

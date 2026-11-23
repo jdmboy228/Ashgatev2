@@ -52,9 +52,11 @@ class ProfilesActivity : Activity() {
         }
         list.setOnItemLongClickListener { _, _, position, _ ->
             // A tap on «Назад» or «Добавить» right before would open two screens.
-            startActivity(
-                Intent(this, ProfileActivity::class.java).putExtra("id", profiles[position].getString("id")),
-            )
+            if (allowTap()) {
+                startActivity(
+                    Intent(this, ProfileActivity::class.java).putExtra("id", profiles[position].getString("id")),
+                )
+            }
             true
         }
         findViewById<View>(R.id.add).onClick {
