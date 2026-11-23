@@ -43,4 +43,13 @@ func TestExplainRussianFailures(t *testing.T) {
 	if Explain(plain) != plain {
 		t.Fatal(Explain(plain))
 	}
+	clearLog()
+	pushLog("[Info] transport/internet/splithttp: unexpected status 404")
+	if got := Explain(errors.New("io: read/write on closed pipe")); got.Error() != "VLESS: сервер отклонил запрос XHTTP. Проверьте path и host" {
+		t.Fatal(got)
+	}
+	clearLog()
+	if got := Explain(errors.New("dial tcp: lookup bad.invalid: no such host")); got.Error() != "VLESS: не удалось найти адрес сервера" {
+		t.Fatal(got)
+	}
 }

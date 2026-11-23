@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	xnet "github.com/xtls/xray-core/common/net"
@@ -136,5 +138,28 @@ func TestRouter(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestFormatErrorAndCheckNotRunning(t *testing.T) {
+	Stop()
+	if err := Check(); err == nil {
+		t.Fatal("Check succeeded when nothing runs")
+	}
+	v, err := mobilecfg.FromLink(fakeLink)
+	if err != nil {
+		t.Fatal(err)
+	}
+	masked := formatError(v, errors.New("VLESS: dial server.example:8443 sni www.example.org"))
+	if strings.Contains(masked.Error(), "server.example") || strings.Contains(masked.Error(), "www.example.org") {
+		t.Fatalf("unmasked VLESS error: %v", masked)
+	}
+	px, err := mobilecfg.Proxy("socks5", "", "192.0.2.10", 1080, "alice", "secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pxErr := formatError(px, errors.New("VLESS: сервер отклонил соединение (192.0.2.10)"))
+	if !strings.HasPrefix(pxErr.Error(), "Прокси: ") || strings.Contains(pxErr.Error(), "192.0.2.10") {
+		t.Fatalf("unexpected proxy error format: %v", pxErr)
 	}
 }

@@ -265,3 +265,204 @@ func TestUDPBurstIsNotDropped(t *testing.T) {
 		t.Fatal("Recv after Close")
 	}
 }
+
+// TestVerifyAndCheckXHTTPReality verifies that vless.Run + vless.Verify only
+// succeeds when a VLESS+XHTTP+REALITY tunnel connects and passes two
+// consecutive probes stably, and returns specific Russian error messages for
+// connection refused, wrong REALITY publicKey, wrong XHTTP path, wrong UUID,
+// unstable connections that drop after the first probe, and mid-session
+// server shutdown (Check).
+func TestVerifyAndCheckXHTTPReality(t *testing.T) {
+	const (
+		uuid = "22222222-2222-4222-8222-222222222222"
+		priv = realityPrivate
+		pub  = realityPublic
+		sid  = realityShort
+		sni  = realitySNI
+	)
+	dest := tlsDest(t)
+	port := mustFree(t)
+	stopServer, err := vless.StartRaw(mustServer(t, map[string]any{
+		"log": map[string]any{"loglevel": "info"},
+		"inbounds": []any{map[string]any{
+			"listen": "127.0.0.1", "port": port, "protocol": "vless",
+			"settings": map[string]any{
+				"decryption": "none",
+				"clients":    []any{map[string]any{"id": uuid}},
+			},
+			"streamSettings": map[string]any{
+				"network": "xhttp", "security": "reality",
+				"xhttpSettings": map[string]any{"path": "/xh", "mode": "auto"},
+				"realitySettings": map[string]any{
+					"dest": dest, "serverNames": []string{sni},
+					"privateKey": priv, "shortIds": []string{sid},
+				},
+			},
+		}},
+		"outbounds": []any{testFreedom},
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(stopServer)
+
+	// Local HTTP 204 target that can also simulate instability (fail after 1st 204).
+	probeLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = probeLn.Close() })
+	var dropAfterFirst bool
+	var probeHits int
+	go func() {
+		for {
+			c, err := probeLn.Accept()
+			if err != nil {
+				return
+			}
+			probeHits++
+			hit := probeHits
+			if dropAfterFirst && hit > 1 {
+				_ = c.Close()
+				continue
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+				b := make([]byte, 512)
+				_, _ = conn.Read(b)
+				_, _ = io.WriteString(conn, "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+			}(c)
+		}
+	}()
+
+	pHost, pPort := splitHostPort(t, probeLn.Addr().String())
+	oldHost, oldPort, oldPause, oldWait := vless.ProbeHost, vless.ProbePort, vless.ProbePause, vless.ProbeWait
+	vless.ProbeHost, vless.ProbePort = pHost, pPort
+	vless.ProbePause, vless.ProbeWait = 20*time.Millisecond, 8*time.Second
+	t.Cleanup(func() {
+		vless.ProbeHost, vless.ProbePort = oldHost, oldPort
+		vless.ProbePause, vless.ProbeWait = oldPause, oldWait
+	})
+
+	clientDoc := func(srvAddr string, p vless.Params) []byte {
+		out, err := vless.Outbound(srvAddr, port, p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if h, pStr, err := net.SplitHostPort(srvAddr); err == nil {
+			pNum, _ := net.LookupPort("tcp", pStr)
+			out, err = vless.Outbound(h, pNum, p)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		return mustServer(t, map[string]any{
+			"log":       map[string]any{"access": "none", "error": "none", "loglevel": "none"},
+			"outbounds": []any{out},
+		})
+	}
+
+	goodParams := vless.Params{
+		UUID: uuid, Network: "xhttp", Security: "reality",
+		SNI: sni, PublicKey: pub, ShortID: sid, Path: "/xh", Mode: "auto",
+	}
+
+	// 1. Healthy & stable server passes Verify (at least 2 probes) and Check.
+	probeHits = 0
+	inst, err := vless.Run(clientDoc(net.JoinHostPort("127.0.0.1", itoa(port)), goodParams))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := vless.Verify(inst); err != nil {
+		_ = inst.Close()
+		t.Fatalf("Verify healthy: %v (hits=%d)\nlog:\n%s", err, probeHits, vless.RecentLog(time.Now().Add(-10*time.Second)))
+	}
+	if probeHits < 2 {
+		_ = inst.Close()
+		t.Fatalf("Verify made %d probes, want at least 2 for stability", probeHits)
+	}
+	if err := vless.Check(inst); err != nil {
+		_ = inst.Close()
+		t.Fatalf("Check healthy: %v", err)
+	}
+	_ = inst.Close()
+
+	// 2. Unstable server (succeeds on first probe, drops subsequent probes) fails Verify.
+	dropAfterFirst = true
+	probeHits = 0
+	inst, err = vless.Run(clientDoc(net.JoinHostPort("127.0.0.1", itoa(port)), goodParams))
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = vless.Verify(inst)
+	_ = inst.Close()
+	dropAfterFirst = false
+	if err == nil || err.Error() != "VLESS: соединение нестабильно (оборвалось после подключения)" {
+		t.Fatalf("Verify unstable: got %v", err)
+	}
+
+	// 3. Wrong XHTTP path -> HTTP 404 from server -> specific XHTTP error.
+	badPath := goodParams
+	badPath.Path = "/wrong-path"
+	inst, err = vless.Run(clientDoc(net.JoinHostPort("127.0.0.1", itoa(port)), badPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = vless.Verify(inst)
+	_ = inst.Close()
+	if err == nil || err.Error() != "VLESS: сервер отклонил запрос XHTTP. Проверьте path и host" {
+		t.Fatalf("Verify bad path: got %v", err)
+	}
+
+	// 4. Wrong REALITY public key -> specific REALITY/auth error.
+	badKey := goodParams
+	badKey.PublicKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	inst, err = vless.Run(clientDoc(net.JoinHostPort("127.0.0.1", itoa(port)), badKey))
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = vless.Verify(inst)
+	_ = inst.Close()
+	if err == nil || !wrongKeyExplained(err) {
+		t.Fatalf("Verify bad REALITY key: got %v", err)
+	}
+
+	// 5. Wrong VLESS UUID -> server closes stream without answering.
+	badUUID := goodParams
+	badUUID.UUID = "99999999-9999-4999-8999-999999999999"
+	inst, err = vless.Run(clientDoc(net.JoinHostPort("127.0.0.1", itoa(port)), badUUID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = vless.Verify(inst)
+	_ = inst.Close()
+	if err == nil || err.Error() != "VLESS: сервер не ответил. Проверьте адрес и порт сервера, UUID и ключи" {
+		t.Fatalf("Verify bad UUID: got %v", err)
+	}
+
+	// 6. Unreachable port (connection refused) -> specific refusal error.
+	inst, err = vless.Run(clientDoc(deadServer(t), goodParams))
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = vless.Verify(inst)
+	_ = inst.Close()
+	if err == nil || err.Error() != "VLESS: сервер отклонил соединение" {
+		t.Fatalf("Verify dead server: got %v", err)
+	}
+
+	// 7. Connected tunnel whose VLESS server stops later -> Check detects failure.
+	inst, err = vless.Run(clientDoc(net.JoinHostPort("127.0.0.1", itoa(port)), goodParams))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer inst.Close()
+	if err := vless.Verify(inst); err != nil {
+		t.Fatalf("Verify before stop: %v", err)
+	}
+	stopServer()
+	if err := vless.Check(inst); err == nil {
+		t.Fatal("Check succeeded after VLESS server stopped")
+	}
+}

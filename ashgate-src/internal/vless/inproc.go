@@ -121,6 +121,46 @@ func DialTCP(addr, host string, port uint16) (net.Conn, error) {
 	return c, nil
 }
 
+// dialInstance opens an in-process TCP connection through inst with the given
+// inbound tag (e.g. "tun"), routed by inst's routing table.
+func dialInstance(parent context.Context, inst *instance, inboundTag, host string, port uint16) (net.Conn, error) {
+	if inst == nil {
+		return nil, errors.New("VLESS: локальный мост не запущен")
+	}
+	d, ok := inst.GetFeature(routing.DispatcherType()).(routing.Dispatcher)
+	if !ok {
+		return nil, errors.New("VLESS: локальный мост не запущен")
+	}
+	if host == "" || port == 0 {
+		return nil, errors.New("VLESS: неверный адрес назначения")
+	}
+	ctx, cancel := context.WithCancel(parent)
+	c := &tcpConn{cancel: cancel, ob: &session.Outbound{}}
+	ctx = context.WithValue(ctx, core.XrayKey(1), inst)
+	ctx = xctx.ContextWithID(ctx, session.NewID())
+	ctx = session.ContextWithInbound(ctx, &session.Inbound{Tag: inboundTag, Name: inboundTag, CanSpliceCopy: 3})
+	if pm, ok := inst.GetFeature(policy.ManagerType()).(policy.Manager); ok {
+		ctx = policy.ContextWithBufferPolicy(ctx, pm.ForLevel(0).Buffer)
+	}
+	ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{c.ob})
+	ctx = session.TrackedConnectionError(ctx, c)
+	link, err := d.Dispatch(ctx, xnet.TCPDestination(xnet.ParseAddress(host), xnet.Port(port)))
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	r, ok := link.Reader.(*pipe.Reader)
+	if !ok {
+		cancel()
+		common.Interrupt(link.Reader)
+		common.Interrupt(link.Writer)
+		return nil, errors.New("VLESS: неожиданный канал Xray")
+	}
+	c.r, c.w = r, link.Writer
+	c.remote = &net.TCPAddr{IP: net.ParseIP(host), Port: int(port)}
+	return c, nil
+}
+
 // errWake makes a Read blocked in the pipe look at its deadline again.
 var errWake = errors.New("vless: wake")
 
@@ -648,6 +688,9 @@ func (d gateDialer) Dial(ctx context.Context, src xnet.Address, dest xnet.Destin
 	if g == nil {
 		conn, err := d.base.Dial(ctx, src, dest, sockopt)
 		if err != nil {
+			if tr != nil && ctx.Err() == nil {
+				pushLog(err.Error())
+			}
 			return nil, err
 		}
 		if tr != nil {
@@ -660,6 +703,9 @@ func (d gateDialer) Dial(ctx context.Context, src xnet.Address, dest xnet.Destin
 	}
 	conn, err := d.base.Dial(ctx, src, dest, sockopt)
 	if err != nil {
+		if tr != nil && ctx.Err() == nil {
+			pushLog(err.Error())
+		}
 		g.release(ctx.Err() == nil)
 		return nil, err
 	}

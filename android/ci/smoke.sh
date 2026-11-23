@@ -122,14 +122,15 @@ tap id "$PKG:id/name"
 shot 3-apps
 adb shell input keyevent KEYCODE_BACK
 
-# Connect: the VPN interface comes up with the tunnel's address.
+# Connect to the fake VLESS server: the VPN interface comes up (blocking leaks),
+# and the screen reports the connection failure instead of «Туннель включён».
 scroll_top
 tap text "Подключить"
-expect text "ПОДКЛЮЧЕНО"
-expect text "Туннель включён"
+expect text "НЕТ СОЕДИНЕНИЯ"
+expect text "Трафик заблокирован"
 sleep 2
 adb shell ip addr | grep -q "10.111.222.1" || fail "no VPN interface with 10.111.222.1"
-shot 4-main-on
+shot 4-main-blocked
 no_crash
 
 # Disconnect: the interface goes away.

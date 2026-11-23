@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 
 	"ashgate/internal/mobilecfg"
@@ -52,13 +53,24 @@ func encode(v any) (string, error) {
 }
 
 var (
-	mu      sync.Mutex
-	running io.Closer
+	mu            sync.Mutex
+	running       io.Closer
+	activeProfile mobilecfg.Profile
+	gen           uint64
 )
 
-// Start runs Xray for a profile on the TUN descriptor fd. Xray reads a
-// duplicate, so the caller still owns and closes fd. assetDir holds
-// geoip.dat and geosite.dat.
+func formatError(p mobilecfg.Profile, err error) error {
+	msg := p.Mask(err.Error())
+	if p.Kind != mobilecfg.KindVLESS && strings.HasPrefix(msg, "VLESS: ") {
+		msg = "Прокси: " + strings.TrimPrefix(msg, "VLESS: ")
+	}
+	return errors.New(msg)
+}
+
+// Start runs Xray for a profile on the TUN descriptor fd and verifies that
+// the connection through the proxy server is up and stable before returning.
+// Xray reads a duplicate, so the caller still owns and closes fd. assetDir
+// holds geosite.dat.
 func Start(profileJSON string, fd int, assetDir string) error {
 	var p mobilecfg.Profile
 	if err := json.Unmarshal([]byte(profileJSON), &p); err != nil {
@@ -69,27 +81,72 @@ func Start(profileJSON string, fd int, assetDir string) error {
 		return err
 	}
 	mu.Lock()
-	defer mu.Unlock()
-	if running != nil {
-		_ = running.Close()
-		running = nil
+	gen++
+	myGen := gen
+	prev := running
+	running = nil
+	activeProfile = mobilecfg.Profile{}
+	if prev != nil {
+		_ = prev.Close()
 	}
 	os.Setenv("xray.location.asset", assetDir)
 	os.Setenv("xray.tun.fd", strconv.Itoa(fd))
 	inst, err := vless.Run(raw)
 	if err != nil {
+		mu.Unlock()
 		return errors.New("Не удалось запустить Xray: " + p.Mask(err.Error()))
 	}
 	running = inst
+	activeProfile = p
+	mu.Unlock()
+
+	if err := vless.Verify(inst); err != nil {
+		_ = inst.Close()
+		mu.Lock()
+		if running == inst {
+			running = nil
+			activeProfile = mobilecfg.Profile{}
+		}
+		mu.Unlock()
+		return formatError(p, err)
+	}
+	mu.Lock()
+	if gen != myGen || running != inst {
+		mu.Unlock()
+		_ = inst.Close()
+		return errors.New("Подключение отменено")
+	}
+	mu.Unlock()
 	return nil
 }
 
-// Stop ends Xray. It is safe to call when nothing runs.
+// Check verifies that the running tunnel still passes traffic through its
+// proxy server. It returns an error when nothing runs or the server stopped
+// answering.
+func Check() error {
+	mu.Lock()
+	inst := running
+	p := activeProfile
+	mu.Unlock()
+	if inst == nil {
+		return errors.New("Туннель не запущен")
+	}
+	if err := vless.Check(inst); err != nil {
+		return formatError(p, err)
+	}
+	return nil
+}
+
+// Stop ends Xray and aborts any in-flight Start or Check. It is safe to call
+// when nothing runs.
 func Stop() {
 	mu.Lock()
-	defer mu.Unlock()
-	if running != nil {
-		_ = running.Close()
-		running = nil
+	gen++
+	r := running
+	running = nil
+	activeProfile = mobilecfg.Profile{}
+	mu.Unlock()
+	if r != nil {
+		_ = r.Close()
 	}
 }

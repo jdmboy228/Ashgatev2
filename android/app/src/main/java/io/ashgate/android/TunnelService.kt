@@ -50,6 +50,9 @@ class TunnelService : VpnService() {
         /** Changes that come together (a network flapping, quick taps) make one restart. */
         private const val RESTART_DELAY_MS = 1000L
 
+        /** How often a running tunnel is checked so a dropped VLESS connection leaves State.ON. */
+        private const val HEALTH_INTERVAL_MS = 15_000L
+
         /**
          * One thread for every instance of the service, as the Go core is one
          * per process: connects and disconnects never overlap, even when a
@@ -110,6 +113,11 @@ class TunnelService : VpnService() {
     /** The restart waiting to run, and whether it must rebuild the interface too. */
     private var restart: ScheduledFuture<*>? = null
     private var restartFull = false
+    private var healthCheck: ScheduledFuture<*>? = null
+
+    /** Incremented on every command so an aborted in-flight start or check is ignored. */
+    @Volatile
+    private var commandSeq = 0
 
     /** Set once this instance is cleaned up: what it scheduled no longer runs. */
     private var destroyed = false
@@ -123,6 +131,11 @@ class TunnelService : VpnService() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val disconnect = intent?.action == DISCONNECT
         val systemStart = intent == null || intent.action == SERVICE_INTERFACE
+        commandSeq++
+        if (disconnect || state == State.STARTING) {
+            // Unblock worker at once if it is waiting on an unreachable server inside Mobile.start.
+            Mobile.stop()
+        }
         onWorker {
             lastStartId = startId
             if (systemStart) expectedUp = true
@@ -154,9 +167,12 @@ class TunnelService : VpnService() {
     }
 
     override fun onDestroy() {
+        commandSeq++
+        Mobile.stop()
         onWorker {
             destroyed = true
             cancelRestart()
+            cancelHealthCheck()
             unwatch()
             close()
             set(State.OFF, error)
@@ -255,15 +271,51 @@ class TunnelService : VpnService() {
     }
 
     private fun runXray(profile: JSONObject, fd: ParcelFileDescriptor) {
+        val seq = commandSeq
+        cancelHealthCheck()
         try {
-            // Stops the previous Xray, if any, and starts one on this interface.
+            // Stops the previous Xray, if any, starts one on this interface, and
+            // verifies that the VLESS/proxy connection is up and stable.
             Mobile.start(profile.toString(), fd.fd.toLong(), geodata().path)
         } catch (e: Exception) {
+            if (destroyed || seq != commandSeq) return
             return fail(e.message ?: e.javaClass.simpleName)
+        }
+        if (destroyed || seq != commandSeq) {
+            Mobile.stop()
+            return
         }
         watch()
         foreground(blocked = false)
         set(State.ON)
+        scheduleHealthCheck(seq)
+    }
+
+    private fun scheduleHealthCheck(seq: Int) {
+        cancelHealthCheck()
+        healthCheck = worker.schedule(
+            Runnable {
+                healthCheck = null
+                if (destroyed || seq != commandSeq || state != State.ON) return@Runnable
+                try {
+                    Mobile.check()
+                } catch (e: Exception) {
+                    if (destroyed || seq != commandSeq || state != State.ON) return@Runnable
+                    fail(e.message ?: e.javaClass.simpleName)
+                    return@Runnable
+                }
+                if (!destroyed && seq == commandSeq && state == State.ON) {
+                    scheduleHealthCheck(seq)
+                }
+            },
+            HEALTH_INTERVAL_MS,
+            TimeUnit.MILLISECONDS,
+        )
+    }
+
+    private fun cancelHealthCheck() {
+        healthCheck?.cancel(false)
+        healthCheck = null
     }
 
     /**
@@ -272,6 +324,7 @@ class TunnelService : VpnService() {
      * With no interface yet nothing can leak, so the service just ends.
      */
     private fun fail(reason: String) {
+        cancelHealthCheck()
         if (tun == null) return stop(reason)
         Mobile.stop()
         // First: the screen must say so whatever happens below.
@@ -284,6 +337,7 @@ class TunnelService : VpnService() {
         val wasUp = tun != null || expectedUp
         expectedUp = false
         cancelRestart()
+        cancelHealthCheck()
         unwatch()
         close()
         set(State.OFF, reason)
