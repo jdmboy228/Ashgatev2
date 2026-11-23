@@ -340,7 +340,7 @@ func TestDNSThroughTunnel(t *testing.T) {
 		// same list as the routing rule, and no fallback to it or from it.
 		local := servers[0].(map[string]any)
 		direct := d["routing"].(map[string]any)["rules"].([]any)[5].(map[string]any)["domain"]
-		if local["address"] != "localhost" || local["skipFallback"] != true || local["finalQuery"] != true || dns["disableFallbackIfMatch"] != true || !reflect.DeepEqual(local["domains"], direct) {
+		if local["address"] != "localhost" || local["skipFallback"] != true || local["finalQuery"] != true || dns["disableFallbackIfMatch"] != true || dns["enableParallelQuery"] != true || !reflect.DeepEqual(local["domains"], direct) {
 			t.Fatalf("%s: system resolver entry = %v (dns = %v)", name, local, dns)
 		}
 		// Every other name goes to DoH, which leaves through the proxy.

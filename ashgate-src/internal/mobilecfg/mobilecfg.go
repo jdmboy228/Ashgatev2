@@ -309,7 +309,10 @@ func XrayJSON(p Profile) ([]byte, error) {
 		// cannot leak around the tunnel, while DNS answers AAAA with NODATA
 		// so apps do not pick IPv6 via the TUN's instant local SYN-ACK and
 		// fail on IPv4-only networks or IPv4-only proxy servers.
-		"dns": map[string]any{"tag": TagDNSIn, "servers": servers, "queryStrategy": "UseIPv4", "disableFallbackIfMatch": true},
+		"dns": map[string]any{
+			"tag": TagDNSIn, "servers": servers, "queryStrategy": "UseIPv4",
+			"disableFallbackIfMatch": true, "enableParallelQuery": true,
+		},
 		"inbounds": []any{tun},
 		"outbounds": []any{
 			proxy,
