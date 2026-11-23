@@ -103,7 +103,6 @@ func Run(configPath string, startCapture bool) error {
 	// Registered before anything below can fail, so an early return still
 	// stops capture and the VLESS bridges and closes the log.
 	defer func() {
-		_ = h.ctrl.stop()
 		h.ctrl.shutdown()
 		if h.logs != nil {
 			_ = h.logs.Close()
@@ -501,7 +500,6 @@ func hostQuit() {
 	}
 	if h.w == nil {
 		if h.ctrl != nil {
-			_ = h.ctrl.stop()
 			h.ctrl.shutdown()
 		}
 		exit()
@@ -509,7 +507,6 @@ func hostQuit() {
 	}
 	go func() {
 		if h.ctrl != nil {
-			_ = h.ctrl.stop()
 			h.ctrl.shutdown()
 		}
 		h.w.Dispatch(exit)

@@ -30,6 +30,12 @@ type Session struct {
 	failed chan struct{}
 }
 
+// NewFakeSession builds a session backed by cancel and done (no driver).
+// Tests in other packages use it to exercise lifecycle races.
+func NewFakeSession(cancel context.CancelFunc, done chan struct{}) *Session {
+	return &Session{cancel: cancel, done: done}
+}
+
 // Apply installs a new configuration. Existing TCP flows keep their proxy.
 func (s *Session) Apply(cfg *config.Config) error {
 	if s == nil || s.eng == nil {
