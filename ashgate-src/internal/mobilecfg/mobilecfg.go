@@ -288,7 +288,7 @@ func XrayJSON(p Profile) ([]byte, error) {
 	// resolver (Ashgate is outside the tunnel, so that is the network's
 	// DNS, and Russian sites give their local answers); every other name
 	// is resolved by DNSServers through the proxy and never falls back.
-	servers := []any{map[string]any{"address": "localhost", "domains": DirectDomains(), "skipFallback": true}}
+	servers := []any{map[string]any{"address": "localhost", "domains": DirectDomains(), "skipFallback": true, "finalQuery": true}}
 	for _, s := range DNSServers {
 		servers = append(servers, s)
 	}
@@ -296,12 +296,12 @@ func XrayJSON(p Profile) ([]byte, error) {
 		// No logs at all: Xray's access log is on by default and gomobile
 		// sends the console to logcat, which would keep every site and the
 		// server's address. Start errors still come back as errors.
-		"log":      map[string]any{"access": "none", "error": "none", "loglevel": "none"},
+		"log": map[string]any{"access": "none", "error": "none", "loglevel": "none"},
 		// UseIPv4: the TUN keeps its IPv6 route so hard-coded IPv6 literals
 		// cannot leak around the tunnel, while DNS answers AAAA with NODATA
 		// so apps do not pick IPv6 via the TUN's instant local SYN-ACK and
 		// fail on IPv4-only networks or IPv4-only proxy servers.
-		"dns":      map[string]any{"tag": TagDNSIn, "servers": servers, "queryStrategy": "UseIPv4"},
+		"dns": map[string]any{"tag": TagDNSIn, "servers": servers, "queryStrategy": "UseIPv4", "disableFallbackIfMatch": true},
 		"inbounds": []any{tun},
 		"outbounds": []any{
 			proxy,
