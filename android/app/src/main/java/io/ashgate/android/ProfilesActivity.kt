@@ -74,7 +74,7 @@ class ProfilesActivity : Activity() {
 
     /** «VLESS · XHTTP · host» or «SOCKS5 · host:port»: never the uuid or the password. */
     private fun meta(p: JSONObject): String = when (p.optString("kind")) {
-        "vless" -> "VLESS · XHTTP · " + (Uri.parse(p.optString("link")).host ?: "")
+        "vless" -> "VLESS · XHTTP · " + p.optString("host").ifEmpty { Uri.parse(p.optString("link")).host ?: "" }
         "socks5" -> "SOCKS5 · ${p.optString("host")}:${p.optInt("port")}"
         else -> "HTTP · ${p.optString("host")}:${p.optInt("port")}"
     }
