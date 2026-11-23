@@ -27,7 +27,11 @@ class ProfileActivity : Activity() {
     private lateinit var proxy: View
     private lateinit var error: TextView
     private lateinit var save: Button
+    private lateinit var delete: Button
     private var id: String? = null
+
+    @Volatile
+    private var closed = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -41,6 +45,7 @@ class ProfileActivity : Activity() {
         proxy = findViewById(R.id.proxy)
         error = findViewById(R.id.error)
         save = findViewById(R.id.save)
+        delete = findViewById(R.id.delete)
 
         id = intent.getStringExtra("id")
         val old = Store.find(this, id)
@@ -65,9 +70,10 @@ class ProfileActivity : Activity() {
                 field(R.id.user).setText(old.optString("user"))
                 field(R.id.pass).setText(old.optString("pass"))
             }
-            findViewById<Button>(R.id.delete).apply {
+            delete.apply {
                 visibility = View.VISIBLE
                 setOnClickListener {
+                    closed = true
                     val wasSelected = Store.selectedId(this@ProfileActivity) == this@ProfileActivity.id
                     Store.delete(this@ProfileActivity, this@ProfileActivity.id!!)
                     if (wasSelected) reconnect()
@@ -78,6 +84,11 @@ class ProfileActivity : Activity() {
         save.setOnClickListener { save() }
     }
 
+    override fun onDestroy() {
+        closed = true
+        super.onDestroy()
+    }
+
     private fun field(id: Int): EditText = findViewById(id)
 
     private fun text(id: Int): String = field(id).text.toString()
@@ -85,6 +96,7 @@ class ProfileActivity : Activity() {
     private fun save() {
         error.visibility = View.GONE
         save.isEnabled = false
+        delete.isEnabled = false
         val vless = kind.checkedRadioButtonId == R.id.kind_vless
         val pasted = link.text.toString().trim()
         val proxyKind = if (kind.checkedRadioButtonId == R.id.kind_http) "http" else "socks5"
@@ -110,6 +122,7 @@ class ProfileActivity : Activity() {
                         ProfileInput.Kind.LINK -> listOf(JSONObject(Mobile.parseLink(pasted)))
                     }
                 }
+                if (closed || isFinishing || isDestroyed) return@thread
                 // An edited profile keeps its place. A server that is already
                 // saved (the same subscription imported again) is replaced
                 // instead of added a second time.
@@ -125,12 +138,14 @@ class ProfileActivity : Activity() {
                 e.message ?: e.javaClass.simpleName
             }
             runOnUiThread {
+                if (closed || isFinishing || isDestroyed) return@runOnUiThread
                 if (failure == null) {
                     // The selected profile changed (edited, or replaced by a re-import).
                     if (Store.selectedId(this)?.let { it in changed } == true) reconnect()
                     finish()
                 } else {
                     save.isEnabled = true
+                    delete.isEnabled = true
                     error.text = failure
                     error.visibility = View.VISIBLE
                 }
@@ -161,15 +176,16 @@ class ProfileActivity : Activity() {
         }
     }
 
-    /** Reads at most [limit] bytes. */
+    /** Reads at most [limit] bytes; fails if the stream is longer so a subscription is never cut in half. */
     private fun java.io.InputStream.readAtMost(limit: Int): ByteArray {
         val out = java.io.ByteArrayOutputStream()
         val buf = ByteArray(8192)
-        while (out.size() < limit) {
-            val n = read(buf, 0, minOf(buf.size, limit - out.size()))
+        while (out.size() <= limit) {
+            val n = read(buf, 0, minOf(buf.size, limit + 1 - out.size()))
             if (n < 0) break
             out.write(buf, 0, n)
         }
+        if (out.size() > limit) throw Exception()
         return out.toByteArray()
     }
 }
