@@ -337,6 +337,7 @@ class TunnelService : VpnService() {
         if (installs != null) return
         val receiver = object : BroadcastReceiver() {
             override fun onReceive(context: Context, intent: Intent) {
+                AppsActivity.invalidateCache()
                 // An update keeps the uid.
                 if (intent.getBooleanExtra(Intent.EXTRA_REPLACING, false)) return
                 val pkg = intent.data?.schemeSpecificPart ?: return

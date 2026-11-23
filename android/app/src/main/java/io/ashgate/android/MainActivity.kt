@@ -103,9 +103,9 @@ class MainActivity : Activity() {
     private fun loadInBackground() {
         thread {
             val usable = Store.usable(this)
-            // The same list the app picker shows.
+            // The same list the app picker shows, cached after the first scan.
             val installed = try {
-                AppsActivity.launcherApps(this).mapTo(HashSet()) { it.activityInfo.packageName }
+                AppsActivity.installedPackages(this)
             } catch (e: Exception) {
                 null
             }

@@ -28,11 +28,30 @@ class AppsActivity : Activity() {
     private val icons = LruCache<String, Drawable>(64)
 
     companion object {
+        private val labels = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+        @Volatile
+        var cachedPackages: Set<String>? = null
+            private set
+
         /** Apps with a launcher icon, without Ashgate itself. Slow: call off the main thread. */
         fun launcherApps(ctx: Context) =
             ctx.packageManager.queryIntentActivities(
                 Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER), 0,
             ).filter { it.activityInfo.packageName != ctx.packageName }.distinctBy { it.activityInfo.packageName }
+                .also { list -> cachedPackages = list.mapTo(HashSet()) { it.activityInfo.packageName } }
+
+        fun installedPackages(ctx: Context): Set<String> =
+            cachedPackages ?: launcherApps(ctx).mapTo(HashSet()) { it.activityInfo.packageName }
+
+        fun invalidateCache() {
+            cachedPackages = null
+        }
+
+        fun labelOf(pm: android.content.pm.PackageManager, info: ResolveInfo): String {
+            val pkg = info.activityInfo.packageName
+            return labels.getOrPut(pkg) { info.activityInfo.applicationInfo.loadLabel(pm).toString() }
+        }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -57,8 +76,7 @@ class AppsActivity : Activity() {
             val apps = found
                 .mapNotNull {
                     try {
-                        val appInfo = it.activityInfo.applicationInfo
-                        App(it.activityInfo.packageName, appInfo.loadLabel(packageManager).toString(), it)
+                        App(it.activityInfo.packageName, labelOf(packageManager, it), it)
                     } catch (e: Exception) {
                         null // Being uninstalled right now.
                     }
