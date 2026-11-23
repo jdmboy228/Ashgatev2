@@ -297,7 +297,11 @@ func XrayJSON(p Profile) ([]byte, error) {
 		// sends the console to logcat, which would keep every site and the
 		// server's address. Start errors still come back as errors.
 		"log":      map[string]any{"access": "none", "error": "none", "loglevel": "none"},
-		"dns":      map[string]any{"tag": TagDNSIn, "servers": servers, "queryStrategy": "UseIP"},
+		// UseIPv4: the TUN keeps its IPv6 route so hard-coded IPv6 literals
+		// cannot leak around the tunnel, while DNS answers AAAA with NODATA
+		// so apps do not pick IPv6 via the TUN's instant local SYN-ACK and
+		// fail on IPv4-only networks or IPv4-only proxy servers.
+		"dns":      map[string]any{"tag": TagDNSIn, "servers": servers, "queryStrategy": "UseIPv4"},
 		"inbounds": []any{tun},
 		"outbounds": []any{
 			proxy,

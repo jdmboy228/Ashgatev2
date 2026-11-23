@@ -328,6 +328,9 @@ func TestDNSThroughTunnel(t *testing.T) {
 		if dns["tag"] != TagDNSIn {
 			t.Fatalf("%s: dns tag = %v", name, dns["tag"])
 		}
+		if dns["queryStrategy"] != "UseIPv4" {
+			t.Fatalf("%s: dns queryStrategy = %v, want UseIPv4", name, dns["queryStrategy"])
+		}
 		servers := dns["servers"].([]any)
 		if len(servers) < 2 {
 			t.Fatalf("%s: DNS servers = %v", name, servers)
