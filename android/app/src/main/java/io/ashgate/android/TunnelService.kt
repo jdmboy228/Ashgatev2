@@ -114,10 +114,15 @@ class TunnelService : VpnService() {
     /** The newest start request processed on [worker], so that stopping never drops one that just came. */
     private var lastStartId = 0
 
+    /** True once the system started or restarted the tunnel without the user on screen, so a failure notifies. */
+    private var expectedUp = false
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val disconnect = intent?.action == DISCONNECT
+        val systemStart = intent == null || intent.action == SERVICE_INTERFACE
         onWorker {
             lastStartId = startId
+            if (systemStart) expectedUp = true
             when {
                 disconnect -> stop(null)
                 // Also RETRY from the notification, the system's start of an
@@ -270,7 +275,8 @@ class TunnelService : VpnService() {
     }
 
     private fun stop(reason: String?) {
-        val wasUp = tun != null
+        val wasUp = tun != null || expectedUp
+        expectedUp = false
         cancelRestart()
         unwatch()
         close()
