@@ -287,15 +287,13 @@ class MainActivity : Activity() {
             else -> null
         }
         if (notice != null) return showState(animate = true)
-        if (Build.VERSION.SDK_INT >= 33 &&
-            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
-        ) {
-            // For the "connected" notification; the tunnel works without it.
-            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 0)
-        }
         try {
             val consent = VpnService.prepare(this)
-            if (consent != null) startActivityForResult(consent, 1) else TunnelService.connect(this)
+            if (consent != null) {
+                startActivityForResult(consent, 1)
+            } else {
+                startTunnel()
+            }
         } catch (e: Exception) {
             // Some firmwares have no consent screen, or fail in prepare().
             notice = getString(R.string.no_vpn_permission)
@@ -303,11 +301,21 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun startTunnel() {
+        if (Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            // Requested only after VPN consent is settled so two system dialogs never race.
+            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 0)
+        }
+        TunnelService.connect(this)
+    }
+
     @Deprecated("Deprecated in Java")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         if (requestCode != 1) return
         if (resultCode == RESULT_OK) {
-            TunnelService.connect(this)
+            startTunnel()
         } else {
             notice = getString(R.string.no_vpn_permission)
             showState(animate = true)
