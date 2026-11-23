@@ -111,14 +111,13 @@ class TunnelService : VpnService() {
     /** Set once this instance is cleaned up: what it scheduled no longer runs. */
     private var destroyed = false
 
-    /** The newest start request, so that stopping never drops one that just came. */
-    @Volatile
+    /** The newest start request processed on [worker], so that stopping never drops one that just came. */
     private var lastStartId = 0
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        lastStartId = startId
         val disconnect = intent?.action == DISCONNECT
         onWorker {
+            lastStartId = startId
             when {
                 disconnect -> stop(null)
                 // Also RETRY from the notification, the system's start of an
