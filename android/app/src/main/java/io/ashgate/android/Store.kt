@@ -28,6 +28,10 @@ object Store {
     @Volatile
     private var cached: SharedPreferences? = null
 
+    private var cachedProfiles: List<String> = emptyList()
+    private var cachedSelected: String? = null
+    private var cachedApps: Set<String> = emptySet()
+
     /** Set when saved data could not be decrypted and was wiped; the main screen says so once. */
     @Volatile
     private var wiped = false
@@ -43,11 +47,18 @@ object Store {
         false
     }
 
+    @Synchronized
     private fun prefs(ctx: Context): SharedPreferences =
-        cached ?: synchronized(this) { cached ?: openOrWipe(ctx).also { cached = it } }
+        cached ?: openOrWipe(ctx).also { cached = it }
 
-    // Twice: the Keystore sometimes fails right after boot.
-    private fun openOrWipe(ctx: Context): SharedPreferences = tryOpen(ctx) ?: tryOpen(ctx) ?: run {
+    // Twice, with a short pause: the Keystore sometimes fails right after boot.
+    private fun openOrWipe(ctx: Context): SharedPreferences = tryOpen(ctx) ?: run {
+        try {
+            Thread.sleep(50)
+        } catch (_: InterruptedException) {
+        }
+        tryOpen(ctx)
+    } ?: run {
         if (!fileIsLost()) throw Unavailable()
         // The Keystore works now, so a failure from here on is the file's.
         tryOpen(ctx) ?: wipeAndOpen(ctx)
@@ -104,8 +115,11 @@ object Store {
             EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM,
         )
         // A wrong key can open the file and fail only on the first read.
-        p.getString("profiles", null)
-        p.getStringSet("apps", null)
+        // Cache the decrypted values so later UI reads never re-decrypt on the main thread.
+        val arr = JSONArray(p.getString("profiles", "[]") ?: "[]")
+        cachedProfiles = List(arr.length()) { arr.getJSONObject(it).toString() }
+        cachedSelected = p.getString("selected", null)
+        cachedApps = p.getStringSet("apps", emptySet())?.toSet() ?: emptySet()
         return p
     }
 
@@ -115,6 +129,7 @@ object Store {
     private const val MASTER_KEY = "_androidx_security_master_key_"
 
     /** True once after the saved data had to be wiped. */
+    @Synchronized
     fun takeWiped(ctx: Context): Boolean {
         prefs(ctx)
         if (!wiped) return false
@@ -122,24 +137,36 @@ object Store {
         return true
     }
 
+    @Synchronized
     fun profiles(ctx: Context): MutableList<JSONObject> {
-        val arr = JSONArray(prefs(ctx).getString("profiles", "[]"))
-        return MutableList(arr.length()) { arr.getJSONObject(it) }
+        prefs(ctx)
+        return MutableList(cachedProfiles.size) { JSONObject(cachedProfiles[it]) }
     }
 
     private fun save(ctx: Context, list: List<JSONObject>) {
-        prefs(ctx).edit().putString("profiles", JSONArray(list).toString()).apply()
+        val p = prefs(ctx)
+        cachedProfiles = list.map { it.toString() }
+        p.edit().putString("profiles", JSONArray(list).toString()).apply()
     }
 
     /** Adds a profile, or replaces the one with the same id. */
     @Synchronized
     fun put(ctx: Context, profile: JSONObject) {
+        putAll(ctx, listOf(profile))
+    }
+
+    /** Adds or replaces several profiles in one encrypted write. */
+    @Synchronized
+    fun putAll(ctx: Context, incoming: List<JSONObject>) {
+        if (incoming.isEmpty()) return
         val list = profiles(ctx)
-        if (!profile.has("id")) profile.put("id", UUID.randomUUID().toString())
-        val at = list.indexOfFirst { it.getString("id") == profile.getString("id") }
-        if (at >= 0) list[at] = profile else list.add(profile)
+        for (profile in incoming) {
+            if (!profile.has("id")) profile.put("id", UUID.randomUUID().toString())
+            val at = list.indexOfFirst { it.getString("id") == profile.getString("id") }
+            if (at >= 0) list[at] = profile else list.add(profile)
+        }
         save(ctx, list)
-        if (selectedId(ctx) == null) select(ctx, profile.getString("id"))
+        if (selectedId(ctx) == null) select(ctx, incoming.first().getString("id"))
     }
 
     @Synchronized
@@ -149,22 +176,40 @@ object Store {
         if (selectedId(ctx) == id) select(ctx, list.firstOrNull()?.getString("id"))
     }
 
-    fun find(ctx: Context, id: String?): JSONObject? =
-        profiles(ctx).firstOrNull { it.getString("id") == id }
-
-    fun selectedId(ctx: Context): String? = prefs(ctx).getString("selected", null)
-
-    fun select(ctx: Context, id: String?) {
-        prefs(ctx).edit().putString("selected", id).apply()
+    @Synchronized
+    fun find(ctx: Context, id: String?): JSONObject? {
+        if (id == null) return null
+        return profiles(ctx).firstOrNull { it.getString("id") == id }
     }
 
+    @Synchronized
+    fun selectedId(ctx: Context): String? {
+        prefs(ctx)
+        return cachedSelected
+    }
+
+    @Synchronized
+    fun select(ctx: Context, id: String?) {
+        val p = prefs(ctx)
+        cachedSelected = id
+        p.edit().putString("selected", id).apply()
+    }
+
+    @Synchronized
     fun selected(ctx: Context): JSONObject? = find(ctx, selectedId(ctx))
 
     /** Package names of the apps that go through the tunnel. */
-    fun apps(ctx: Context): Set<String> =
-        prefs(ctx).getStringSet("apps", emptySet())!!.toSet()
+    @Synchronized
+    fun apps(ctx: Context): Set<String> {
+        prefs(ctx)
+        return cachedApps
+    }
 
+    @Synchronized
     fun saveApps(ctx: Context, apps: Set<String>) {
-        prefs(ctx).edit().putStringSet("apps", apps).apply()
+        val p = prefs(ctx)
+        val copy = apps.toSet()
+        cachedApps = copy
+        p.edit().putStringSet("apps", copy).apply()
     }
 }

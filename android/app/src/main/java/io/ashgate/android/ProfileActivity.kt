@@ -132,7 +132,7 @@ class ProfileActivity : Activity() {
                 val incomingKeys = found.map { ProfileInput.serverKey(it.optString("link")) }
                 val ids = ProfileInput.ids(saved, incomingKeys, id)
                 found.forEachIndexed { i, p -> ids[i]?.let { p.put("id", it) } }
-                found.forEach { Store.put(this, it) }
+                Store.putAll(this, found)
                 ProfileInput.duplicateOnEdit(saved, incomingKeys, ids, id)?.let { Store.delete(this, it) }
                 changed = found.map { it.getString("id") }.toSet()
                 null
