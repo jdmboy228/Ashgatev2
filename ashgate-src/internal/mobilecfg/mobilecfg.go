@@ -260,13 +260,15 @@ func XrayJSON(p Profile) ([]byte, error) {
 		"tag":      TagDNS,
 		"protocol": "dns",
 		// A and AAAA are answered by Xray's DNS. Other types (HTTPS, SRV,
-		// TXT) go as they are to RawDNS over TCP through the proxy: to
-		// the original server they could leave the tunnel.
+		// TXT) for direct domains get an empty local NOERROR answer so
+		// Russian sites never wait on or leak through the proxy; the rest
+		// go as they are to RawDNS over TCP through the proxy.
 		"settings": map[string]any{
 			"rewriteNetwork": "tcp", "rewriteAddress": RawDNS, "rewritePort": 53,
 			"userLevel": DNSLevel,
 			"rules": []any{
 				map[string]any{"action": "hijack", "qType": "1,28"},
+				map[string]any{"action": "return", "domain": DirectDomains()},
 				map[string]any{"action": "direct"},
 			},
 		},

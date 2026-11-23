@@ -355,8 +355,13 @@ func TestDNSThroughTunnel(t *testing.T) {
 			}
 			proxy := o["streamSettings"].(map[string]any)["sockopt"].(map[string]any)["dialerProxy"]
 			s := o["settings"].(map[string]any)
-			if proxy != TagProxy || s["rewriteNetwork"] != "tcp" || s["rewriteAddress"] != RawDNS {
+			dnsRules := s["rules"].([]any)
+			if proxy != TagProxy || s["rewriteNetwork"] != "tcp" || s["rewriteAddress"] != RawDNS || len(dnsRules) != 3 {
 				t.Fatalf("%s: dns outbound = %v", name, o)
+			}
+			r1 := dnsRules[1].(map[string]any)
+			if r1["action"] != "return" || !reflect.DeepEqual(r1["domain"], direct) {
+				t.Fatalf("%s: dns direct non-A/AAAA rule = %v", name, r1)
 			}
 		}
 	}
