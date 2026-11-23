@@ -138,9 +138,10 @@ class ProfileActivity : Activity() {
         }
     }
 
-    /** A running tunnel picks up the changed profile. */
+    /** A running tunnel picks up the changed profile, or stops when none are left. */
     private fun reconnect() {
-        if (TunnelService.state != State.OFF) TunnelService.connect(this)
+        if (TunnelService.state == State.OFF) return
+        if (Store.selectedId(this) == null) TunnelService.disconnect(this) else TunnelService.connect(this)
     }
 
     /** Errors never quote the address: it holds the subscription's token. */
