@@ -218,16 +218,20 @@ const MTU = 1500
 // uses a new port for each query, so these flows get a short idle time.
 const DNSLevel = 1
 
-// DirectDomains are the desktop's direct list (.ru, .рф, .su, Russian
-// services) as Xray rules, plus geosite:category-ru. Only names go direct:
-// a Russian address without such a name goes through the proxy.
-func DirectDomains() []string {
+var defaultDirectDomains = func() []string {
 	c := config.Config{DirectDomains: config.DefaultDirectDomains}
-	var out []string
+	out := make([]string, 0, len(c.DirectDomains)+1)
 	for _, d := range c.BypassDomains() {
 		out = append(out, "domain:"+d)
 	}
 	return append(out, "geosite:category-ru")
+}()
+
+// DirectDomains are the desktop's direct list (.ru, .рф, .su, Russian
+// services) as Xray rules, plus geosite:category-ru. Only names go direct:
+// a Russian address without such a name goes through the proxy.
+func DirectDomains() []string {
+	return append([]string(nil), defaultDirectDomains...)
 }
 
 // XrayJSON is the Xray document for a profile.
@@ -247,6 +251,7 @@ func XrayJSON(p Profile) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	direct := DirectDomains()
 	tun := map[string]any{
 		"tag":      TagTun,
 		"protocol": "tun",
@@ -269,7 +274,7 @@ func XrayJSON(p Profile) ([]byte, error) {
 			"userLevel": DNSLevel,
 			"rules": []any{
 				map[string]any{"action": "hijack", "qType": "1,28"},
-				map[string]any{"action": "return", "domain": DirectDomains()},
+				map[string]any{"action": "return", "domain": direct},
 				map[string]any{"action": "direct"},
 			},
 		},
@@ -281,7 +286,7 @@ func XrayJSON(p Profile) ([]byte, error) {
 		map[string]any{"type": "field", "inboundTag": []string{TagTun}, "port": DoTPort, "outboundTag": TagProxy},
 		map[string]any{"type": "field", "inboundTag": []string{TagTun}, "domain": RussianResolverDomains, "outboundTag": TagProxy},
 		map[string]any{"type": "field", "inboundTag": []string{TagTun}, "ip": RussianResolverIPs, "outboundTag": TagProxy},
-		map[string]any{"type": "field", "inboundTag": []string{TagTun}, "domain": DirectDomains(), "outboundTag": TagDirect},
+		map[string]any{"type": "field", "inboundTag": []string{TagTun}, "domain": direct, "outboundTag": TagDirect},
 		map[string]any{"type": "field", "inboundTag": []string{TagTun}, "ip": LANRanges, "outboundTag": TagDirect},
 	}
 	if p.Kind == KindHTTP {
@@ -291,7 +296,7 @@ func XrayJSON(p Profile) ([]byte, error) {
 	// resolver (Ashgate is outside the tunnel, so that is the network's
 	// DNS, and Russian sites give their local answers); every other name
 	// is resolved by DNSServers through the proxy and never falls back.
-	servers := []any{map[string]any{"address": "localhost", "domains": DirectDomains(), "skipFallback": true, "finalQuery": true}}
+	servers := []any{map[string]any{"address": "localhost", "domains": direct, "skipFallback": true, "finalQuery": true}}
 	for _, s := range DNSServers {
 		servers = append(servers, s)
 	}
