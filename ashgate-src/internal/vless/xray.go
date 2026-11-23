@@ -3,6 +3,7 @@ package vless
 import (
 	"bytes"
 	"io"
+	"sync"
 
 	applog "github.com/xtls/xray-core/app/log"
 	xraylog "github.com/xtls/xray-core/common/log"
@@ -51,12 +52,35 @@ func loadAndStart(raw []byte) (*instance, error) {
 	return inst, nil
 }
 
-// Run starts Xray with a ready JSON document. Closing the result stops it.
+// Run starts Xray with a ready JSON document. Closing the result stops it
+// and closes every outbound socket it still holds open (including live UDP
+// flows whose TUN queues Xray's stack.Close does not close).
 // The Android core uses it; the desktop goes through Listen.
 func Run(raw []byte) (io.Closer, error) {
+	tr := newRunTracker()
+	setActiveTracker(tr)
 	inst, err := loadAndStart(raw)
 	if err != nil {
+		tr.closeAll()
+		clearActiveTracker(tr)
 		return nil, err
 	}
-	return inst, nil
+	return &runInstance{inst: inst, tr: tr}, nil
+}
+
+type runInstance struct {
+	inst *instance
+	tr   *runTracker
+	once sync.Once
+}
+
+func (r *runInstance) Close() error {
+	var err error
+	r.once.Do(func() {
+		clearActiveTracker(r.tr)
+		r.tr.cancel()
+		err = r.inst.Close()
+		r.tr.closeAll()
+	})
+	return err
 }

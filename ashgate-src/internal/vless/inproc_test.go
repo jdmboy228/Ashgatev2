@@ -290,3 +290,61 @@ func TestUDPSendDoesNotBlockOnStuckServer(t *testing.T) {
 		t.Fatalf("%d datagrams left queued after Close", n)
 	}
 }
+
+type dummyPacketConn struct {
+	net.PacketConn
+	closed bool
+}
+
+func (d *dummyPacketConn) Close() error {
+	d.closed = true
+	return nil
+}
+
+// Stopping a Run tracker immediately closes tracked TCP and UDP sockets
+// (keeping *xnet.PacketConnWrapper's concrete type for freedom UDP) and
+// aborts in-flight dials.
+func TestRunTrackerClosesLiveSockets(t *testing.T) {
+	tr := newRunTracker()
+	setActiveTracker(tr)
+	t.Cleanup(func() { clearActiveTracker(tr) })
+
+	pd := &pipeDialer{}
+	d := gateDialer{base: pd}
+	dest := xnet.TCPDestination(xnet.ParseAddress("198.51.100.20"), 443)
+	tcpConn, err := d.Dial(context.Background(), nil, dest, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pc := &dummyPacketConn{}
+	udpWrap := &xnet.PacketConnWrapper{PacketConn: pc}
+	trackedUDP, err := tr.track(udpWrap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := trackedUDP.(*xnet.PacketConnWrapper); !ok {
+		t.Fatalf("UDP wrapper lost concrete type: %T", trackedUDP)
+	}
+
+	// Normal close removes a socket from the tracker immediately.
+	shortConn, err := d.Dial(context.Background(), nil, dest, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = shortConn.Close()
+	tr.mu.Lock()
+	activeBeforeStop := len(tr.conns)
+	tr.mu.Unlock()
+	if activeBeforeStop != 2 {
+		t.Fatalf("active conns = %d, want 2", activeBeforeStop)
+	}
+
+	tr.closeAll()
+	if !pc.closed {
+		t.Fatal("tracked UDP PacketConn was not closed on stop")
+	}
+	if _, err := tcpConn.Write([]byte("x")); err == nil {
+		t.Fatal("tracked TCP conn remained writable after stop")
+	}
+}

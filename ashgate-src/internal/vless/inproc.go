@@ -638,9 +638,22 @@ func (g *gate) expired(c *gatedConn) {
 type gateDialer struct{ base internet.SystemDialer }
 
 func (d gateDialer) Dial(ctx context.Context, src xnet.Address, dest xnet.Destination, sockopt *internet.SocketConfig) (net.Conn, error) {
+	tr := currentTracker()
+	if tr != nil {
+		var cancel context.CancelFunc
+		ctx, cancel = tr.wrapContext(ctx)
+		defer cancel()
+	}
 	g := gateFor(dest)
 	if g == nil {
-		return d.base.Dial(ctx, src, dest, sockopt)
+		conn, err := d.base.Dial(ctx, src, dest, sockopt)
+		if err != nil {
+			return nil, err
+		}
+		if tr != nil {
+			return tr.track(conn)
+		}
+		return conn, nil
 	}
 	if err := g.acquire(ctx); err != nil {
 		return nil, err
@@ -650,9 +663,152 @@ func (d gateDialer) Dial(ctx context.Context, src xnet.Address, dest xnet.Destin
 		g.release(ctx.Err() == nil)
 		return nil, err
 	}
+	if tr != nil {
+		conn, err = tr.track(conn)
+		if err != nil {
+			g.release(false)
+			return nil, err
+		}
+	}
 	gc := &gatedConn{Conn: conn, g: g}
 	gc.timer = time.AfterFunc(gateHold, func() { gc.once.Do(func() { g.expired(gc) }) })
 	return gc, nil
+}
+
+// runTracker tracks outbound sockets opened while a vless.Run instance is
+// active so that stopping the instance immediately unblocks and closes
+// live TCP and UDP flows instead of waiting for Xray's connIdle timer.
+type runTracker struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	mu     sync.Mutex
+	closed bool
+	nextID uint64
+	conns  map[uint64]io.Closer
+}
+
+var (
+	trackerMu     sync.Mutex
+	activeTracker *runTracker
+)
+
+func newRunTracker() *runTracker {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &runTracker{
+		ctx:    ctx,
+		cancel: cancel,
+		conns:  make(map[uint64]io.Closer),
+	}
+}
+
+func setActiveTracker(tr *runTracker) {
+	trackerMu.Lock()
+	old := activeTracker
+	activeTracker = tr
+	trackerMu.Unlock()
+	if old != nil {
+		old.closeAll()
+	}
+}
+
+func clearActiveTracker(tr *runTracker) {
+	trackerMu.Lock()
+	if activeTracker == tr {
+		activeTracker = nil
+	}
+	trackerMu.Unlock()
+}
+
+func currentTracker() *runTracker {
+	trackerMu.Lock()
+	tr := activeTracker
+	trackerMu.Unlock()
+	return tr
+}
+
+func (tr *runTracker) wrapContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	out, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(tr.ctx, cancel)
+	return out, func() {
+		stop()
+		cancel()
+	}
+}
+
+func (tr *runTracker) track(conn net.Conn) (net.Conn, error) {
+	tr.mu.Lock()
+	if tr.closed {
+		tr.mu.Unlock()
+		_ = conn.Close()
+		return nil, net.ErrClosed
+	}
+	tr.nextID++
+	id := tr.nextID
+	if pw, ok := conn.(*xnet.PacketConnWrapper); ok {
+		// Keep the outer *xnet.PacketConnWrapper type intact: Xray's
+		// freedom outbound type-asserts it for UDP ReadFrom/WriteTo.
+		pw.PacketConn = &trackedPacketConn{
+			PacketConn: pw.PacketConn,
+			tr:         tr,
+			id:         id,
+		}
+		tr.conns[id] = pw
+		tr.mu.Unlock()
+		return pw, nil
+	}
+	tc := &trackedConn{Conn: conn, tr: tr, id: id}
+	tr.conns[id] = tc
+	tr.mu.Unlock()
+	return tc, nil
+}
+
+func (tr *runTracker) untrack(id uint64) {
+	tr.mu.Lock()
+	delete(tr.conns, id)
+	tr.mu.Unlock()
+}
+
+func (tr *runTracker) closeAll() {
+	tr.cancel()
+	tr.mu.Lock()
+	tr.closed = true
+	conns := make([]io.Closer, 0, len(tr.conns))
+	for id, c := range tr.conns {
+		conns = append(conns, c)
+		delete(tr.conns, id)
+	}
+	tr.mu.Unlock()
+	for _, c := range conns {
+		_ = c.Close()
+	}
+}
+
+type trackedConn struct {
+	net.Conn
+	tr   *runTracker
+	id   uint64
+	once sync.Once
+}
+
+func (c *trackedConn) Close() error {
+	c.once.Do(func() { c.tr.untrack(c.id) })
+	return c.Conn.Close()
+}
+
+type trackedPacketConn struct {
+	net.PacketConn
+	tr   *runTracker
+	id   uint64
+	once sync.Once
+}
+
+func (c *trackedPacketConn) Close() error {
+	c.once.Do(func() { c.tr.untrack(c.id) })
+	return c.PacketConn.Close()
 }
 
 func (d gateDialer) DestIpAddress() net.IP { return d.base.DestIpAddress() }
