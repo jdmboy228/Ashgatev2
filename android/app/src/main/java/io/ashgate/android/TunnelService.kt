@@ -81,6 +81,9 @@ class TunnelService : VpnService() {
         @Volatile
         var listener: (() -> Unit)? = null
 
+        @Volatile
+        private var geoDir: File? = null
+
         fun connect(ctx: Context) {
             ctx.startService(Intent(ctx, TunnelService::class.java))
         }
@@ -376,10 +379,14 @@ class TunnelService : VpnService() {
 
     /** Copies geosite.dat out of the APK once per installed build. */
     private fun geodata(): File {
+        geoDir?.let { return it }
         val dir = File(filesDir, "geo")
         val stamp = File(dir, "stamp")
         val build = packageManager.getPackageInfo(packageName, 0).lastUpdateTime.toString()
-        if (stamp.exists() && stamp.readText() == build) return dir
+        if (stamp.exists() && stamp.readText() == build) {
+            geoDir = dir
+            return dir
+        }
         dir.mkdirs()
         for (name in listOf("geosite.dat")) {
             assets.open(name).use { input ->
@@ -387,6 +394,7 @@ class TunnelService : VpnService() {
             }
         }
         stamp.writeText(build)
+        geoDir = dir
         return dir
     }
 
