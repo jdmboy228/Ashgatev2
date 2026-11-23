@@ -69,6 +69,15 @@ class MainActivity : Activity() {
         Fonts.set(Fonts.medium(this), sub, findViewById(R.id.label_profile), findViewById(R.id.label_apps),
             findViewById(R.id.label_russia))
         Fonts.set(Fonts.bold(this), profile, apps, findViewById(R.id.russia))
+        findViewById<TextView>(R.id.version).apply {
+            typeface = Fonts.mono(this@MainActivity)
+            val v = try {
+                packageManager.getPackageInfo(packageName, 0).versionName
+            } catch (e: Exception) {
+                null
+            }
+            if (!v.isNullOrEmpty()) text = "v$v"
+        }
 
         // Blur needs API 31, so the glow is a radial gradient fading out to its edge.
         glow.background = GradientDrawable().apply {

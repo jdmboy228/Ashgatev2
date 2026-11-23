@@ -173,4 +173,17 @@
                 style="@style/MainButtonText" />
         </LinearLayout>
     </LinearLayout>
+
+    <TextView
+        android:id="@+id/version"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top|right"
+        android:layout_marginTop="16dp"
+        android:layout_marginRight="@dimen/ag_screen_h"
+        android:includeFontPadding="false"
+        android:letterSpacing="0.04"
+        android:singleLine="true"
+        android:textColor="@color/ag_text3"
+        android:textSize="@dimen/ag_ts_caption" />
 </FrameLayout>
