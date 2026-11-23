@@ -210,8 +210,9 @@ var LANRanges = []string{
 	"fc00::/7", "fe80::/10",
 }
 
-// MTU of the TUN. VpnService must be given the same value.
-const MTU = 1500
+// MTU of the TUN. VpnService must be given the same value; 1400 fits
+// cellular, PPPoE and IPv6 mobile links without fragmenting UDP/QUIC.
+const MTU = 1400
 
 // DNSLevel is the policy level of the DNS outbound. Xray keeps a DNS flow
 // open after answering it until the flow idles out, and the phone's resolver
