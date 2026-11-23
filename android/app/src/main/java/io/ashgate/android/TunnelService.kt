@@ -12,6 +12,7 @@ import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
 import android.net.Network
+import android.net.NetworkCapabilities
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
@@ -87,6 +88,14 @@ class TunnelService : VpnService() {
         @Volatile
         private var geoDir: File? = null
 
+        /** Incremented on every user/service command so an aborted in-flight start or check is ignored. */
+        @Volatile
+        private var commandSeq = 0
+
+        /** The current active service instance; an older instance being destroyed must not touch global state. */
+        @Volatile
+        private var active: TunnelService? = null
+
         fun connect(ctx: Context) {
             ctx.startService(Intent(ctx, TunnelService::class.java))
         }
@@ -115,10 +124,6 @@ class TunnelService : VpnService() {
     private var restartFull = false
     private var healthCheck: ScheduledFuture<*>? = null
 
-    /** Incremented on every command so an aborted in-flight start or check is ignored. */
-    @Volatile
-    private var commandSeq = 0
-
     /** Set once this instance is cleaned up: what it scheduled no longer runs. */
     private var destroyed = false
 
@@ -131,6 +136,16 @@ class TunnelService : VpnService() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val disconnect = intent?.action == DISCONNECT
         val systemStart = intent == null || intent.action == SERVICE_INTERFACE
+        active = this
+        // A system VpnService bind/start arriving while the tunnel is already
+        // starting or up must not abort the running start.
+        if (systemStart && (state == State.STARTING || state == State.ON)) {
+            onWorker {
+                lastStartId = startId
+                expectedUp = true
+            }
+            return START_STICKY
+        }
         commandSeq++
         if (disconnect || state == State.STARTING) {
             // Unblock worker at once if it is waiting on an unreachable server inside Mobile.start.
@@ -163,19 +178,24 @@ class TunnelService : VpnService() {
 
     /** Runs on [worker]; a callback that arrives after onDestroy is dropped. */
     private fun later(block: () -> Unit) {
-        onWorker { if (!destroyed) block() }
+        onWorker { if (!destroyed && active === this) block() }
     }
 
     override fun onDestroy() {
-        commandSeq++
-        Mobile.stop()
+        val isCurrent = active === this
+        if (isCurrent) {
+            commandSeq++
+            Mobile.stop()
+        }
         onWorker {
+            val wasActive = !destroyed && active === this
             destroyed = true
+            if (active === this) active = null
             cancelRestart()
             cancelHealthCheck()
             unwatch()
-            close()
-            set(State.OFF, error)
+            close(stopCore = wasActive)
+            if (wasActive) set(State.OFF, error)
         }
         super.onDestroy()
     }
@@ -184,10 +204,13 @@ class TunnelService : VpnService() {
     private fun restartSoon(full: Boolean) {
         restartFull = restartFull || full
         if (restart != null) return
+        val seq = commandSeq
         restart = worker.schedule(
             Runnable {
-                if (destroyed) return@Runnable
                 restart = null
+                if (destroyed || active !== this || seq != commandSeq || state == State.OFF || state == State.STARTING) {
+                    return@Runnable
+                }
                 val rebuild = restartFull || tun == null
                 restartFull = false
                 if (rebuild) start() else guarded { restartXray() }
@@ -336,10 +359,12 @@ class TunnelService : VpnService() {
     private fun stop(reason: String?) {
         val wasUp = tun != null || expectedUp
         expectedUp = false
+        destroyed = true
+        if (active === this) active = null
         cancelRestart()
         cancelHealthCheck()
         unwatch()
-        close()
+        close(stopCore = true)
         set(State.OFF, reason)
         stopForeground(STOP_FOREGROUND_REMOVE)
         // Not asked for by the user: the picked apps are outside the tunnel now.
@@ -347,8 +372,8 @@ class TunnelService : VpnService() {
         stopSelf(lastStartId)
     }
 
-    private fun close() {
-        Mobile.stop()
+    private fun close(stopCore: Boolean) {
+        if (stopCore) Mobile.stop()
         closeQuietly(tun)
         tun = null
     }
@@ -372,17 +397,30 @@ class TunnelService : VpnService() {
         if (watching != null) return
         val manager = getSystemService(ConnectivityManager::class.java)
         val callback = object : ConnectivityManager.NetworkCallback() {
+            private var seeded = false
+
             override fun onAvailable(n: Network) {
+                val caps = try {
+                    manager.getNetworkCapabilities(n)
+                } catch (e: Exception) {
+                    null
+                }
+                // Ignore our own VPN interface: only physical network switches count.
+                if (caps != null && caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) return
                 later {
+                    if (watching !== this) return@later
                     val previous = network
                     network = n
-                    if (watching != null && previous != n && state != State.OFF) restartSoon(full = false)
+                    if (!seeded) {
+                        // The first delivery on registration reports the current network, which is no change.
+                        seeded = true
+                        return@later
+                    }
+                    if (previous != n && state != State.OFF) restartSoon(full = false)
                 }
             }
         }
         try {
-            // The callback first reports the current network, which is no change.
-            network = manager.activeNetwork
             manager.registerDefaultNetworkCallback(callback)
             watching = callback
         } catch (e: Exception) {

@@ -248,9 +248,16 @@ class MainActivity : Activity() {
 
     /** Sets [text] (and [color]); a change fades out and back in. */
     private fun swap(view: TextView, text: String, color: Int?, animate: Boolean) {
+        val targetColor = color ?: view.currentTextColor
+        val targetKey = "$text#$targetColor"
         val same = view.text.toString() == text && (color == null || view.currentTextColor == color)
-        if (same && view.alpha == 1f) return
-        view.animate().cancel()
+        if (same && view.alpha == 1f) {
+            view.tag = targetKey
+            return
+        }
+        if (animate && view.tag == targetKey) return
+        view.tag = targetKey
+        view.animate().withEndAction(null).cancel()
         val apply = {
             view.text = text
             if (color != null) view.setTextColor(color)
@@ -261,8 +268,9 @@ class MainActivity : Activity() {
             return
         }
         view.animate().alpha(0f).setDuration(100).withEndAction {
+            if (view.tag != targetKey) return@withEndAction
             apply()
-            view.animate().alpha(1f).setDuration(150).start()
+            view.animate().withEndAction(null).alpha(1f).setDuration(150).start()
         }.start()
     }
 
