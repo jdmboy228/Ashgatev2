@@ -113,11 +113,28 @@ func (f *Firewall) Unblock() error {
 	defer f.mu.Unlock()
 	// Deleting by name also removes rules a lost state file forgot.
 	err := f.run(`advfirewall firewall delete rule name="` + RuleName + `"`)
-	if errors.Is(err, ErrUnsupported) {
-		return err
+	if err != nil {
+		if errors.Is(err, ErrUnsupported) {
+			return err
+		}
+		if !isNoRulesError(err) {
+			return err
+		}
 	}
 	clear(f.cur)
 	return f.saveLocked()
+}
+
+// isNoRulesError reports netsh's response when no firewall rules exist with
+// RuleName: the desired end state is already reached.
+func isNoRulesError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "no rules match") ||
+		strings.Contains(msg, "нет правил, соответствующих") ||
+		strings.Contains(msg, "правила не найдены")
 }
 
 func (f *Firewall) add(path string) error {

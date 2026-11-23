@@ -87,9 +87,11 @@ type controller struct {
 	// ksPending/ksRunning coalesce kill-switch syncs requested by saves.
 	ksPending bool
 	ksRunning bool
-	// ksSaved is the target list last written for the guard; see
-	// saveTargets. Guarded by ksMu.
+	// ksSaved is the target list last written for the guard; ksClean marks
+	// that Ashgate's firewall rules were confirmed absent since the last
+	// block. Guarded by ksMu.
 	ksSaved string
+	ksClean bool
 
 	// updateURL is the download page from the last update check that found
 	// a newer version. /api/update/open opens only this link, never one the

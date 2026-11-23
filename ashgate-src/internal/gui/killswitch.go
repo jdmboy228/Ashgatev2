@@ -117,8 +117,11 @@ func (c *controller) syncKill() {
 	var missing []string
 	switch {
 	case !killWanted(cfg):
-		if len(fw.Blocked()) > 0 {
+		if !c.ksClean || len(fw.Blocked()) > 0 {
 			err = fw.Unblock()
+			if err == nil {
+				c.ksClean = true
+			}
 		}
 		c.stopGuardLocked()
 	case running:
@@ -129,10 +132,15 @@ func (c *controller) syncKill() {
 		if c.guardStop == nil && err == nil {
 			c.guardStop, err = c.hooks.guard(c.ksState())
 		}
-		if len(fw.Blocked()) > 0 {
-			err = errors.Join(err, fw.Unblock())
+		if !c.ksClean || len(fw.Blocked()) > 0 {
+			if uerr := fw.Unblock(); uerr != nil {
+				err = errors.Join(err, uerr)
+			} else {
+				c.ksClean = true
+			}
 		}
 	default:
+		c.ksClean = false
 		var paths []string
 		paths, missing = killTargets(cfg)
 		err = fw.Block(paths)
@@ -164,6 +172,7 @@ func (c *controller) blockNow() {
 	}
 	c.ksMu.Lock()
 	defer c.ksMu.Unlock()
+	c.ksClean = false
 	err := fw.Block(loadTargets(c.ksState()))
 	c.mu.Lock()
 	if err != nil && !errors.Is(err, killswitch.ErrUnsupported) {
