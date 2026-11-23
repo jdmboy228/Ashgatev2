@@ -57,7 +57,8 @@ class AppsActivity : Activity() {
             val apps = found
                 .mapNotNull {
                     try {
-                        App(it.activityInfo.packageName, it.loadLabel(packageManager).toString(), it)
+                        val appInfo = it.activityInfo.applicationInfo
+                        App(it.activityInfo.packageName, appInfo.loadLabel(packageManager).toString(), it)
                     } catch (e: Exception) {
                         null // Being uninstalled right now.
                     }
@@ -97,7 +98,7 @@ class AppsActivity : Activity() {
             // The row may have scrolled away and now show another app.
             if (view.tag != app.pkg) return@execute
             val icon = try {
-                app.info.loadIcon(packageManager)
+                app.info.activityInfo.applicationInfo.loadIcon(packageManager)
             } catch (e: Exception) {
                 return@execute
             }
