@@ -397,4 +397,14 @@ func TestMask(t *testing.T) {
 	if got := s.Mask("auth alice/secret to 192.0.2.10:1080 failed"); got != "auth ***/*** to ***:1080 failed" {
 		t.Fatalf("got %q", got)
 	}
+	// Extra downloadSettings fields, path, and uppercase UUIDs are masked too.
+	extraJSON := `{"downloadSettings":{"address":"203.0.113.55","security":"reality","realitySettings":{"serverName":"dl.example.org","publicKey":"BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB","shortId":"ef56"},"xhttpSettings":{"host":"dl-cdn.example.org","path":"/dl-secret"}}}`
+	withExtra, err := FromLink(strings.Replace(xhttpLink, "#Test%20XHTTP", "&extra="+url.QueryEscape(extraJSON)+"#Test%20XHTTP", 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	leakMsg := "uuid " + strings.ToUpper(fakeUUID) + " path /api dl 203.0.113.55 sni dl.example.org key BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB sid ef56 host dl-cdn.example.org dlpath /dl-secret"
+	if got := withExtra.Mask(leakMsg); got != "uuid *** path *** dl *** sni *** key *** sid *** host *** dlpath ***" {
+		t.Fatalf("got %q", got)
+	}
 }

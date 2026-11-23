@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -362,12 +363,57 @@ func proxyOutbound(p Profile) (map[string]any, error) {
 // shown on screen and ends up in screenshots. Values under 4 characters
 // could match ordinary words and are left alone.
 func (p Profile) Mask(msg string) string {
-	secrets := []string{p.Pass, p.User, p.Host}
+	secrets := []string{p.Pass, p.User, p.Host, p.Link}
+	if u, err := url.Parse(strings.TrimSpace(p.Link)); err == nil {
+		q := u.Query()
+		secrets = append(secrets, u.User.Username(), u.Hostname(), q.Get("pbk"), q.Get("publicKey"), q.Get("sid"), q.Get("shortId"))
+	}
 	if parsed, err := vless.ParseLink(p.Link); err == nil {
 		v := parsed.Params
-		secrets = append(secrets, v.UUID, strings.ReplaceAll(v.UUID, "-", ""), v.PublicKey, v.ShortID, v.SNI, v.Host)
+		noDash := strings.ReplaceAll(v.UUID, "-", "")
+		secrets = append(secrets,
+			v.UUID, strings.ToUpper(v.UUID), noDash, strings.ToUpper(noDash),
+			v.PublicKey, v.ShortID, v.SNI, v.Host,
+			v.Path, v.ServiceName, v.Authority,
+		)
+		if v.PinnedSHA256 != "" {
+			secrets = append(secrets, strings.Split(v.PinnedSHA256, ",")...)
+		}
 		if host, _, err := net.SplitHostPort(parsed.Address); err == nil {
 			secrets = append(secrets, host)
+		}
+		if len(v.Extra) > 0 {
+			var extra struct {
+				DownloadSettings *struct {
+					Address         string `json:"address"`
+					RealitySettings *struct {
+						ServerName string `json:"serverName"`
+						PublicKey  string `json:"publicKey"`
+						ShortID    string `json:"shortId"`
+					} `json:"realitySettings"`
+					TLSSettings *struct {
+						ServerName string `json:"serverName"`
+						Pinned     string `json:"pinnedPeerCertSha256"`
+					} `json:"tlsSettings"`
+					XHTTPSettings *struct {
+						Host string `json:"host"`
+						Path string `json:"path"`
+					} `json:"xhttpSettings"`
+				} `json:"downloadSettings"`
+			}
+			if json.Unmarshal(v.Extra, &extra) == nil && extra.DownloadSettings != nil {
+				d := extra.DownloadSettings
+				secrets = append(secrets, d.Address)
+				if d.RealitySettings != nil {
+					secrets = append(secrets, d.RealitySettings.ServerName, d.RealitySettings.PublicKey, d.RealitySettings.ShortID)
+				}
+				if d.TLSSettings != nil {
+					secrets = append(secrets, d.TLSSettings.ServerName, d.TLSSettings.Pinned)
+				}
+				if d.XHTTPSettings != nil {
+					secrets = append(secrets, d.XHTTPSettings.Host, d.XHTTPSettings.Path)
+				}
+			}
 		}
 	}
 	// Longest first, so a shorter value never cuts a longer one in half.
