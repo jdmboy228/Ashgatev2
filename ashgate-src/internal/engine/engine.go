@@ -173,6 +173,7 @@ type Engine struct {
 	rotatedAt time.Time
 
 	dnsSem chan struct{}
+	wg     sync.WaitGroup
 	// relays is how TCP relays go per proxy; see RelayHealth.
 	relays relayBook
 
@@ -282,6 +283,16 @@ func New(cfg *config.Config, opt Options) (*Engine, error) {
 // SetInjector installs the reply path used by UDP.
 func (e *Engine) SetInjector(inj Injector) {
 	e.inj.Store(&inj)
+}
+
+// Wait blocks until background UDP reader and DNS-over-TCP goroutines exit.
+// Callers must stop submitting new ForwardUDP work and cancel the session
+// context before calling Wait.
+func (e *Engine) Wait() {
+	if e == nil {
+		return
+	}
+	e.wg.Wait()
 }
 
 func (e *Engine) injector() Injector {

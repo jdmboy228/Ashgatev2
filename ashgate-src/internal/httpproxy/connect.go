@@ -46,6 +46,9 @@ func DNSQuery(ctx context.Context, p config.Proxy, server string, query []byte) 
 	if len(query) == 0 || len(query) > 65535 {
 		return nil, errors.New("http proxy: dns query has an invalid length")
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	host, portStr, err := net.SplitHostPort(server)
 	if err != nil {
 		return nil, err
@@ -58,17 +61,32 @@ func DNSQuery(ctx context.Context, p config.Proxy, server string, query []byte) 
 	if err != nil {
 		return nil, err
 	}
+	return dnsExchange(ctx, conn, query)
+}
+
+func dnsExchange(ctx context.Context, conn net.Conn, query []byte) ([]byte, error) {
 	defer conn.Close()
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stop()
 	_ = conn.SetDeadline(deadline(ctx, 10*time.Second))
 	var lenb [2]byte
 	binary.BigEndian.PutUint16(lenb[:], uint16(len(query)))
 	if _, err := conn.Write(lenb[:]); err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		return nil, err
 	}
 	if _, err := conn.Write(query); err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		return nil, err
 	}
 	if _, err := io.ReadFull(conn, lenb[:]); err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		return nil, err
 	}
 	n := binary.BigEndian.Uint16(lenb[:])
@@ -77,6 +95,9 @@ func DNSQuery(ctx context.Context, p config.Proxy, server string, query []byte) 
 	}
 	buf := make([]byte, n)
 	if _, err := io.ReadFull(conn, buf); err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		return nil, err
 	}
 	return buf, nil

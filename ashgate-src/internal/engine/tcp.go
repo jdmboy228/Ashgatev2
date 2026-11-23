@@ -43,7 +43,14 @@ type tcpFlow struct {
 }
 
 // ServeConn looks up the NAT entry for an accepted local connection and relays it.
-func (e *Engine) ServeConn(conn net.Conn) {
+func (e *Engine) ServeConn(ctx context.Context, conn net.Conn) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if ctx.Err() != nil {
+		conn.Close()
+		return
+	}
 	ta, ok := conn.RemoteAddr().(*net.TCPAddr)
 	if !ok {
 		conn.Close()
@@ -68,10 +75,13 @@ func (e *Engine) ServeConn(conn net.Conn) {
 		conn.Close()
 		return
 	}
-	e.serveFlow(conn, flow)
+	e.serveFlow(ctx, conn, flow)
 }
 
-func (e *Engine) serveFlow(conn net.Conn, flow *tcpFlow) {
+func (e *Engine) serveFlow(ctx context.Context, conn net.Conn, flow *tcpFlow) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	defer conn.Close()
 	defer e.finishTCP(flow)
 
@@ -79,10 +89,13 @@ func (e *Engine) serveFlow(conn net.Conn, flow *tcpFlow) {
 	if !flow.dial.IsZero() {
 		target = flow.dial
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	upstream, err := e.dial.DialTCP(ctx, flow.proxy, target.NetIP().String(), target.Port)
+	dialCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	upstream, err := e.dial.DialTCP(dialCtx, flow.proxy, target.NetIP().String(), target.Port)
 	cancel()
 	if err != nil {
+		if ctx.Err() != nil {
+			return
+		}
 		e.relays.dead(flow.proxy.Name, flow.created, e.now())
 		flow.stat.fail(err.Error(), e.now())
 		e.log(logbuf.Event{
@@ -98,6 +111,11 @@ func (e *Engine) serveFlow(conn net.Conn, flow *tcpFlow) {
 		return
 	}
 	defer upstream.Close()
+	stop := context.AfterFunc(ctx, func() {
+		_ = conn.Close()
+		_ = upstream.Close()
+	})
+	defer stop()
 	e.log(logbuf.Event{
 		Process: display(flow.proc),
 		PID:     flow.proc.PID,

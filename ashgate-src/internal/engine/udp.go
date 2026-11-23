@@ -63,6 +63,12 @@ func (f *udpFlow) touch(t time.Time) {
 
 // ForwardUDP sends one datagram through the proxy and injects replies.
 func (e *Engine) ForwardUDP(ctx context.Context, d UDPDatagram) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 	e.mu.Lock()
 	flow := e.udp[d.Key]
 	e.mu.Unlock()
@@ -73,7 +79,9 @@ func (e *Engine) ForwardUDP(ctx context.Context, d UDPDatagram) error {
 	if flow.proxy.Type == "http" || (flow.sys && flow.proxy.Type == "socks5") {
 		select {
 		case e.dnsSem <- struct{}{}:
+			e.wg.Add(1)
 			go func() {
+				defer e.wg.Done()
 				defer func() { <-e.dnsSem }()
 				_ = e.forwardDNSTCP(ctx, flow, d.Payload)
 			}()
@@ -94,6 +102,9 @@ func (e *Engine) forwardSOCKS(ctx context.Context, flow *udpFlow, d UDPDatagram)
 	// for I/O.
 	dst := &net.UDPAddr{IP: flow.relay.NetIP(), Port: int(flow.relay.Port)}
 	if err := sess.Send(ctx, dst, d.Payload); err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		e.log(logbuf.Event{Process: display(flow.proc), PID: flow.proc.PID, Proto: "UDP", Dest: flow.orig.String(), Via: flow.proxy.Name, Status: "error", Error: err.Error()})
 		e.failDNS(flow, d.Payload)
 		return err
@@ -112,7 +123,7 @@ func (e *Engine) udpSession(ctx context.Context, flow *udpFlow, payload []byte) 
 	flow.mu.Lock()
 	closed, sess, failedAt := flow.closed, flow.sess, flow.failedAt
 	flow.mu.Unlock()
-	if closed {
+	if closed || ctx.Err() != nil {
 		return nil, nil
 	}
 	if sess != nil {
@@ -124,6 +135,9 @@ func (e *Engine) udpSession(ctx context.Context, flow *udpFlow, payload []byte) 
 	}
 	sess, err := e.dial.DialUDP(ctx, flow.proxy)
 	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		flow.mu.Lock()
 		flow.failedAt = e.now()
 		flow.mu.Unlock()
@@ -133,15 +147,19 @@ func (e *Engine) udpSession(ctx context.Context, flow *udpFlow, payload []byte) 
 		return nil, err
 	}
 	flow.mu.Lock()
-	if flow.closed {
-		// Retired while dialing.
+	if flow.closed || ctx.Err() != nil {
+		// Retired or stopped while dialing.
 		flow.mu.Unlock()
 		_ = sess.Close()
 		return nil, nil
 	}
 	flow.sess = sess
 	flow.mu.Unlock()
-	go e.readUDP(flow, sess)
+	e.wg.Add(1)
+	go func() {
+		defer e.wg.Done()
+		e.readUDP(flow, sess)
+	}()
 	return sess, nil
 }
 

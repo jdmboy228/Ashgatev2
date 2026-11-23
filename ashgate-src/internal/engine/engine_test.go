@@ -189,7 +189,7 @@ func TestTCPRedirectAndRelay(t *testing.T) {
 		if err != nil {
 			return
 		}
-		e.ServeConn(c)
+		e.ServeConn(context.Background(), c)
 		close(accepted)
 	}()
 	dialer := net.Dialer{LocalAddr: &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: int(alloc)}, Timeout: 2 * time.Second}

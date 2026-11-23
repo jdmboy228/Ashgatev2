@@ -157,3 +157,70 @@ func TestUDPSweepAndCloseAllDoNotWaitForIO(t *testing.T) {
 		}
 	}
 }
+
+type waitDial struct {
+	fakeDial
+	sess *waitSession
+}
+
+func (d *waitDial) DialUDP(context.Context, config.Proxy) (dialer.Session, error) {
+	return d.sess, nil
+}
+
+type waitSession struct {
+	closed        chan struct{}
+	closeOnce     sync.Once
+	recvUnblocked chan struct{}
+	allowExit     chan struct{}
+}
+
+func (s *waitSession) Send(context.Context, *net.UDPAddr, []byte) error { return nil }
+
+func (s *waitSession) Recv(context.Context) (*net.UDPAddr, []byte, error) {
+	<-s.closed
+	close(s.recvUnblocked)
+	<-s.allowExit
+	return nil, nil, io.EOF
+}
+
+func (s *waitSession) Close() error {
+	s.closeOnce.Do(func() { close(s.closed) })
+	return nil
+}
+
+func TestEngineWaitWaitsForReadUDP(t *testing.T) {
+	ws := &waitSession{
+		closed:        make(chan struct{}),
+		recvUnblocked: make(chan struct{}),
+		allowExit:     make(chan struct{}),
+	}
+	cfg := testConfig()
+	cfg.DNS.Mode = "original"
+	e, _ := newEngine(t, cfg, fixedRes{p: rules.Process{Name: "curl.exe", PID: 5}, ok: true}, &waitDial{sess: ws}, nil)
+	pkt, _ := packet.BuildUDP(packet.V4(10, 9, 8, 7, 1901), packet.V4(9, 9, 9, 9, 3478), []byte{1})
+	res := e.HandlePacket(pkt, Meta{}, true)
+	if res.Action != ActionUDP {
+		t.Fatal(res.Action)
+	}
+	if err := e.ForwardUDP(context.Background(), *res.UDP); err != nil {
+		t.Fatal(err)
+	}
+	e.closeAll()
+	<-ws.recvUnblocked
+	waitDone := make(chan struct{})
+	go func() {
+		e.Wait()
+		close(waitDone)
+	}()
+	select {
+	case <-waitDone:
+		t.Fatal("Engine.Wait returned before readUDP exited")
+	case <-time.After(30 * time.Millisecond):
+	}
+	close(ws.allowExit)
+	select {
+	case <-waitDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Engine.Wait did not return after readUDP exited")
+	}
+}
