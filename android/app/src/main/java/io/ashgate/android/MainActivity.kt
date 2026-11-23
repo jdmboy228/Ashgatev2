@@ -30,6 +30,7 @@ class MainActivity : Activity() {
 
     /** Apps with a launcher icon, counted in the background; null until then. */
     private var appsTotal: Int? = null
+    private var installedApps: Set<String>? = null
 
     /** A check before connecting that failed; shown until the next try. */
     private var notice: String? = null
@@ -97,13 +98,16 @@ class MainActivity : Activity() {
         thread {
             val usable = Store.usable(this)
             // The same list the app picker shows.
-            val total = try {
-                AppsActivity.launcherApps(this).size
+            val installed = try {
+                AppsActivity.launcherApps(this).mapTo(HashSet()) { it.activityInfo.packageName }
             } catch (e: Exception) {
                 null
             }
             runOnUiThread {
-                if (total != null) appsTotal = total
+                if (installed != null) {
+                    installedApps = installed
+                    appsTotal = installed.size
+                }
                 val unavailable = getString(R.string.store_unavailable)
                 if (!usable) {
                     notice = unavailable
@@ -111,7 +115,7 @@ class MainActivity : Activity() {
                     // A notice whose cause was fixed elsewhere (a profile or apps picked) goes away.
                     if (notice == unavailable ||
                         notice == getString(R.string.need_profile) && Store.selected(this) != null ||
-                        notice == getString(R.string.need_apps) && Store.apps(this).isNotEmpty()
+                        notice == getString(R.string.need_apps) && pickedAppsCount() > 0
                     ) {
                         notice = null
                     }
@@ -133,10 +137,17 @@ class MainActivity : Activity() {
         super.onStop()
     }
 
+    private fun pickedAppsCount(): Int {
+        if (!Store.isOpen) return 0
+        val picked = Store.apps(this)
+        val installed = installedApps ?: return picked.size
+        return picked.count { it in installed }
+    }
+
     private fun showRows() {
         if (!Store.isOpen) return
         profile.text = Store.selected(this)?.optString("name") ?: getString(R.string.need_profile)
-        val n = Store.apps(this).size
+        val n = pickedAppsCount()
         apps.text = appsTotal?.let { getString(R.string.apps_of, n, it) } ?: n.toString()
     }
 
@@ -189,7 +200,7 @@ class MainActivity : Activity() {
             else -> null
         }
         // Until the saved data is open only a message can be shown.
-        val n = if (Store.isOpen) Store.apps(this).size else 0
+        val n = pickedAppsCount()
         val text = when {
             message != null -> message
             !Store.isOpen -> return
@@ -272,7 +283,7 @@ class MainActivity : Activity() {
         if (!Store.isOpen) return loadInBackground()
         notice = when {
             Store.selected(this) == null -> getString(R.string.need_profile)
-            Store.apps(this).isEmpty() -> getString(R.string.need_apps)
+            pickedAppsCount() == 0 -> getString(R.string.need_apps)
             else -> null
         }
         if (notice != null) return showState(animate = true)

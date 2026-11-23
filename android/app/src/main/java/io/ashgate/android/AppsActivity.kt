@@ -64,6 +64,7 @@ class AppsActivity : Activity() {
                 }
                 // Picked apps first, then by name.
                 .sortedWith(compareBy({ it.pkg !in chosen }, { it.label.lowercase() }))
+            val installedPkgs = apps.mapTo(HashSet()) { it.pkg }
             runOnUiThread {
                 val adapter = Adapter(apps, chosen)
                 list.adapter = adapter
@@ -72,6 +73,7 @@ class AppsActivity : Activity() {
                 list.animate().alpha(1f).setDuration(200).start()
                 list.setOnItemClickListener { _, row, position, _ ->
                     val app = adapter.getItem(position) as? App ?: return@setOnItemClickListener
+                    chosen.retainAll(installedPkgs)
                     if (!chosen.remove(app.pkg)) chosen.add(app.pkg)
                     Store.saveApps(this, chosen.toSet())
                     adapter.notifyDataSetChanged()
