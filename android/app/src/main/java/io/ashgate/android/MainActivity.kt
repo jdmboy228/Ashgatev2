@@ -49,6 +49,7 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        notice = savedInstanceState?.getString("notice")
         setContentView(R.layout.main)
         glow = findViewById(R.id.glow)
         dot = findViewById(R.id.dot)
@@ -84,6 +85,11 @@ class MainActivity : Activity() {
         if (Store.isOpen) startActivity(Intent(this, screen)) else loadInBackground()
     }
 
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        outState.putString("notice", notice)
+    }
+
     override fun onStart() {
         super.onStart()
         visible = true
@@ -104,6 +110,7 @@ class MainActivity : Activity() {
                 null
             }
             runOnUiThread {
+                if (isFinishing || isDestroyed) return@runOnUiThread
                 if (installed != null) {
                     installedApps = installed
                     appsTotal = installed.size
@@ -119,7 +126,7 @@ class MainActivity : Activity() {
                     ) {
                         notice = null
                     }
-                    if (Store.takeWiped(this)) notice = getString(R.string.store_wiped)
+                    if (visible && Store.takeWiped(this)) notice = getString(R.string.store_wiped)
                 }
                 showRows()
                 showState(animate = false)
@@ -133,6 +140,9 @@ class MainActivity : Activity() {
         if (TunnelService.listener === onState) TunnelService.listener = null
         pulse?.cancel()
         pulse = null
+        colorAnim?.cancel()
+        colorAnim = null
+        glow.animate().cancel()
         dot.alpha = 1f
         super.onStop()
     }
