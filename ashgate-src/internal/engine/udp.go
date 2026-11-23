@@ -334,3 +334,105 @@ func (e *Engine) closeAll() {
 		}
 	}
 }
+
+// udpFlowMatchesLocked reports whether flow still matches snap: same routing
+// decision (rule or system DNS), proxy endpoint/credentials, rule stat, and
+// DNS relay configuration. Callers hold e.mu.
+func (e *Engine) udpFlowMatchesLocked(flow *udpFlow, snap *snapshot) bool {
+	if snap == nil {
+		return false
+	}
+	dns := flow.orig.Port == 53
+	if destinationBypass(flow.orig, snap.bypassPrivate && !dns, dns) {
+		return false
+	}
+	if e.selfPID != 0 && flow.proc.PID == e.selfPID {
+		return false
+	}
+	var wantProxy config.Proxy
+	var wantSys bool
+	var wantStat *ruleStat
+	if flow.proc.PID == 0 && flow.proc.Name == "" && flow.proc.Path == "" {
+		if !dns || snap.sysProxy == nil {
+			return false
+		}
+		wantProxy = *snap.sysProxy
+		wantSys = true
+	} else {
+		dec := snap.rules.Match(flow.proc)
+		if dec.Action == "" && (rules.IsSystemDNS(flow.proc.Name) || flow.proc.PID == 4 || (flow.proc.Name == "" && flow.proc.Path == "")) {
+			switch {
+			case dns:
+				if snap.sysProxy == nil {
+					return false
+				}
+				wantProxy = *snap.sysProxy
+				wantSys = true
+			case func() bool { _, ok := dohServers[flow.orig]; return ok }():
+				if snap.sysProxy == nil {
+					return false
+				}
+				wantProxy = *snap.sysProxy
+				wantSys = false
+			default:
+				return false
+			}
+		} else {
+			if dec.Action != "proxy" || (dec.TCPOnly && !dns) {
+				return false
+			}
+			p, ok := snap.proxies[dec.Proxy]
+			if !ok {
+				return false
+			}
+			wantProxy = p
+			wantSys = false
+			if dec.RuleIndex >= 0 && dec.RuleIndex < len(snap.ruleKeys) {
+				wantStat = e.stats[snap.ruleKeys[dec.RuleIndex]]
+			}
+		}
+	}
+	if wantSys != flow.sys {
+		return false
+	}
+	if wantProxy.Type != "socks5" && wantProxy.Type != "vless" && !dns {
+		return false
+	}
+	if !sameProxyTransport(flow.proxy, wantProxy) {
+		return false
+	}
+	if wantStat != flow.stat {
+		return false
+	}
+	if dns && (snap.dns.Mode == "proxy" || wantSys) {
+		return relayInDNSServers(flow.orig, flow.relay, snap.dnsServers)
+	}
+	return flow.relay.Equal(flow.orig)
+}
+
+func sameProxyTransport(a, b config.Proxy) bool {
+	return a.Name == b.Name &&
+		a.Type == b.Type &&
+		a.Address == b.Address &&
+		a.Username == b.Username &&
+		a.Password == b.Password &&
+		a.Local == b.Local &&
+		a.LocalAuthUser == b.LocalAuthUser &&
+		a.LocalAuthPass == b.LocalAuthPass
+}
+
+func relayInDNSServers(orig, relay packet.Addr, servers []string) bool {
+	validAny := false
+	for i := range servers {
+		if alt, ok := dnsRelay(servers, uint64(i)); ok {
+			validAny = true
+			if alt.Equal(relay) {
+				return true
+			}
+		}
+	}
+	if !validAny {
+		return relay.Equal(orig)
+	}
+	return false
+}

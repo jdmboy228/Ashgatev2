@@ -303,7 +303,8 @@ func (e *Engine) injector() Injector {
 	return *p
 }
 
-// Apply installs a new rule set. Existing TCP flows keep their proxy.
+// Apply installs a new rule set. Existing TCP flows keep their proxy,
+// while failed or invalidated UDP flows are retired.
 func (e *Engine) Apply(cfg *config.Config) error {
 	if err := cfg.Validate(); err != nil {
 		return err
@@ -321,7 +322,20 @@ func (e *Engine) Apply(cfg *config.Config) error {
 	e.blockTCP = newAgeSet[packet.Addr]()
 	e.blockUDP = newAgeSet[udpKey]()
 	e.unknownUDP = newAgeSet[udpKey]()
+	var stale []*udpFlow
+	for k, f := range e.udp {
+		f.mu.Lock()
+		failed := f.sess == nil && !f.failedAt.IsZero()
+		f.mu.Unlock()
+		if failed || !e.udpFlowMatchesLocked(f, snap) {
+			delete(e.udp, k)
+			stale = append(stale, f)
+		}
+	}
 	e.mu.Unlock()
+	for _, f := range stale {
+		e.retireUDP(f)
+	}
 	return nil
 }
 
