@@ -126,9 +126,13 @@ class TunnelService : VpnService() {
             when {
                 disconnect -> stop(null)
                 // Also RETRY from the notification, the system's start of an
-                // always-on VPN, and its restart after the process died (no intent).
-                tun == null -> start()
-                else -> restartSoon(full = true)
+                // always-on VPN, and its restart after the process died (no intent):
+                // explicit starts and profile/app changes run at once, without the
+                // network-flap delay.
+                else -> {
+                    cancelRestart()
+                    start()
+                }
             }
         }
         // If the process dies the interface goes with it and the picked apps
@@ -157,7 +161,7 @@ class TunnelService : VpnService() {
         super.onDestroy()
     }
 
-    /** One restart for everything that happens within [RESTART_DELAY_MS]. Runs on [worker]. */
+    /** One restart for network changes that arrive within [RESTART_DELAY_MS]. Runs on [worker]. */
     private fun restartSoon(full: Boolean) {
         restartFull = restartFull || full
         if (restart != null) return
@@ -165,8 +169,7 @@ class TunnelService : VpnService() {
             Runnable {
                 if (destroyed) return@Runnable
                 restart = null
-                // A blocked tunnel may lack a working interface: build it again.
-                val rebuild = restartFull || state == State.BLOCKED
+                val rebuild = restartFull || tun == null
                 restartFull = false
                 if (rebuild) start() else guarded { restartXray() }
             },
@@ -338,7 +341,10 @@ class TunnelService : VpnService() {
                 if (intent.getBooleanExtra(Intent.EXTRA_REPLACING, false)) return
                 val pkg = intent.data?.schemeSpecificPart ?: return
                 later {
-                    if (tun != null && pkg in Store.apps(this@TunnelService)) restartSoon(full = true)
+                    if (tun != null && pkg in Store.apps(this@TunnelService)) {
+                        cancelRestart()
+                        start()
+                    }
                 }
             }
         }
