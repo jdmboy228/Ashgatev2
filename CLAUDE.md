@@ -4,6 +4,14 @@ The app is in `ashgate-src/` (Go module `ashgate`). The installer is `installer.
 `build-installer.ps1`. Windows end-to-end tests are in `ashgate-src/e2e/` and run in
 `.github/workflows/windows-e2e.yml`.
 
+## Versioning
+
+- Always bump the application version when preparing changes for `main`, keeping all three
+  version sources in sync (verified by CI `Versions agree`):
+  `ashgate-src/internal/version/version.go`, `version.json` (with updated `release_notes`),
+  and `ashgate-src/winres/winres.json` (manifest identity, `file_version`, `product_version`,
+  `FileVersion`, `ProductVersion`), plus `ashgate-src/CHANGELOG.md`.
+
 ## Server rules
 
 - This Linux server has a small disk (~10 GB). Never install browsers or GUI packages via snap or apt (no chromium snap, no cups, no gnome/gtk/mesa).
