@@ -37,9 +37,10 @@ android {
     }
     buildTypes {
         release {
-            // R8 drops unused Kotlin/AndroidX code; proguard-rules.pro keeps
-            // the gomobile bindings the Go core calls through JNI.
+            // R8 drops unused Kotlin/AndroidX code and resources; proguard-rules.pro
+            // keeps the gomobile bindings the Go core calls through JNI.
             isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
             signingConfig = signingConfigs.findByName("release")
         }
