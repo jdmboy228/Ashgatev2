@@ -45,6 +45,10 @@ class MainActivity : Activity() {
     /** Between onStart and onStop: a late state callback must not start the pulse on a hidden screen. */
     private var visible = false
 
+    @Volatile
+    private var loading = false
+    private var afterLoad: (() -> Unit)? = null
+
     private val onState: () -> Unit = { runOnUiThread { showState(animate = true) } }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -82,7 +86,12 @@ class MainActivity : Activity() {
     }
 
     private fun open(screen: Class<out Activity>) {
-        if (Store.isOpen) startActivity(Intent(this, screen)) else loadInBackground()
+        if (Store.isOpen) {
+            startActivity(Intent(this, screen))
+        } else {
+            afterLoad = { startActivity(Intent(this, screen)) }
+            loadInBackground()
+        }
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
@@ -101,6 +110,8 @@ class MainActivity : Activity() {
 
     /** Opening the saved data (the Keystore) and listing the apps both take a moment. */
     private fun loadInBackground() {
+        if (loading) return
+        loading = true
         thread {
             val usable = Store.usable(this)
             // The same list the app picker shows, cached after the first scan.
@@ -110,11 +121,14 @@ class MainActivity : Activity() {
                 null
             }
             runOnUiThread {
+                loading = false
                 if (isFinishing || isDestroyed) return@runOnUiThread
                 if (installed != null) {
                     installedApps = installed
                     appsTotal = installed.size
                 }
+                val pending = afterLoad
+                afterLoad = null
                 val unavailable = getString(R.string.store_unavailable)
                 if (!usable) {
                     notice = unavailable
@@ -130,12 +144,14 @@ class MainActivity : Activity() {
                 }
                 showRows()
                 showState(animate = false)
+                if (usable && visible) pending?.invoke()
             }
         }
     }
 
     override fun onStop() {
         visible = false
+        afterLoad = null
         // A newer main screen may already have put its own listener here.
         if (TunnelService.listener === onState) TunnelService.listener = null
         pulse?.cancel()
@@ -290,7 +306,10 @@ class MainActivity : Activity() {
     }
 
     private fun connect() {
-        if (!Store.isOpen) return loadInBackground()
+        if (!Store.isOpen) {
+            afterLoad = { connect() }
+            return loadInBackground()
+        }
         notice = when {
             Store.selected(this) == null -> getString(R.string.need_profile)
             pickedAppsCount() == 0 -> getString(R.string.need_apps)
