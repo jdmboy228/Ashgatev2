@@ -110,7 +110,7 @@ func start(parent context.Context, cfg *config.Config, logs *logbuf.Buffer, brid
 		return nil, err
 	}
 	opened = append(opened, sockH)
-	flowH, err := windivert.Open("(tcp or udp) and event == ESTABLISHED", windivert.LayerFlow, 0, windivert.FlagSniff|windivert.FlagRecvOnly)
+	flowH, err := windivert.Open(flowFilter, windivert.LayerFlow, 0, windivert.FlagSniff|windivert.FlagRecvOnly)
 	if err != nil {
 		return nil, err
 	}

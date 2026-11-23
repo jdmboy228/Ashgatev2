@@ -19,6 +19,10 @@ func netFilter(relay4, relay6 uint16) string {
 	return "outbound and !impostor and (tcp or udp) and (!loopback or " + relay + ")"
 }
 
+// flowFilter subscribes LayerFlow to both flow creation and deletion so the
+// resolver retires exact-IP entries when flows end.
+const flowFilter = "(tcp or udp) and (event == ESTABLISHED or event == DELETED)"
+
 // relayPort is the port of a relay address such as 127.0.0.1:34010, read
 // as the config and the engine read it.
 func relayPort(addr string) (uint16, error) {
