@@ -30,10 +30,8 @@ func TestRouter(t *testing.T) {
 	if dir == "" {
 		t.Skip("ASHGATE_GEODATA is not set")
 	}
-	for _, f := range []string{"geoip.dat", "geosite.dat"} {
-		if _, err := os.Stat(filepath.Join(dir, f)); err != nil {
-			t.Fatal(err)
-		}
+	if _, err := os.Stat(filepath.Join(dir, "geosite.dat")); err != nil {
+		t.Fatal(err)
 	}
 	t.Setenv("xray.location.asset", dir)
 

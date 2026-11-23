@@ -37,10 +37,13 @@ func main() {
 }
 
 func trimDir(dir string) error {
-	if err := rewrite(filepath.Join(dir, "geoip.dat"), func(raw []byte) ([]byte, error) {
-		return trimIP(raw, keepIP)
-	}); err != nil {
-		return err
+	ipPath := filepath.Join(dir, "geoip.dat")
+	if _, err := os.Stat(ipPath); err == nil {
+		if err := rewrite(ipPath, func(raw []byte) ([]byte, error) {
+			return trimIP(raw, keepIP)
+		}); err != nil {
+			return err
+		}
 	}
 	return rewrite(filepath.Join(dir, "geosite.dat"), func(raw []byte) ([]byte, error) {
 		return trimSite(raw, keepSite)

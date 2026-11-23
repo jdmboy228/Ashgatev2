@@ -43,20 +43,18 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      # Xray's geoip:ru and geosite:category-ru come from these files; they
-      # ship inside the APK. Pinned releases, checked by hash.
+      # Xray's geosite:category-ru comes from this file; it ships inside
+      # the APK. Pinned release, checked by hash.
       - name: Geodata
         working-directory: android/app/src/main
         run: |
           mkdir -p assets && cd assets
-          curl -fsSL --retry 3 -o geoip.dat https://github.com/v2fly/geoip/releases/download/202611080027/geoip.dat
           curl -fsSL --retry 3 -o geosite.dat https://github.com/v2fly/domain-list-community/releases/download/20261110034535/dlc.dat
           sha256sum -c <<'SUMS'
-          eedb24b3b9fcba27e06b92c0428dab90d9496083091ae4cf39e11387fd99d0e2  geoip.dat
           6cc4decf520dbfd96e1e3750661976eb31d2a5381090b8768cb2ab1528201fcf  geosite.dat
           SUMS
-          # Only geoip:ru and geosite:category-ru stay (about 25 MB less);
-          # the router tests below run on the trimmed files.
+          # Only geosite:category-ru stays (about 25 MB less);
+          # the router tests below run on the trimmed file.
           (cd "$GITHUB_WORKSPACE/ashgate-src" && go run ./cmd/geotrim "$GITHUB_WORKSPACE/android/app/src/main/assets")
 
       # Links, subscriptions and proxies; the Xray document; and the real

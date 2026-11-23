@@ -373,14 +373,14 @@ class TunnelService : VpnService() {
         }
     }
 
-    /** Copies geoip.dat and geosite.dat out of the APK once per installed build. */
+    /** Copies geosite.dat out of the APK once per installed build. */
     private fun geodata(): File {
         val dir = File(filesDir, "geo")
         val stamp = File(dir, "stamp")
         val build = packageManager.getPackageInfo(packageName, 0).lastUpdateTime.toString()
         if (stamp.exists() && stamp.readText() == build) return dir
         dir.mkdirs()
-        for (name in listOf("geoip.dat", "geosite.dat")) {
+        for (name in listOf("geosite.dat")) {
             assets.open(name).use { input ->
                 File(dir, name).outputStream().use { input.copyTo(it) }
             }
