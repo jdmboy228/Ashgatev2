@@ -308,15 +308,19 @@ func XrayJSON(p Profile) ([]byte, error) {
 		"inbounds": []any{tun},
 		"outbounds": []any{
 			proxy,
-			map[string]any{"tag": TagDirect, "protocol": "freedom"},
+			map[string]any{
+				"tag":            TagDirect,
+				"protocol":       "freedom",
+				"streamSettings": map[string]any{"sockopt": map[string]any{"tcpKeepAliveIdle": 300}},
+			},
 			dnsOut,
 			map[string]any{"tag": TagBlock, "protocol": "blackhole"},
 		},
 		"routing": map[string]any{"domainStrategy": "AsIs", "rules": rules},
-		// As on the desktop: quiet connections live 30 minutes, and a
-		// half-closed one gets a few seconds to finish.
+		// Idle connections live 5 minutes (instead of the desktop's 30) so idle
+		// sockets and UDP flows do not keep the phone's cellular radio awake.
 		"policy": map[string]any{"levels": map[string]any{
-			"0":                    map[string]any{"connIdle": 1800, "uplinkOnly": 2, "downlinkOnly": 5},
+			"0":                    map[string]any{"connIdle": 300, "uplinkOnly": 2, "downlinkOnly": 5},
 			strconv.Itoa(DNSLevel): map[string]any{"connIdle": 30},
 		}},
 	}
@@ -337,7 +341,14 @@ func proxyOutbound(p Profile) (map[string]any, error) {
 		if err != nil {
 			return nil, err
 		}
-		return vless.Outbound(host, port, parsed.Params)
+		out, err := vless.Outbound(host, port, parsed.Params)
+		if err != nil {
+			return nil, err
+		}
+		if stream, ok := out["streamSettings"].(map[string]any); ok {
+			stream["sockopt"] = map[string]any{"tcpKeepAliveIdle": 300}
+		}
+		return out, nil
 	case KindSOCKS5, KindHTTP:
 		checked, err := Proxy(p.Kind, p.Name, p.Host, p.Port, p.User, p.Pass)
 		if err != nil {
@@ -352,7 +363,12 @@ func proxyOutbound(p Profile) (map[string]any, error) {
 		if checked.Kind == KindHTTP {
 			protocol = "http"
 		}
-		return map[string]any{"tag": TagProxy, "protocol": protocol, "settings": settings}, nil
+		return map[string]any{
+			"tag":            TagProxy,
+			"protocol":       protocol,
+			"settings":       settings,
+			"streamSettings": map[string]any{"sockopt": map[string]any{"tcpKeepAliveIdle": 300}},
+		}, nil
 	default:
 		return nil, errors.New("Неизвестный тип профиля")
 	}

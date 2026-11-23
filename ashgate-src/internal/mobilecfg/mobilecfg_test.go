@@ -306,11 +306,12 @@ func TestRejectsPlainDownload(t *testing.T) {
 	}
 }
 
-// DNS flows stay open until they idle out, so theirs is short.
+// DNS flows stay open until they idle out, so theirs is short; mobile
+// level-0 connections idle out after 5 minutes to save cellular battery.
 func TestDNSFlowsIdleOutQuickly(t *testing.T) {
 	for name, p := range profiles(t) {
 		levels := doc(t, p)["policy"].(map[string]any)["levels"].(map[string]any)
-		if levels["0"].(map[string]any)["connIdle"] != float64(1800) || levels["1"].(map[string]any)["connIdle"] != float64(30) {
+		if levels["0"].(map[string]any)["connIdle"] != float64(300) || levels["1"].(map[string]any)["connIdle"] != float64(30) {
 			t.Fatalf("%s: levels = %v", name, levels)
 		}
 		for _, o := range outbounds(t, p) {
