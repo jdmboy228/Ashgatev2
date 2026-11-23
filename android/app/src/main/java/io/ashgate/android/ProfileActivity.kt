@@ -129,9 +129,11 @@ class ProfileActivity : Activity() {
                 val saved = Store.profiles(this)
                     .mapNotNull { p -> ProfileInput.serverKey(p.optString("link"))?.let { it to p.getString("id") } }
                     .groupBy({ it.first }, { it.second })
-                val ids = ProfileInput.ids(saved, found.map { ProfileInput.serverKey(it.optString("link")) }, id)
+                val incomingKeys = found.map { ProfileInput.serverKey(it.optString("link")) }
+                val ids = ProfileInput.ids(saved, incomingKeys, id)
                 found.forEachIndexed { i, p -> ids[i]?.let { p.put("id", it) } }
                 found.forEach { Store.put(this, it) }
+                ProfileInput.duplicateOnEdit(saved, incomingKeys, ids, id)?.let { Store.delete(this, it) }
                 changed = found.map { it.getString("id") }.toSet()
                 null
             } catch (e: Exception) {

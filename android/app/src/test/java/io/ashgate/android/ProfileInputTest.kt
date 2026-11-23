@@ -35,6 +35,14 @@ class ProfileInputTest {
         assertEquals("$uuid@server.example:8443", ProfileInput.serverKey(link))
         assertEquals(ProfileInput.serverKey(link), ProfileInput.serverKey(renamed))
         assertEquals(ProfileInput.serverKey(link), ProfileInput.serverKey(" VLESS://${uuid.uppercase()}@SERVER.example:8443/?x=1"))
+        assertEquals(
+            "$uuid@server.example:443",
+            ProfileInput.serverKey("vless://$uuid@server.example?type=xhttp&security=reality"),
+        )
+        assertEquals(
+            "$uuid@[2001:db8::1]:443",
+            ProfileInput.serverKey("vless://$uuid@[2001:db8::1]?type=xhttp&security=reality"),
+        )
     }
 
     @Test
@@ -87,5 +95,15 @@ class ProfileInputTest {
     @Test
     fun proxiesWithoutKeysAreNew() {
         assertEquals(listOf(null), ProfileInput.ids(mapOf("a@one:443" to listOf("id-1")), listOf(null), null))
+    }
+
+    @Test
+    fun editingProfileToExistingServerFindsDuplicateId() {
+        val saved = mapOf("a@one:443" to listOf("id-1"), "b@two:443" to listOf("id-2"))
+        val incoming = listOf("b@two:443")
+        val assigned = ProfileInput.ids(saved, incoming, "id-1")
+        assertEquals(listOf("id-1"), assigned)
+        assertEquals("id-2", ProfileInput.duplicateOnEdit(saved, incoming, assigned, "id-1"))
+        assertNull(ProfileInput.duplicateOnEdit(saved, listOf("a@one:443"), listOf("id-1"), "id-1"))
     }
 }
