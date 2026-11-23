@@ -74,3 +74,52 @@ func TestTargetsRoundTrip(t *testing.T) {
 		t.Fatalf("got %v", got)
 	}
 }
+
+func TestUnblockKeepsStateOnNetshErrorAndClearsOnNoRules(t *testing.T) {
+	state := filepath.Join(t.TempDir(), "killswitch.json")
+	var failErr error
+	f := NewWithRunner(state, func(line string) error {
+		if strings.Contains(line, "delete rule") && failErr != nil {
+			return failErr
+		}
+		return nil
+	})
+	if err := f.Block([]string{`C:\Apps\app.exe`}); err != nil {
+		t.Fatal(err)
+	}
+
+	// A real netsh error must preserve f.cur and killswitch.json.
+	failErr = errors.New("netsh: exit status 1: access denied")
+	if err := f.Unblock(); err == nil {
+		t.Fatal("expected error from Unblock")
+	}
+	if got := f.Blocked(); len(got) != 1 || got[0] != `C:\Apps\app.exe` {
+		t.Fatalf("Unblock error cleared memory state: %v", got)
+	}
+	if reloaded := New(state).Blocked(); len(reloaded) != 1 || reloaded[0] != `C:\Apps\app.exe` {
+		t.Fatalf("Unblock error cleared persisted state: %v", reloaded)
+	}
+
+	// "No rules match" (English and Russian) means rules are already gone.
+	failErr = errors.New("netsh: exit status 1: No rules match the specified criteria.")
+	if err := f.Unblock(); err != nil {
+		t.Fatalf("English no-rules error failed Unblock: %v", err)
+	}
+	if got := f.Blocked(); len(got) != 0 {
+		t.Fatalf("blocked after English no-rules: %v", got)
+	}
+	if reloaded := New(state).Blocked(); len(reloaded) != 0 {
+		t.Fatalf("persisted state after English no-rules: %v", reloaded)
+	}
+
+	if err := f.Block([]string{`C:\Apps\app.exe`}); err != nil {
+		t.Fatal(err)
+	}
+	failErr = errors.New("netsh: exit status 1: Нет правил, соответствующих указанным критериям.")
+	if err := f.Unblock(); err != nil {
+		t.Fatalf("Russian no-rules error failed Unblock: %v", err)
+	}
+	if got := f.Blocked(); len(got) != 0 {
+		t.Fatalf("blocked after Russian no-rules: %v", got)
+	}
+}

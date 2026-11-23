@@ -1,6 +1,15 @@
 package runtime
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
+
+func TestFlowFilterIncludesDeleted(t *testing.T) {
+	if !strings.Contains(flowFilter, "ESTABLISHED") || !strings.Contains(flowFilter, "DELETED") {
+		t.Fatalf("flowFilter = %q, want both ESTABLISHED and DELETED", flowFilter)
+	}
+}
 
 func TestNetFilterOnePort(t *testing.T) {
 	got := netFilter(34010, 34010)

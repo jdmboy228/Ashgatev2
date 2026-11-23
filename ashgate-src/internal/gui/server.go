@@ -74,22 +74,28 @@ type controller struct {
 	alive     map[string]bool
 	aliveAt   time.Time
 	aliveBusy bool
-	// startMu keeps two Start clicks from opening two capture sessions.
+	// startMu serializes start, stop, and shutdown.
 	startMu sync.Mutex
+	// sessWg tracks session watcher goroutines launched by start.
+	sessWg sync.WaitGroup
 
 	// Kill switch: ksMu serialises firewall changes; stopping is set while
-	// a Stop is in progress so a sync does not lift the block early.
+	// a Stop is in progress so a sync does not lift the block early;
+	// closed prevents new sessions from starting during shutdown.
 	ksMu      sync.Mutex
 	stopping  bool
+	closed    bool
 	guardStop func()
 	ksMissing []string
 	ksErr     string
 	// ksPending/ksRunning coalesce kill-switch syncs requested by saves.
 	ksPending bool
 	ksRunning bool
-	// ksSaved is the target list last written for the guard; see
-	// saveTargets. Guarded by ksMu.
+	// ksSaved is the target list last written for the guard; ksClean marks
+	// that Ashgate's firewall rules were confirmed absent since the last
+	// block. Guarded by ksMu.
 	ksSaved string
+	ksClean bool
 
 	// updateURL is the download page from the last update check that found
 	// a newer version. /api/update/open opens only this link, never one the
@@ -158,13 +164,27 @@ func (c *controller) setNotice(text string) {
 	c.mu.Unlock()
 }
 
-// shutdown stops published VLESS bridges. Capture is stopped separately.
+// shutdown prevents any new capture session from starting, stops an active
+// capture session, stops background loops, and closes published VLESS bridges.
 func (c *controller) shutdown() {
-	if c == nil || c.bridges == nil {
+	if c == nil {
 		return
 	}
-	c.doneOnce.Do(func() { close(c.done) })
-	c.bridges.Close()
+	// Mark closed before taking startMu so an in-flight startSession sees it
+	// as soon as it returns and never lifts the kill switch.
+	c.mu.Lock()
+	c.closed = true
+	c.mu.Unlock()
+	c.startMu.Lock()
+	_ = c.stopLocked()
+	c.startMu.Unlock()
+	c.sessWg.Wait()
+	if c.done != nil {
+		c.doneOnce.Do(func() { close(c.done) })
+	}
+	if c.bridges != nil {
+		c.bridges.Close()
+	}
 }
 
 func (c *controller) Handler() http.Handler {
@@ -646,6 +666,10 @@ func (c *controller) start() error {
 	c.startMu.Lock()
 	defer c.startMu.Unlock()
 	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return errors.New("Ashgate завершает работу")
+	}
 	if c.sess != nil && c.sess.Running() {
 		c.mu.Unlock()
 		return nil
@@ -664,12 +688,23 @@ func (c *controller) start() error {
 		c.mu.Unlock()
 		return err
 	}
+	if c.closed {
+		c.mu.Unlock()
+		sess.Stop()
+		select {
+		case <-sess.Done():
+		case <-time.After(8 * time.Second):
+		}
+		return errors.New("Ashgate завершает работу")
+	}
 	c.sess = sess
 	c.errText = ""
 	// Unlock before anything below takes c.mu again: sync.Mutex is not
 	// reentrant, and holding it here froze the window on Start (0.7.1).
 	c.mu.Unlock()
+	c.sessWg.Add(1)
 	go func() {
+		defer c.sessWg.Done()
 		select {
 		case <-sess.Failed():
 			c.blockNow() // see killswitch.go
@@ -682,9 +717,12 @@ func (c *controller) start() error {
 				c.errText = e.Error()
 			}
 		}
+		closed := c.closed
 		c.mu.Unlock()
-		// Capture ended, by Stop or by a failure: block proxied apps.
-		c.syncKill()
+		if !closed {
+			// Capture ended, by Stop or by a failure: block proxied apps.
+			c.syncKill()
+		}
 	}()
 	// Capture is up, so the firewall block can be lifted. Wait for it (and
 	// for the guard), like stop does: until then proxied apps are still
@@ -694,10 +732,21 @@ func (c *controller) start() error {
 }
 
 func (c *controller) stop() error {
+	c.startMu.Lock()
+	defer c.startMu.Unlock()
+	return c.stopLocked()
+}
+
+// stopLocked stops the current capture session. Callers hold startMu.
+func (c *controller) stopLocked() error {
 	c.mu.Lock()
 	sess := c.sess
 	c.mu.Unlock()
 	if sess == nil {
+		return nil
+	}
+	if !sess.Running() {
+		c.syncKill()
 		return nil
 	}
 	// Block before capture stops, so there is no moment when proxied

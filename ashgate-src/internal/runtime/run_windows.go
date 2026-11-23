@@ -110,7 +110,7 @@ func start(parent context.Context, cfg *config.Config, logs *logbuf.Buffer, brid
 		return nil, err
 	}
 	opened = append(opened, sockH)
-	flowH, err := windivert.Open("(tcp or udp) and event == ESTABLISHED", windivert.LayerFlow, 0, windivert.FlagSniff|windivert.FlagRecvOnly)
+	flowH, err := windivert.Open(flowFilter, windivert.LayerFlow, 0, windivert.FlagSniff|windivert.FlagRecvOnly)
 	if err != nil {
 		return nil, err
 	}
@@ -160,10 +160,10 @@ func start(parent context.Context, cfg *config.Config, logs *logbuf.Buffer, brid
 		consume(ctx, newCapture(eng, div, udp), pkts)
 	}()
 	wg.Add(1)
-	go acceptLoop(ln4, eng, &wg)
+	go acceptLoop(ctx, ln4, eng, &wg)
 	if ln6 != nil {
 		wg.Add(1)
-		go acceptLoop(ln6, eng, &wg)
+		go acceptLoop(ctx, ln6, eng, &wg)
 	}
 	wg.Add(1)
 	go func() {
@@ -178,6 +178,7 @@ func start(parent context.Context, cfg *config.Config, logs *logbuf.Buffer, brid
 		if ownBridges {
 			bridges.Close()
 		}
+		eng.SetInjector(nil)
 		_ = netH.Shutdown(windivert.ShutdownBoth)
 		_ = sockH.Shutdown(windivert.ShutdownBoth)
 		_ = flowH.Shutdown(windivert.ShutdownBoth)
@@ -186,8 +187,9 @@ func start(parent context.Context, cfg *config.Config, logs *logbuf.Buffer, brid
 			_ = ln6.Close()
 		}
 		wg.Wait()
+		eng.Wait()
 		res.Close()
-		_ = netH.Close()
+		_ = div.close()
 		_ = sockH.Close()
 		_ = flowH.Close()
 		// The driver does not unload by itself. Stop it before releasing
@@ -267,14 +269,18 @@ func recvNet(ctx context.Context, cancel context.CancelFunc, s *Session, h windi
 	}
 }
 
-func acceptLoop(ln net.Listener, eng *engine.Engine, wg *sync.WaitGroup) {
+func acceptLoop(ctx context.Context, ln net.Listener, eng *engine.Engine, wg *sync.WaitGroup) {
 	defer wg.Done()
 	for {
 		c, err := ln.Accept()
 		if err != nil {
 			return
 		}
-		go eng.ServeConn(c)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			eng.ServeConn(ctx, c)
+		}()
 	}
 }
 
@@ -307,13 +313,30 @@ type divert struct {
 func (d *divert) send(pkt []byte, addr *windivert.Address) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if d.h == 0 {
+		return windows.ERROR_INVALID_HANDLE
+	}
 	return d.h.Send(pkt, addr)
 }
 
 func (d *divert) sendBatch(b *windivert.Batch) (int, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if d.h == 0 {
+		return 0, windows.ERROR_INVALID_HANDLE
+	}
 	return d.h.SendBatch(b.Buf, b.Addrs)
+}
+
+func (d *divert) close() error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.h == 0 {
+		return nil
+	}
+	h := d.h
+	d.h = 0
+	return h.Close()
 }
 
 func (d *divert) InjectInbound(pkt []byte, ifIdx, subIfIdx uint32) error {

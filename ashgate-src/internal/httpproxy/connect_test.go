@@ -2,6 +2,7 @@ package httpproxy
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"testing"
@@ -74,5 +75,32 @@ func TestDNSQueryOverConnect(t *testing.T) {
 	}
 	if len(got) < 3 || got[0] != 0x12 || got[2]&0x80 == 0 {
 		t.Fatalf("response %x", got)
+	}
+}
+
+func TestDNSExchangeCancelsWithContext(t *testing.T) {
+	near, far := net.Pipe()
+	defer near.Close()
+	defer far.Close()
+	go func() {
+		buf := make([]byte, 256)
+		_, _ = far.Read(buf)
+		_, _ = far.Read(buf)
+	}()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := dnsExchange(ctx, near, []byte{0x12, 0x34, 0x01, 0x00})
+		done <- err
+	}()
+	time.Sleep(30 * time.Millisecond)
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("got %v, want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("dnsExchange did not unblock on context cancellation")
 	}
 }

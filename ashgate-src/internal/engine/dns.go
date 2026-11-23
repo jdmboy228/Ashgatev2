@@ -289,6 +289,12 @@ func (e *Engine) systemEncryptedDNS(pkt []byte, h *packet.Header, meta Meta, pro
 // HTTP proxies have no UDP, and system DNS through SOCKS5 must not depend
 // on UDP ASSOCIATE, which many servers lack.
 func (e *Engine) forwardDNSTCP(ctx context.Context, flow *udpFlow, payload []byte) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 	server := flow.relay.String()
 	var resp []byte
 	var err error
@@ -298,10 +304,16 @@ func (e *Engine) forwardDNSTCP(ctx context.Context, flow *udpFlow, payload []byt
 		resp, err = e.dnsTCP(ctx, flow.proxy, flow.relay, payload)
 	}
 	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		flow.stat.fail(err.Error(), e.now())
 		e.log(logbuf.Event{Process: display(flow.proc), PID: flow.proc.PID, Proto: "UDP", Dest: flow.orig.String(), Via: flow.proxy.Name, Status: "error", Error: err.Error()})
 		e.failDNS(flow, payload)
 		return err
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
 	}
 	n := int64(len(resp))
 	flow.down.Add(n)
@@ -317,6 +329,9 @@ func (e *Engine) dnsTCP(ctx context.Context, p config.Proxy, server packet.Addr,
 	if len(query) == 0 || len(query) > 65535 {
 		return nil, errors.New("dns query has an invalid length")
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	c, err := e.dial.DialTCP(ctx, p, server.NetIP().String(), server.Port)
@@ -324,6 +339,8 @@ func (e *Engine) dnsTCP(ctx context.Context, p config.Proxy, server packet.Addr,
 		return nil, err
 	}
 	defer c.Close()
+	stop := context.AfterFunc(ctx, func() { _ = c.Close() })
+	defer stop()
 	if dl, ok := ctx.Deadline(); ok {
 		_ = c.SetDeadline(dl)
 	}
@@ -331,14 +348,23 @@ func (e *Engine) dnsTCP(ctx context.Context, p config.Proxy, server packet.Addr,
 	binary.BigEndian.PutUint16(msg, uint16(len(query)))
 	copy(msg[2:], query)
 	if _, err := c.Write(msg); err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		return nil, err
 	}
 	var hdr [2]byte
 	if _, err := io.ReadFull(c, hdr[:]); err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		return nil, err
 	}
 	resp := make([]byte, binary.BigEndian.Uint16(hdr[:]))
 	if _, err := io.ReadFull(c, resp); err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		return nil, err
 	}
 	return resp, nil

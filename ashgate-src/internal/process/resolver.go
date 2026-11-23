@@ -74,6 +74,7 @@ type entry struct {
 type Resolver struct {
 	mu         sync.Mutex
 	exact      map[exactKey]entry
+	exactPorts map[wildKey]map[exactKey]struct{}
 	wild       map[wildKey]entry
 	helper     map[exactKey]uint32
 	helperWild map[wildKey]uint32
@@ -113,6 +114,7 @@ func (r *Resolver) Close() {
 func New() *Resolver {
 	r := &Resolver{
 		exact:      map[exactKey]entry{},
+		exactPorts: map[wildKey]map[exactKey]struct{}{},
 		wild:       map[wildKey]entry{},
 		helper:     map[exactKey]uint32{},
 		helperWild: map[wildKey]uint32{},
@@ -141,16 +143,81 @@ func (r *Resolver) Observe(proto uint8, local packet.Addr, pid uint32, closing b
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	wk := wildKey{proto, local.Port}
 	if unspecified(local) {
-		r.wild[wildKey{proto, local.Port}] = e
+		if closing {
+			// Do not clobber a newer open wildcard socket of another process.
+			if cur, ok := r.wild[wk]; !ok || !cur.until.IsZero() || cur.proc.PID == pid {
+				r.wild[wk] = e
+			}
+			// Retire exact entries created by LayerFlow ESTABLISHED for this closing
+			// wildcard socket so they cannot stay open forever and shadow reuse.
+			for ek := range r.exactPorts[wk] {
+				cur := r.exact[ek]
+				if cur.proc.PID == pid || !alive(cur, now) {
+					r.delExactLocked(ek)
+				}
+			}
+		} else {
+			// A new wildcard socket on (proto, port) invalidates stale exact entries
+			// on that port (e.g. from a previous owner whose CLOSE was missed or late).
+			for ek := range r.exactPorts[wk] {
+				r.delExactLocked(ek)
+			}
+			r.wild[wk] = e
+		}
 	} else {
-		r.exact[exactKey{proto, local}] = e
+		ek := exactKey{proto, local}
+		if closing {
+			cur, hasCur := r.exact[ek]
+			switch {
+			case hasCur && cur.until.IsZero() && cur.proc.PID != pid:
+				// Newer open exact socket belongs to another process.
+			case (!hasCur || !cur.until.IsZero()) && r.wildOpenForOtherLocked(wk, pid):
+				// Newer open wildcard socket belongs to another process; do not insert
+				// a closed exact entry that would shadow it.
+			default:
+				r.setExactLocked(ek, e)
+			}
+		} else {
+			r.setExactLocked(ek, e)
+		}
 	}
 	if r.pruneAt.IsZero() {
 		r.pruneAt = now
 	} else if now.Sub(r.pruneAt) >= pruneEvery {
 		r.pruneLocked(now)
 	}
+}
+
+func (r *Resolver) setExactLocked(k exactKey, e entry) {
+	r.exact[k] = e
+	if r.exactPorts == nil {
+		r.exactPorts = map[wildKey]map[exactKey]struct{}{}
+	}
+	wk := wildKey{k.proto, k.addr.Port}
+	m := r.exactPorts[wk]
+	if m == nil {
+		m = map[exactKey]struct{}{}
+		r.exactPorts[wk] = m
+	}
+	m[k] = struct{}{}
+}
+
+func (r *Resolver) delExactLocked(k exactKey) {
+	delete(r.exact, k)
+	wk := wildKey{k.proto, k.addr.Port}
+	if m := r.exactPorts[wk]; m != nil {
+		delete(m, k)
+		if len(m) == 0 {
+			delete(r.exactPorts, wk)
+		}
+	}
+}
+
+func (r *Resolver) wildOpenForOtherLocked(wk wildKey, pid uint32) bool {
+	w, ok := r.wild[wk]
+	return ok && w.until.IsZero() && w.proc.PID != pid
 }
 
 // pruneLocked drops closed sockets past their grace period, sockets of
@@ -188,7 +255,7 @@ func (r *Resolver) pruneLocked(now time.Time) {
 	}
 	for k, e := range r.exact {
 		if !alive(e, now) || socketDead(e.proc.PID) {
-			delete(r.exact, k)
+			r.delExactLocked(k)
 		}
 	}
 	for k, e := range r.wild {
@@ -383,7 +450,7 @@ func (r *Resolver) socketLocked(proto uint8, src packet.Addr, now time.Time, sta
 	if e, ok := r.exact[exactKey{proto, src}]; ok {
 		switch {
 		case !alive(e, now):
-			delete(r.exact, exactKey{proto, src})
+			r.delExactLocked(exactKey{proto, src})
 		case counts(e):
 			return e.proc, true, time.Time{}
 		default:

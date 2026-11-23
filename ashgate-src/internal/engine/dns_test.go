@@ -458,3 +458,51 @@ func TestSystemDNSOldConnectionDropped(t *testing.T) {
 		t.Fatalf("svchost's open DNS connection went %v", r.Action)
 	}
 }
+
+func TestForwardDNSTCPCancelsWithContext(t *testing.T) {
+	near, far := net.Pipe()
+	defer near.Close()
+	defer far.Close()
+	go func() {
+		// Read the query and stay silent until closed.
+		buf := make([]byte, 512)
+		_, _ = far.Read(buf)
+		<-time.After(5 * time.Second)
+	}()
+
+	pd := &pipeDial{next: make(chan net.Conn, 1)}
+	pd.next <- near
+	inj := &memInj{}
+	e, logs := newEngine(t, testConfig(), svchost, pd, inj)
+	flow := &udpFlow{
+		app:   packet.V4(10, 0, 0, 2, 50090),
+		orig:  packet.V4(192, 168, 1, 1, 53),
+		relay: packet.V4(1, 1, 1, 1, 53),
+		proxy: config.Proxy{Name: "socks", Type: "socks5"},
+		proc:  svchost.p,
+		sys:   true,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- e.forwardDNSTCP(ctx, flow, dnsQuery(1, "slow.example.com", 1))
+	}()
+	time.Sleep(30 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("got %v, want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("forwardDNSTCP did not unblock on context cancellation")
+	}
+	if inj.count() != 0 {
+		t.Fatalf("injected %d replies on cancelled shutdown, want 0", inj.count())
+	}
+	if len(logs.Snapshot()) != 0 {
+		t.Fatalf("logged %v on cancelled shutdown, want 0 errors", logs.Snapshot())
+	}
+}

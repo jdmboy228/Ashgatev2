@@ -383,3 +383,95 @@ func TestPruneKeepsSocketsOfUnreadablePIDs(t *testing.T) {
 		t.Fatal("the socket of an exited process was kept")
 	}
 }
+
+func TestWildcardCloseClearsExactFlowEntry(t *testing.T) {
+	start := time.Unix(1000, 0)
+	r, clock := testResolver(start)
+	wild := packet.V4(0, 0, 0, 0, 54321)
+	exact := packet.V4(192, 168, 1, 10, 54321)
+
+	// Unconnected UDP socket binds 0.0.0.0:54321 and generates an interface-IP
+	// LayerFlow ESTABLISHED event for PID 10.
+	r.Observe(packet.ProtoUDP, wild, 10, false)
+	r.Observe(packet.ProtoUDP, exact, 10, false)
+	if p, ok := r.Owner(packet.ProtoUDP, exact, NewFlow, false); !ok || p.PID != 10 {
+		t.Fatalf("open socket owner: %+v %v", p, ok)
+	}
+
+	// Closing 0.0.0.0:54321 must retire PID 10's exact flow entry so it cannot
+	// stay open forever and shadow reuse.
+	r.Observe(packet.ProtoUDP, wild, 10, true)
+	r.mu.Lock()
+	_, exactExists := r.exact[exactKey{packet.ProtoUDP, exact}]
+	r.mu.Unlock()
+	if exactExists {
+		t.Fatal("stale exact entry survived wildcard CLOSE")
+	}
+	if p, ok := r.Owner(packet.ProtoUDP, exact, NewFlow, false); ok {
+		t.Fatalf("NewFlow returned closed wildcard owner PID %d", p.PID)
+	}
+	// A one-shot datagram within recentClose still resolves via wildcard entry.
+	if p, ok := r.Owner(packet.ProtoUDP, exact, NewDatagram, false); !ok || p.PID != 10 {
+		t.Fatalf("NewDatagram within recentClose: %+v %v, want PID 10", p, ok)
+	}
+	*clock = start.Add(recentClose + time.Millisecond)
+	if p, ok := r.Owner(packet.ProtoUDP, exact, NewDatagram, false); ok {
+		t.Fatalf("NewDatagram after recentClose returned PID %d", p.PID)
+	}
+
+	// Port reuse by PID 20 on 0.0.0.0:54321 must immediately attribute to PID 20.
+	r.Observe(packet.ProtoUDP, wild, 20, false)
+	if p, ok := r.Owner(packet.ProtoUDP, exact, NewFlow, false); !ok || p.PID != 20 {
+		t.Fatalf("reused port owner: %+v %v, want PID 20", p, ok)
+	}
+}
+
+func TestWildcardBindClearsStaleExactEntry(t *testing.T) {
+	start := time.Unix(1000, 0)
+	r, _ := testResolver(start)
+	wild := packet.V4(0, 0, 0, 0, 54322)
+	exact := packet.V4(192, 168, 1, 10, 54322)
+
+	// PID 10 has an exact entry whose CLOSE was missed or delayed.
+	r.Observe(packet.ProtoUDP, exact, 10, false)
+	// PID 20 binds wildcard on the same port.
+	r.Observe(packet.ProtoUDP, wild, 20, false)
+	if p, ok := r.Owner(packet.ProtoUDP, exact, NewFlow, false); !ok || p.PID != 20 {
+		t.Fatalf("after wildcard bind: %+v %v, want PID 20", p, ok)
+	}
+	// A late EventFlowDeleted for PID 10 must not clobber PID 20.
+	r.Observe(packet.ProtoUDP, exact, 10, true)
+	if p, ok := r.Owner(packet.ProtoUDP, exact, NewFlow, false); !ok || p.PID != 20 {
+		t.Fatalf("after late DELETED for old PID (NewFlow): %+v %v, want PID 20", p, ok)
+	}
+	if p, ok := r.Owner(packet.ProtoUDP, exact, NewDatagram, false); !ok || p.PID != 20 {
+		t.Fatalf("after late DELETED for old PID (NewDatagram): %+v %v, want PID 20", p, ok)
+	}
+}
+
+func TestFlowDeletedAllowsPruneWhileWildcardStaysOpen(t *testing.T) {
+	start := time.Unix(1000, 0)
+	r, clock := testResolver(start)
+	wild := packet.V4(0, 0, 0, 0, 54323)
+	exact := packet.V4(192, 168, 1, 10, 54323)
+
+	r.Observe(packet.ProtoUDP, wild, 10, false)
+	r.Observe(packet.ProtoUDP, exact, 10, false)
+	// Flow ends (EventFlowDeleted) while socket stays open.
+	r.Observe(packet.ProtoUDP, exact, 10, true)
+	if p, ok := r.Owner(packet.ProtoUDP, exact, NewFlow, false); !ok || p.PID != 10 {
+		t.Fatalf("open wildcard owner after flow delete: %+v %v", p, ok)
+	}
+	*clock = start.Add(pruneEvery + closeGrace)
+	r.Observe(packet.ProtoUDP, packet.V4(10, 0, 0, 1, 12345), 11, false)
+	r.mu.Lock()
+	_, exactExists := r.exact[exactKey{packet.ProtoUDP, exact}]
+	_, wildExists := r.wild[wildKey{packet.ProtoUDP, 54323}]
+	r.mu.Unlock()
+	if exactExists {
+		t.Fatal("deleted exact flow entry was not pruned")
+	}
+	if !wildExists {
+		t.Fatal("open wildcard socket entry was pruned")
+	}
+}

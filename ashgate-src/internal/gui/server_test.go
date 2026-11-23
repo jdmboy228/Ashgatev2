@@ -622,3 +622,239 @@ func TestCyrillicProxyNameRoundTrip(t *testing.T) {
 		t.Fatalf("%+v %+v", got.Proxies, got.Rules)
 	}
 }
+
+func TestStopWaitsForInFlightStart(t *testing.T) {
+	dir := t.TempDir()
+	fw := killswitch.NewWithRunner(filepath.Join(dir, "killswitch.json"), func(string) error { return nil })
+	cfg := config.Default()
+	cfg.KillSwitch = true
+	cfg.Proxies = []config.Proxy{{Name: "p", Type: "socks5", Address: "127.0.0.1:1080"}}
+	cfg.Rules = []config.Rule{{Process: `C:\Apps\app.exe`, Action: "proxy", Proxy: "p"}}
+
+	c := &controller{
+		path:     filepath.Join(dir, "config.json"),
+		cfg:      cfg,
+		checks:   map[string]probe.Report{},
+		bridgeSt: map[string]vless.Status{},
+		bridges:  vless.NewManager(),
+		done:     make(chan struct{}),
+		loopDone: make(chan struct{}),
+		hooks: hooks{
+			firewall: fw,
+			guard:    func(string) (func(), error) { return func() {}, nil },
+		},
+	}
+	defer c.shutdown()
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	sessDone := make(chan struct{})
+	var stopOnce sync.Once
+	sess := rt.NewFakeSession(func() {
+		stopOnce.Do(func() { close(sessDone) })
+	}, sessDone)
+	c.startSession = func(context.Context, *config.Config, *logbuf.Buffer, *vless.Manager) (*rt.Session, error) {
+		close(entered)
+		<-release
+		return sess, nil
+	}
+
+	startErr := make(chan error, 1)
+	go func() { startErr <- c.start() }()
+	<-entered
+
+	stopErr := make(chan error, 1)
+	go func() { stopErr <- c.stop() }()
+
+	// stop() must block behind startMu until start() finishes.
+	select {
+	case err := <-stopErr:
+		t.Fatalf("stop returned early (%v) while start was in flight", err)
+	case <-time.After(30 * time.Millisecond):
+	}
+
+	close(release)
+	if err := <-startErr; err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if err := <-stopErr; err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	if sess.Running() {
+		t.Fatal("session still running after stop")
+	}
+	if got := fw.Blocked(); len(got) != 1 || got[0] != `C:\Apps\app.exe` {
+		t.Fatalf("kill switch blocked = %v, want app blocked after stop", got)
+	}
+}
+
+func TestShutdownDuringInFlightStartNeverUnblocksKillSwitch(t *testing.T) {
+	dir := t.TempDir()
+	var mu sync.Mutex
+	var unblocksAfterEnter int
+	var trackUnblocks bool
+	fw := killswitch.NewWithRunner(filepath.Join(dir, "killswitch.json"), func(line string) error {
+		mu.Lock()
+		if trackUnblocks && strings.Contains(line, "delete rule") {
+			unblocksAfterEnter++
+		}
+		mu.Unlock()
+		return nil
+	})
+	cfg := config.Default()
+	cfg.KillSwitch = true
+	cfg.Proxies = []config.Proxy{{Name: "p", Type: "socks5", Address: "127.0.0.1:1080"}}
+	cfg.Rules = []config.Rule{{Process: `C:\Apps\app.exe`, Action: "proxy", Proxy: "p"}}
+
+	c := &controller{
+		path:     filepath.Join(dir, "config.json"),
+		cfg:      cfg,
+		checks:   map[string]probe.Report{},
+		bridgeSt: map[string]vless.Status{},
+		bridges:  vless.NewManager(),
+		done:     make(chan struct{}),
+		loopDone: make(chan struct{}),
+		hooks: hooks{
+			firewall: fw,
+			guard:    func(string) (func(), error) { return func() {}, nil },
+		},
+	}
+	c.syncKill()
+	if got := fw.Blocked(); len(got) != 1 {
+		t.Fatalf("initial block = %v", got)
+	}
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	sessDone := make(chan struct{})
+	var stopOnce sync.Once
+	sess := rt.NewFakeSession(func() {
+		stopOnce.Do(func() { close(sessDone) })
+	}, sessDone)
+	var starts int
+	c.startSession = func(context.Context, *config.Config, *logbuf.Buffer, *vless.Manager) (*rt.Session, error) {
+		starts++
+		close(entered)
+		<-release
+		return sess, nil
+	}
+
+	startErr := make(chan error, 1)
+	go func() { startErr <- c.start() }()
+	<-entered
+
+	mu.Lock()
+	trackUnblocks = true
+	mu.Unlock()
+
+	shutDone := make(chan struct{})
+	go func() {
+		c.shutdown()
+		close(shutDone)
+	}()
+	time.Sleep(30 * time.Millisecond)
+	close(release)
+
+	if err := <-startErr; err == nil {
+		t.Fatal("start succeeded after shutdown")
+	}
+	<-shutDone
+	if sess.Running() {
+		t.Fatal("in-flight session was left running after shutdown")
+	}
+	mu.Lock()
+	gotUnblocks := unblocksAfterEnter
+	mu.Unlock()
+	if gotUnblocks != 0 {
+		t.Fatalf("kill switch was unblocked %d times during shutdown", gotUnblocks)
+	}
+	if got := fw.Blocked(); len(got) != 1 || got[0] != `C:\Apps\app.exe` {
+		t.Fatalf("kill switch blocked = %v after shutdown", got)
+	}
+	if err := c.start(); err == nil || starts != 1 {
+		t.Fatalf("late start after shutdown: err=%v starts=%d", err, starts)
+	}
+}
+
+func TestConcurrentStopsKeepStoppingUntilDone(t *testing.T) {
+	dir := t.TempDir()
+	fw := killswitch.NewWithRunner(filepath.Join(dir, "killswitch.json"), func(string) error { return nil })
+	cfg := config.Default()
+	cfg.KillSwitch = true
+	cfg.Proxies = []config.Proxy{{Name: "p", Type: "socks5", Address: "127.0.0.1:1080"}}
+	cfg.Rules = []config.Rule{{Process: `C:\Apps\app.exe`, Action: "proxy", Proxy: "p"}}
+
+	c := &controller{
+		path:     filepath.Join(dir, "config.json"),
+		cfg:      cfg,
+		checks:   map[string]probe.Report{},
+		bridgeSt: map[string]vless.Status{},
+		bridges:  vless.NewManager(),
+		done:     make(chan struct{}),
+		loopDone: make(chan struct{}),
+		hooks: hooks{
+			firewall: fw,
+			guard:    func(string) (func(), error) { return func() {}, nil },
+		},
+	}
+	defer c.shutdown()
+
+	stopCalled := make(chan struct{})
+	allowDone := make(chan struct{})
+	sessDone := make(chan struct{})
+	var once sync.Once
+	sess := rt.NewFakeSession(func() {
+		once.Do(func() {
+			close(stopCalled)
+			go func() {
+				<-allowDone
+				close(sessDone)
+			}()
+		})
+	}, sessDone)
+	c.startSession = func(context.Context, *config.Config, *logbuf.Buffer, *vless.Manager) (*rt.Session, error) {
+		return sess, nil
+	}
+	if err := c.start(); err != nil {
+		t.Fatal(err)
+	}
+
+	err1 := make(chan error, 1)
+	err2 := make(chan error, 1)
+	go func() { err1 <- c.stop() }()
+	go func() { err2 <- c.stop() }()
+
+	<-stopCalled
+	c.mu.Lock()
+	stoppingMid := c.stopping
+	c.mu.Unlock()
+	if !stoppingMid {
+		t.Fatal("c.stopping cleared while stop was still waiting for session")
+	}
+
+	// Neither stop() may return before sess.Done() closes.
+	select {
+	case err := <-err1:
+		t.Fatalf("first stop returned early: %v", err)
+	case err := <-err2:
+		t.Fatalf("second stop returned early: %v", err)
+	case <-time.After(30 * time.Millisecond):
+	}
+
+	close(allowDone)
+	if err := <-err1; err != nil {
+		t.Fatalf("stop 1: %v", err)
+	}
+	if err := <-err2; err != nil {
+		t.Fatalf("stop 2: %v", err)
+	}
+	c.mu.Lock()
+	stoppingAfter := c.stopping
+	c.mu.Unlock()
+	if stoppingAfter {
+		t.Fatal("c.stopping remained true after stop completed")
+	}
+	if got := fw.Blocked(); len(got) != 1 || got[0] != `C:\Apps\app.exe` {
+		t.Fatalf("kill switch blocked = %v after stop", got)
+	}
+}

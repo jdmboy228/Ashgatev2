@@ -88,7 +88,7 @@ func TestRelayHealth(t *testing.T) {
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
-			e.serveFlow(relaySide, &tcpFlow{proxy: config.Proxy{Name: "p"}, created: clk.now()})
+			e.serveFlow(context.Background(), relaySide, &tcpFlow{proxy: config.Proxy{Name: "p"}, created: clk.now()})
 		}()
 		if send != "" {
 			_, _ = appSide.Write([]byte(send))
@@ -137,7 +137,7 @@ func TestRelayHealth(t *testing.T) {
 	pd.fail = errors.New("refused")
 	appSide, relaySide := net.Pipe()
 	defer appSide.Close()
-	e.serveFlow(relaySide, &tcpFlow{proxy: config.Proxy{Name: "p"}, created: clk.now()})
+	e.serveFlow(context.Background(), relaySide, &tcpFlow{proxy: config.Proxy{Name: "p"}, created: clk.now()})
 	if h := e.RelayHealth("p", none); h.Dead != 1 {
 		t.Fatalf("dial error: %+v", h)
 	}
@@ -167,7 +167,7 @@ func TestRelayWaiting(t *testing.T) {
 		done = make(chan struct{})
 		go func() {
 			defer close(done)
-			e.serveFlow(relaySide, &tcpFlow{proxy: config.Proxy{Name: "p"}, created: clk.now()})
+			e.serveFlow(context.Background(), relaySide, &tcpFlow{proxy: config.Proxy{Name: "p"}, created: clk.now()})
 		}()
 		return appSide, far, done
 	}
@@ -386,5 +386,61 @@ func TestSpliceClosesSilentUpstreamAfterAppEOF(t *testing.T) {
 	}
 	if _, ok := run(true); ok {
 		t.Fatal("an upstream that answered was closed after the app's EOF")
+	}
+}
+
+type blockingDial struct {
+	started chan struct{}
+}
+
+func (d *blockingDial) DialTCP(ctx context.Context, _ config.Proxy, _ string, _ uint16) (net.Conn, error) {
+	close(d.started)
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func (d *blockingDial) DialUDP(context.Context, config.Proxy) (dialer.Session, error) {
+	return nil, dialer.ErrUDPUnsupported
+}
+
+func TestServeFlowCancelsDialAndSplice(t *testing.T) {
+	// Cancelling ctx unblocks a stuck DialTCP.
+	bd := &blockingDial{started: make(chan struct{})}
+	e, _ := newEngine(t, testConfig(), fixedRes{}, bd, nil)
+	appSide, relaySide := net.Pipe()
+	defer appSide.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		e.serveFlow(ctx, relaySide, &tcpFlow{proxy: config.Proxy{Name: "p"}, created: time.Now()})
+	}()
+	<-bd.started
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("serveFlow stuck in DialTCP after context cancel")
+	}
+
+	// Cancelling ctx also unblocks an active splice.
+	pd := &pipeDial{next: make(chan net.Conn, 1)}
+	up := &silentUpstream{closed: make(chan struct{})}
+	pd.next <- up
+	e2, _ := newEngine(t, testConfig(), fixedRes{}, pd, nil)
+	app2, relay2 := net.Pipe()
+	defer app2.Close()
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	done2 := make(chan struct{})
+	go func() {
+		defer close(done2)
+		e2.serveFlow(ctx2, relay2, &tcpFlow{proxy: config.Proxy{Name: "p"}, created: time.Now()})
+	}()
+	time.Sleep(30 * time.Millisecond)
+	cancel2()
+	select {
+	case <-done2:
+	case <-time.After(2 * time.Second):
+		t.Fatal("serveFlow stuck in splice after context cancel")
 	}
 }
