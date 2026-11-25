@@ -132,8 +132,21 @@ func Run(configPath string, startCapture bool) error {
 		_ = srv.Shutdown(ctx)
 	}()
 
-	data := webViewDataDir()
-	_ = os.MkdirAll(data, 0o700)
+	data, err := webViewDataDir()
+	if err != nil {
+		alert(err.Error())
+		return err
+	}
+	if isReparsePoint(data) {
+		err := errors.New("каталог данных WebView2 является точкой повторного анализа")
+		alert(err.Error())
+		return err
+	}
+	if err := os.MkdirAll(data, 0o700); err != nil {
+		alert(err.Error())
+		return err
+	}
+	clearWebViewEnv()
 
 	w := webview2.NewWithOptions(webview2.WebViewOptions{
 		Debug:     false,
@@ -793,26 +806,100 @@ func alert(text string) {
 	runtime.KeepAlive(title)
 }
 
-// webViewDataDir is the WebView2 profile of the window.
-func webViewDataDir() string {
-	if os.Getenv("LOCALAPPDATA") == "" {
-		return filepath.Join(os.TempDir(), "Ashgate", "WebView2")
+// clearWebViewEnv unsets WEBVIEW2_* environment variables before creating the
+// WebView2 environment so a non-elevated process (via HKCU\Environment) cannot
+// override the browser executable folder or inject Chromium flags into the
+// elevated window. Admin-only HKLM WebView2 policies remain honored.
+func clearWebViewEnv() {
+	for _, kv := range os.Environ() {
+		if k, _, ok := strings.Cut(kv, "="); ok && strings.HasPrefix(strings.ToUpper(k), "WEBVIEW2_") {
+			_ = os.Unsetenv(k)
+		}
 	}
-	return filepath.Join(os.Getenv("LOCALAPPDATA"), "Ashgate", "WebView2")
 }
 
-// RemoveWebViewData deletes the WebView2 profile (ashgate cleanup, run by
-// the uninstaller). Its processes can hold files for a moment after the
-// window closed, so it retries for up to 10 seconds.
-func RemoveWebViewData() {
-	dir := webViewDataDir()
+// webViewDataDir is the WebView2 profile of the window. When elevated, it
+// lives under config.ProtectedDir() so non-elevated processes cannot tamper
+// with Chromium profile files or plant junctions. Non-elevated runs (dev/tests)
+// fall back to %LOCALAPPDATA%\Ashgate\WebView2 or os.UserCacheDir().
+func webViewDataDir() (string, error) {
+	if windows.GetCurrentProcessToken().IsElevated() {
+		dir, err := config.ProtectedDir()
+		if err != nil {
+			return "", err
+		}
+		return filepath.Join(dir, "WebView2"), nil
+	}
+	return legacyWebViewDataDir(), nil
+}
+
+func legacyWebViewDataDir() string {
+	if base := os.Getenv("LOCALAPPDATA"); base != "" {
+		return filepath.Join(base, "Ashgate", "WebView2")
+	}
+	if base, err := os.UserCacheDir(); err == nil && base != "" {
+		return filepath.Join(base, "Ashgate", "WebView2")
+	}
+	return filepath.Join(os.TempDir(), "Ashgate", "WebView2")
+}
+
+// isReparsePoint reports whether path is an NTFS reparse point (junction or
+// symlink). Missing paths return false; unexpected attribute errors fail closed.
+func isReparsePoint(path string) bool {
+	p, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return true
+	}
+	attrs, err := windows.GetFileAttributes(p)
+	if err != nil {
+		if errors.Is(err, windows.ERROR_FILE_NOT_FOUND) || errors.Is(err, windows.ERROR_PATH_NOT_FOUND) {
+			return false
+		}
+		return true
+	}
+	return attrs&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+func removeWebViewSubdir(dir string) {
+	if dir == "" {
+		return
+	}
+	parent := filepath.Dir(dir)
+	if isReparsePoint(parent) || isReparsePoint(dir) {
+		return
+	}
+	if _, err := os.Lstat(dir); err != nil {
+		return
+	}
 	for i := 0; i < 20; i++ {
+		if isReparsePoint(parent) || isReparsePoint(dir) {
+			return
+		}
 		if err := os.RemoveAll(dir); err == nil {
 			break
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
-	_ = os.Remove(filepath.Dir(dir)) // the Ashgate folder, if now empty
+}
+
+// RemoveWebViewData deletes the WebView2 profile (ashgate cleanup, run by
+// the uninstaller). Its processes can hold files for a moment after the
+// window closed, so it retries for up to 10 seconds. It only deletes the
+// WebView2 subdirectory (never ProtectedDir itself) and refuses reparse points.
+func RemoveWebViewData() {
+	var primary string
+	if dir, err := webViewDataDir(); err == nil {
+		primary = dir
+		removeWebViewSubdir(primary)
+	}
+	legacy := legacyWebViewDataDir()
+	if legacy != "" && !strings.EqualFold(filepath.Clean(legacy), filepath.Clean(primary)) {
+		removeWebViewSubdir(legacy)
+		parent := filepath.Dir(legacy)
+		if !isReparsePoint(parent) {
+			_ = os.Remove(parent) // legacy Ashgate folder, if now empty
+		}
+	}
 }
 
 // dropQuitMessage removes a pending WM_QUIT from this thread's queue.

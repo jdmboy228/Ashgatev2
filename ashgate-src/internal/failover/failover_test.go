@@ -466,3 +466,48 @@ func TestReadyMovesTheCutoff(t *testing.T) {
 		t.Fatal("a dead connection on the new server did not start a check")
 	}
 }
+
+// Once a server has answered a connection, RelayHealth keeps reporting that
+// same LastGood timestamp on every 250 ms tick. After a Failed check, those
+// stale ticks must not wipe fails back to 0 or mark the tunnel proven again,
+// so a second Failed check triggers failover.
+func TestStaleLastGoodDoesNotResetFailedCount(t *testing.T) {
+	g := New(2, t0, Defaults, fixed(0.5))
+	t1 := at(10 * sec)
+	if g.Observe(t1, Evidence{LastGood: t1, LastUse: t1}) {
+		t.Fatal("check while traffic succeeded")
+	}
+	if !g.Proven(at(11 * sec)) {
+		t.Fatal("server should be proven after LastGood")
+	}
+	// Server begins refusing connections; RelayHealth still carries LastGood = t1.
+	t2 := at(20 * sec)
+	ev := Evidence{LastGood: t1, LastDead: t2, LastUse: t2}
+	if check(t, g, t2, ev, Failed) || g.Active != 0 {
+		t.Fatalf("switched on first failure: active %d", g.Active)
+	}
+	if g.Proven(t2) {
+		t.Fatal("still proven right after a Failed check")
+	}
+	// 250 ms later (before RetryAfter = 500 ms), Observe sees the same stale t1.
+	if g.Observe(t2.Add(250*time.Millisecond), ev) {
+		t.Fatal("retry check fired before RetryAfter")
+	}
+	if g.Proven(t2.Add(250 * time.Millisecond)) {
+		t.Fatal("stale LastGood restored Proven after a Failed check")
+	}
+	// At RetryAfter (500 ms), the second check must still be wanted even with
+	// stale LastGood = t1 and no new LastDead, and a second Failed switches.
+	t3 := t2.Add(500 * time.Millisecond)
+	if !check(t, g, t3, Evidence{LastGood: t1, LastUse: t2}, Failed) || g.Active != 1 {
+		t.Fatalf("stale LastGood prevented failover on second Failed check: active %d", g.Active)
+	}
+	// Switching cleared provenAt: a fresh answer at t3 proves the backup, while
+	// stale t1 does not.
+	if g.Observe(t3, Evidence{LastGood: t1}) || g.Proven(t3) {
+		t.Fatal("old LastGood proved the backup after switch")
+	}
+	if g.Observe(t3, Evidence{LastGood: t3}) || !g.Proven(t3) {
+		t.Fatal("fresh answer at switch timestamp did not prove the backup")
+	}
+}

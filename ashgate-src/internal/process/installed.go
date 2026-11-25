@@ -75,7 +75,7 @@ func cleanTarget(s string) string {
 
 func usableTarget(path string) bool {
 	low := strings.ToLower(path)
-	if !strings.HasSuffix(low, ".exe") || !(strings.Contains(low, `:\`) || strings.HasPrefix(low, `\\`)) {
+	if !strings.HasSuffix(low, ".exe") || len(low) < 3 || low[0] < 'a' || low[0] > 'z' || low[1] != ':' || low[2] != '\\' {
 		return false
 	}
 	name := baseOf(low)

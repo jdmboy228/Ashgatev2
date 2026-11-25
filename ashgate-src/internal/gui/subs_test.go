@@ -729,3 +729,133 @@ func TestNoProbesWhileUnused(t *testing.T) {
 		t.Fatalf("%d probes of the primary with the tunnel unused", after-before)
 	}
 }
+
+// A healthCheck that started before subApply must not apply its stale result
+// to the updated server list or clobber g.applying.
+func TestStaleHealthCheckIgnoredAfterSubApply(t *testing.T) {
+	r := newFoRig(t, fastFo())
+	r.c.mu.Lock()
+	r.c.cfg.Proxies = []config.Proxy{{Name: rigSub, Type: "vless", Sub: &config.Subscription{Count: 2}}}
+	r.c.mu.Unlock()
+
+	inCheck := make(chan struct{})
+	releaseCheck := make(chan struct{})
+	r.c.mu.Lock()
+	r.c.fo.check = func(vless.Status) failover.Result {
+		close(inCheck)
+		<-releaseCheck
+		return failover.Frozen
+	}
+	r.g.checking = true
+	r.g.fo.Begin(time.Now())
+	r.c.mu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		r.c.healthCheck(rigSub)
+	}()
+	<-inCheck
+
+	// Update the subscription while the old check is still in flight.
+	fresh := subs.Entries([]string{subLink("xhttp", "x2"), subLink("tcp", "raw2")})
+	if err := r.c.subApply(rigSub, "https://sub.example/tok", fresh, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate an active switch/apply in progress when the stale check returns.
+	r.c.mu.Lock()
+	r.g.applying = true
+	r.c.mu.Unlock()
+
+	close(releaseCheck)
+	<-done
+
+	r.c.mu.Lock()
+	checking := r.g.checking
+	applying := r.g.applying
+	active := r.g.fo.Active
+	label := r.g.label(active)
+	r.c.mu.Unlock()
+
+	if checking {
+		t.Fatal("g.checking stayed true after stale healthCheck finished")
+	}
+	if !applying {
+		t.Fatal("stale healthCheck clobbered g.applying")
+	}
+	if active != 0 || label != "x2 · XHTTP" {
+		t.Fatalf("stale healthCheck switched the updated list: active=%d label=%q", active, label)
+	}
+	for _, e := range r.logs.Snapshot() {
+		if strings.Contains(e.Error, "Переключение сервера") {
+			t.Fatalf("stale healthCheck logged a switch: %+v", e)
+		}
+	}
+}
+
+// A probePrimary that started before subApply must not credit the old
+// primary's result to the newly updated primary or clobber g.applying.
+func TestStaleProbePrimaryIgnoredAfterSubApply(t *testing.T) {
+	cfg := fastFo()
+	cfg.PrimaryNeed = 1
+	cfg.MinReturn = 0
+	r := newFoRig(t, cfg)
+	r.c.mu.Lock()
+	r.c.cfg.Proxies = []config.Proxy{{Name: rigSub, Type: "vless", Sub: &config.Subscription{Count: 2}}}
+	// Move to the backup (raw1, index 1).
+	r.g.fo.Reset(2, 1, time.Now(), true, "switched to backup")
+	r.c.mu.Unlock()
+
+	inProbe := make(chan struct{})
+	releaseProbe := make(chan struct{})
+	r.c.mu.Lock()
+	r.c.fo.probe = func(subs.Entry) bool {
+		close(inProbe)
+		<-releaseProbe
+		return true
+	}
+	r.g.probing = true
+	r.c.mu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		r.c.probePrimary(rigSub)
+	}()
+	<-inProbe
+
+	// subApply replaces the primary (x1 -> x2) while keeping active backup raw1 at index 1.
+	fresh := subs.Entries([]string{subLink("xhttp", "x2"), subLink("tcp", "raw1")})
+	if err := r.c.subApply(rigSub, "https://sub.example/tok", fresh, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate an active apply when the stale probe returns.
+	r.c.mu.Lock()
+	r.g.applying = true
+	r.c.mu.Unlock()
+
+	close(releaseProbe)
+	<-done
+
+	r.c.mu.Lock()
+	probing := r.g.probing
+	applying := r.g.applying
+	active := r.g.fo.Active
+	label := r.g.label(active)
+	r.c.mu.Unlock()
+
+	if probing {
+		t.Fatal("g.probing stayed true after stale probePrimary finished")
+	}
+	if !applying {
+		t.Fatal("stale probePrimary clobbered g.applying")
+	}
+	if active != 1 || label != "raw1 · RAW" {
+		t.Fatalf("stale probePrimary switched onto the new primary: active=%d label=%q", active, label)
+	}
+	for _, e := range r.logs.Snapshot() {
+		if strings.Contains(e.Error, "Переключение сервера") {
+			t.Fatalf("stale probePrimary logged a switch: %+v", e)
+		}
+	}
+}

@@ -130,11 +130,20 @@ func (c *controller) syncKill() {
 		// The guard blocks these if Ashgate dies while capturing.
 		err = c.saveTargetsLocked(paths)
 		if c.guardStop == nil && err == nil {
-			c.guardStop, err = c.hooks.guard(c.ksState())
+			if c.hooks.guard != nil {
+				c.guardStop, err = c.hooks.guard(c.ksState())
+			} else {
+				err = killswitch.ErrUnsupported
+			}
 		}
-		if !c.ksClean || len(fw.Blocked()) > 0 {
+		guardOK := err == nil || errors.Is(err, killswitch.ErrUnsupported)
+		if guardOK && (!c.ksClean || len(fw.Blocked()) > 0) {
 			if uerr := fw.Unblock(); uerr != nil {
-				err = errors.Join(err, uerr)
+				if errors.Is(err, killswitch.ErrUnsupported) {
+					err = uerr
+				} else {
+					err = errors.Join(err, uerr)
+				}
 			} else {
 				c.ksClean = true
 			}
@@ -173,7 +182,15 @@ func (c *controller) blockNow() {
 	c.ksMu.Lock()
 	defer c.ksMu.Unlock()
 	c.ksClean = false
-	err := fw.Block(loadTargets(c.ksState()))
+	saved := loadTargets(c.ksState())
+	blocked := fw.Blocked()
+	targets := make([]string, 0, len(saved)+len(blocked))
+	targets = append(targets, saved...)
+	targets = append(targets, blocked...)
+	if len(targets) == 0 {
+		targets, _ = killTargets(cfg)
+	}
+	err := fw.Block(targets)
 	c.mu.Lock()
 	if err != nil && !errors.Is(err, killswitch.ErrUnsupported) {
 		c.ksErr = err.Error()

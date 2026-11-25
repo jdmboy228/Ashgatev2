@@ -23,9 +23,11 @@ type Session struct {
 	done    chan struct{}
 	bridges *vless.Manager
 	bctx    context.Context
+	relay   config.Relay
 
-	mu  sync.Mutex
-	err error
+	applyMu sync.Mutex
+	mu      sync.Mutex
+	err     error
 	// failed is closed when capture fails; see Failed.
 	failed chan struct{}
 }
@@ -41,9 +43,19 @@ func (s *Session) Apply(cfg *config.Config) error {
 	if s == nil || s.eng == nil {
 		return errors.New("движок не запущен")
 	}
+	s.applyMu.Lock()
+	defer s.applyMu.Unlock()
 	cp, err := cloneConfig(cfg)
 	if err != nil {
 		return err
+	}
+	// Pin relay addresses to those bound at Start so live capture filter and
+	// listeners cannot desync from the engine snapshot.
+	if s.relay.TCP4 != "" {
+		cp.Relay.TCP4 = s.relay.TCP4
+	}
+	if s.relay.TCP6 != "" {
+		cp.Relay.TCP6 = s.relay.TCP6
 	}
 	var syncErr error
 	if s.bridges != nil {

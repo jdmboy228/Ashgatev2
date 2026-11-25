@@ -91,6 +91,8 @@ type subGroup struct {
 	url       string
 	entries   []subs.Entry
 	fo        *failover.Group
+	gen       uint64
+	applyGen  uint64
 	openErr   string
 	nextFetch time.Time
 	retried   bool
@@ -289,6 +291,8 @@ func keepSubs(next, old *config.Config) {
 // Existing connections on a replaced server end; new ones use the new
 // server. Nothing goes direct meanwhile.
 func (c *controller) applySubs() {
+	c.applyMu.Lock()
+	defer c.applyMu.Unlock()
 	cfg := c.runtimeCfg()
 	c.mu.Lock()
 	sess := c.sess
@@ -494,7 +498,8 @@ func tunnelClient(st vless.Status) *http.Client {
 // subApply adopts a fetched list. The active server stays while its link
 // is in the list; otherwise the best server by priority takes over.
 func (c *controller) subApply(name, url string, fresh []subs.Entry, now time.Time) error {
-	sealed, err := subs.Seal(subs.Secret{URL: url, Links: subs.Links(subs.Order(fresh))})
+	ordered := subs.Order(fresh)
+	sealed, err := subs.Seal(subs.Secret{URL: url, Links: subs.Links(ordered)})
 	if err != nil {
 		c.subFailed(name, err, now)
 		return err
@@ -513,18 +518,6 @@ func (c *controller) subApply(name, url string, fresh []subs.Entry, now time.Tim
 		c.mu.Unlock()
 		return nil // removed meanwhile
 	}
-	activeLink := ""
-	if len(g.entries) > 0 {
-		activeLink = g.entries[g.fo.Active].Link
-	}
-	ordered, active, reconnect := subs.Apply(fresh, activeLink)
-	reason := ""
-	if reconnect && activeLink != "" {
-		reason = "Подписка обновлена, прежнего сервера в ней нет → " + ordered[active].Label()
-	}
-	g.entries, g.sealed, g.retried = ordered, sealed, false
-	g.fo.Reset(len(ordered), active, now, reason != "", reason)
-	g.nextFetch = nextUpdate(now)
 	cfg := cloneCfg(c.cfg)
 	s := *cfg.Proxies[idx].Sub
 	s.Sealed, s.Count, s.UpdatedAt, s.CheckedAt, s.Error = sealed, len(ordered), now, now, ""
@@ -534,14 +527,30 @@ func (c *controller) subApply(name, url string, fresh []subs.Entry, now time.Tim
 		return err
 	}
 	c.mu.Lock()
+	activeLink := ""
+	if len(g.entries) > 0 && g.fo.Active < len(g.entries) {
+		activeLink = g.entries[g.fo.Active].Link
+	}
+	ordered, active, reconnect := subs.Apply(fresh, activeLink)
+	reason := ""
+	if reconnect && activeLink != "" && active < len(ordered) {
+		reason = "Подписка обновлена, прежнего сервера в ней нет → " + ordered[active].Label()
+	}
+	g.entries, g.sealed, g.retried = ordered, sealed, false
+	g.fo.Reset(len(ordered), active, now, reason != "", reason)
+	g.gen++
+	g.nextFetch = nextUpdate(now)
 	c.cfg = cfg
+	var applyGen uint64
+	if reconnect {
+		g.applyGen++
+		applyGen = g.applyGen
+		g.applying = true
+	}
 	c.mu.Unlock()
 	c.subLog(name, "info", "Подписка обновлена: серверов "+strconv.Itoa(len(ordered)))
 	if reconnect {
-		c.mu.Lock()
-		g.applying = true
-		c.mu.Unlock()
-		c.switched(g)
+		c.switchedGen(g, applyGen)
 	}
 	return nil
 }
@@ -589,8 +598,12 @@ func (c *controller) healthCheck(name string) {
 	g := c.subs[name]
 	st := c.bridgeSt[name]
 	server := ""
-	if g != nil && g.fo.Active < len(g.entries) {
-		server = g.entries[g.fo.Active].Address
+	var gen uint64
+	if g != nil {
+		gen = g.gen
+		if g.fo.Active < len(g.entries) {
+			server = g.entries[g.fo.Active].Address
+		}
 	}
 	c.mu.Unlock()
 	check, route := checkBridge, hasRoute
@@ -609,6 +622,11 @@ func (c *controller) healthCheck(name string) {
 		c.mu.Unlock()
 		return
 	}
+	g.checking = false
+	if g.gen != gen {
+		c.mu.Unlock()
+		return
+	}
 	// Real traffic answered while the check ran outweighs the check.
 	var good time.Time
 	if sess := c.tunnel(); sess != nil && sess.Running() {
@@ -616,11 +634,17 @@ func (c *controller) healthCheck(name string) {
 	}
 	switched := g.fo.Check(time.Now(), res, good, g.label)
 	reason := g.fo.Reason
-	g.checking, g.applying = false, switched
+	var applyGen uint64
+	if switched {
+		g.gen++
+		g.applyGen++
+		applyGen = g.applyGen
+		g.applying = true
+	}
 	c.mu.Unlock()
 	if switched {
 		c.subLog(name, "error", "Переключение сервера: "+reason)
-		c.switched(g)
+		c.switchedGen(g, applyGen)
 	}
 }
 
@@ -668,11 +692,22 @@ func probeServer(e subs.Entry) bool {
 // the group judge it: what the traffic showed until now was the old
 // server's, or the moment without a tunnel.
 func (c *controller) switched(g *subGroup) {
+	c.mu.Lock()
+	g.applyGen++
+	applyGen := g.applyGen
+	g.applying = true
+	c.mu.Unlock()
+	c.switchedGen(g, applyGen)
+}
+
+func (c *controller) switchedGen(g *subGroup, applyGen uint64) {
 	c.applySubs()
 	c.mu.Lock()
-	g.applying = false
-	g.forget()
-	g.fo.Ready(time.Now())
+	if g.applyGen == applyGen {
+		g.applying = false
+		g.forget()
+		g.fo.Ready(time.Now())
+	}
 	c.mu.Unlock()
 }
 
@@ -683,8 +718,12 @@ func (c *controller) probePrimary(name string) {
 	c.mu.Lock()
 	g := c.subs[name]
 	var e subs.Entry
-	if g != nil && len(g.entries) > 0 {
-		e = g.entries[0]
+	var gen uint64
+	if g != nil {
+		gen = g.gen
+		if len(g.entries) > 0 {
+			e = g.entries[0]
+		}
 	}
 	c.mu.Unlock()
 	probe := probeServer
@@ -698,6 +737,10 @@ func (c *controller) probePrimary(name string) {
 		return
 	}
 	g.probing = false
+	if g.gen != gen {
+		c.mu.Unlock()
+		return
+	}
 	// While a check of the backup runs or a switch is under way, a good
 	// probe does not count: the return waits for a calmer moment. A group
 	// that is on the primary by now has nothing to return to.
@@ -706,11 +749,17 @@ func (c *controller) probePrimary(name string) {
 		back = g.fo.Probe(time.Now(), ok && !g.checking && !g.applying, g.label)
 	}
 	reason := g.fo.Reason
-	g.applying = g.applying || back
+	var applyGen uint64
+	if back {
+		g.gen++
+		g.applyGen++
+		applyGen = g.applyGen
+		g.applying = true
+	}
 	c.mu.Unlock()
 	if back {
 		c.subLog(name, "info", "Переключение сервера: "+reason)
-		c.switched(g)
+		c.switchedGen(g, applyGen)
 	}
 }
 

@@ -139,7 +139,7 @@ func start(parent context.Context, cfg *config.Config, logs *logbuf.Buffer, brid
 		err = nil
 	}
 
-	s := &Session{eng: eng, cancel: cancel, done: make(chan struct{}), bridges: bridges, bctx: ctx}
+	s := &Session{eng: eng, cancel: cancel, done: make(chan struct{}), bridges: bridges, bctx: ctx, relay: cp.Relay}
 	var wg sync.WaitGroup
 	udp := newUDPQueue(udpShards, udpShardDepth, logs, func(d engine.UDPDatagram) {
 		_ = eng.ForwardUDP(ctx, d)

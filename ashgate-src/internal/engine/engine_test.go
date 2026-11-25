@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"strconv"
@@ -771,6 +772,96 @@ func TestRefreshBypassSkipsDNSForIPLiterals(t *testing.T) {
 		if e.proxyServer(packet.FromIP(net.ParseIP(ip), 443)) {
 			t.Errorf("%s:443 counts as a proxy server", ip)
 		}
+	}
+}
+
+func TestRefreshBypassRetainsPriorIPsOnTransientError(t *testing.T) {
+	fail := false
+	old := lookupIP
+	lookupIP = func(_ context.Context, _, host string) ([]net.IP, error) {
+		if fail {
+			return nil, errors.New("doh unavailable")
+		}
+		return []net.IP{net.ParseIP("198.51.100.7")}, nil
+	}
+	t.Cleanup(func() { lookupIP = old })
+
+	cfg := config.Default()
+	cfg.Proxies = []config.Proxy{
+		{Name: "named", Type: "socks5", Address: "proxy.example.com:1080"},
+	}
+	e, _ := newEngine(t, cfg, nil, nil, nil)
+	e.RefreshBypass(context.Background())
+	addr := packet.FromIP(net.ParseIP("198.51.100.7"), 1080)
+	if !e.proxyServer(addr) {
+		t.Fatal("initial lookup did not populate proxy server")
+	}
+	// Transient lookup failure must retain the previously resolved IPs.
+	fail = true
+	e.RefreshBypass(context.Background())
+	if !e.proxyServer(addr) {
+		t.Fatal("transient lookup failure wiped previously resolved proxy IP")
+	}
+	// Removing the proxy drops its retained IPs on the next refresh.
+	cfg2 := config.Default()
+	if err := e.Apply(cfg2); err != nil {
+		t.Fatal(err)
+	}
+	e.RefreshBypass(context.Background())
+	if e.proxyServer(addr) {
+		t.Fatal("removed proxy IP was retained")
+	}
+}
+
+func TestRefreshBypassSerialized(t *testing.T) {
+	oldStarted := make(chan struct{})
+	unblockOld := make(chan struct{})
+	old := lookupIP
+	lookupIP = func(_ context.Context, _, host string) ([]net.IP, error) {
+		switch host {
+		case "old.example.com":
+			close(oldStarted)
+			<-unblockOld
+			return []net.IP{net.ParseIP("198.51.100.1")}, nil
+		case "new.example.com":
+			return []net.IP{net.ParseIP("198.51.100.2")}, nil
+		default:
+			return nil, errors.New("unexpected host: " + host)
+		}
+	}
+	t.Cleanup(func() { lookupIP = old })
+
+	cfg1 := config.Default()
+	cfg1.Proxies = []config.Proxy{{Name: "p", Type: "socks5", Address: "old.example.com:1080"}}
+	e, _ := newEngine(t, cfg1, nil, nil, nil)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		e.RefreshBypass(context.Background())
+	}()
+	<-oldStarted
+
+	cfg2 := config.Default()
+	cfg2.Proxies = []config.Proxy{{Name: "p", Type: "socks5", Address: "new.example.com:1080"}}
+	if err := e.Apply(cfg2); err != nil {
+		t.Fatal(err)
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		e.RefreshBypass(context.Background())
+	}()
+
+	close(unblockOld)
+	wg.Wait()
+
+	if !e.proxyServer(packet.FromIP(net.ParseIP("198.51.100.2"), 1080)) {
+		t.Fatal("newer proxy IP missing after serialized RefreshBypass")
+	}
+	if e.proxyServer(packet.FromIP(net.ParseIP("198.51.100.1"), 1080)) {
+		t.Fatal("stale proxy IP overwrote newer RefreshBypass")
 	}
 }
 

@@ -4,6 +4,7 @@ package gui
 
 import (
 	"errors"
+	"sync"
 	"time"
 	"unsafe"
 
@@ -55,29 +56,51 @@ func claimInstance() (release func(), already bool) {
 		}
 		return func() {}, true
 	}
-	ev := createEvent(eventSDDL, instanceEvent)
-	quit := createEvent(quitSDDL, instanceQuitEvent)
-	stop := make(chan struct{})
-	if ev != 0 {
-		go watchEvent(ev, stop, requestShow)
+	inst := &singleInstance{
+		mutex: mutex,
+		ev:    createEvent(eventSDDL, instanceEvent),
+		quit:  createStrictEvent(quitSDDL, instanceQuitEvent),
+		stop:  make(chan struct{}),
 	}
-	if quit != 0 {
-		go watchEvent(quit, stop, requestQuit)
+	inst.watch(inst.ev, requestShow)
+	inst.watch(inst.quit, requestQuit)
+	return inst.release, false
+}
+
+type singleInstance struct {
+	mutex windows.Handle
+	ev    windows.Handle
+	quit  windows.Handle
+	stop  chan struct{}
+	wg    sync.WaitGroup
+	once  sync.Once
+}
+
+func (s *singleInstance) watch(ev windows.Handle, fire func()) {
+	if ev == 0 {
+		return
 	}
-	return func() {
-		select {
-		case <-stop:
-		default:
-			close(stop)
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		watchEvent(ev, s.stop, fire)
+	}()
+}
+
+func (s *singleInstance) release() {
+	s.once.Do(func() {
+		close(s.stop)
+		s.wg.Wait()
+		if s.ev != 0 {
+			windows.CloseHandle(s.ev)
 		}
-		if ev != 0 {
-			windows.CloseHandle(ev)
+		if s.quit != 0 {
+			windows.CloseHandle(s.quit)
 		}
-		if quit != 0 {
-			windows.CloseHandle(quit)
+		if s.mutex != 0 {
+			windows.CloseHandle(s.mutex)
 		}
-		windows.CloseHandle(mutex)
-	}, false
+	})
 }
 
 func createNamed(open func(*uint16) (windows.Handle, error), name string) (windows.Handle, bool, error) {
@@ -101,6 +124,27 @@ func createEvent(sddl, name string) windows.Handle {
 		return windows.CreateEvent(sa, 0, 0, name)
 	}, name)
 	if err != nil && !errors.Is(err, windows.ERROR_ALREADY_EXISTS) {
+		if ev != 0 {
+			windows.CloseHandle(ev)
+		}
+		return 0
+	}
+	return ev
+}
+
+// createStrictEvent creates a named event and refuses to adopt an existing
+// one. A non-elevated process can pre-create events in Global\, which would
+// cause CreateEvent to ignore sa and return ERROR_ALREADY_EXISTS with the
+// squatted handle.
+func createStrictEvent(sddl, name string) windows.Handle {
+	sa := sdSA(sddl)
+	if sa == nil {
+		return 0
+	}
+	ev, exists, err := createNamed(func(n *uint16) (windows.Handle, error) {
+		return windows.CreateEvent(sa, 0, 0, n)
+	}, name)
+	if err != nil || exists {
 		if ev != 0 {
 			windows.CloseHandle(ev)
 		}

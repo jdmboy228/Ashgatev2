@@ -251,7 +251,7 @@ func startBridge(ctx context.Context, cc ClientConfig) (*Bridge, error) {
 		if addr == "" {
 			continue
 		}
-		if err := waitPort(addr, 2*time.Second); err != nil {
+		if err := waitPort(ctx, addr, 2*time.Second); err != nil {
 			b.Close()
 			return nil, fmt.Errorf("VLESS: локальный порт %s не открылся: %w", addr, err)
 		}
@@ -555,17 +555,33 @@ func freePort() (int, error) {
 	return port, nil
 }
 
-func waitPort(addr string, d time.Duration) error {
+func waitPort(ctx context.Context, addr string, d time.Duration) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	deadline := time.Now().Add(d)
 	var last error
+	dialer := &net.Dialer{Timeout: 200 * time.Millisecond}
 	for time.Now().Before(deadline) {
-		c, err := net.DialTimeout("tcp", addr, 200*time.Millisecond)
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		c, err := dialer.DialContext(ctx, "tcp", addr)
 		if err == nil {
 			_ = c.Close()
 			return nil
 		}
 		last = err
-		time.Sleep(20 * time.Millisecond)
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		t := time.NewTimer(20 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return ctx.Err()
+		case <-t.C:
+		}
 	}
 	if last == nil {
 		last = errors.New("VLESS: локальный мост не открыл порт")

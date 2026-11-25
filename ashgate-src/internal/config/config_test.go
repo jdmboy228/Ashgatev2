@@ -133,6 +133,16 @@ func TestLoadOrInit(t *testing.T) {
 	if again.DNS.Mode != "proxy" {
 		t.Fatal(again.DNS.Mode)
 	}
+
+	// If the parent path cannot be created as a directory, LoadOrInit fails
+	// before trying to read or secure it.
+	blocker := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadOrInit(filepath.Join(blocker, "config.json")); err == nil {
+		t.Fatal("LoadOrInit succeeded when parent path is a file")
+	}
 }
 
 func TestExampleConfig(t *testing.T) {

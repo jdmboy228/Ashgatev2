@@ -124,8 +124,10 @@ type Engine struct {
 
 	snap atomic.Pointer[snapshot]
 	// servers holds the proxies' own IP:port; see RefreshBypass.
-	servers atomic.Pointer[map[packet.Addr]struct{}]
-	inj     atomic.Pointer[Injector]
+	servers     atomic.Pointer[map[packet.Addr]struct{}]
+	bypassMu    sync.Mutex
+	bypassHosts map[string][]net.IP
+	inj         atomic.Pointer[Injector]
 	// noRelay6 is set when the IPv6 relay could not listen; see
 	// DisableIPv6Relay. relay6Logged keeps its log to one line.
 	noRelay6     atomic.Bool
@@ -383,11 +385,18 @@ var lookupIP = func(ctx context.Context, _, host string) ([]net.IP, error) {
 // program: a VLESS server behind a CDN shares its IP with other sites, and
 // a routed program's connection to them follows its rule.
 func (e *Engine) RefreshBypass(ctx context.Context) {
+	e.bypassMu.Lock()
+	defer e.bypassMu.Unlock()
 	snap := e.snap.Load()
 	if snap == nil {
 		return
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	m := map[packet.Addr]struct{}{}
+	nextHosts := make(map[string][]net.IP)
+	resolved := make(map[string][]net.IP)
 	for _, p := range snap.proxies {
 		host, portStr, err := net.SplitHostPort(p.Address)
 		if err != nil {
@@ -401,16 +410,27 @@ func (e *Engine) RefreshBypass(ctx context.Context) {
 			m[packet.FromIP(ip, uint16(port))] = struct{}{}
 			continue
 		}
-		ctx2, cancel := context.WithTimeout(ctx, 5*time.Second)
-		ips, err := lookupIP(ctx2, "ip", host)
-		cancel()
-		if err != nil {
-			continue
+		key := strings.ToLower(host)
+		ips, ok := resolved[key]
+		if !ok {
+			ctx2, cancel := context.WithTimeout(ctx, 5*time.Second)
+			got, err := lookupIP(ctx2, "ip", host)
+			cancel()
+			if err == nil && len(got) > 0 {
+				ips = append([]net.IP(nil), got...)
+			} else if prev := e.bypassHosts[key]; len(prev) > 0 {
+				ips = prev
+			}
+			resolved[key] = ips
+			if len(ips) > 0 {
+				nextHosts[key] = ips
+			}
 		}
 		for _, ip := range ips {
 			m[packet.FromIP(ip, uint16(port))] = struct{}{}
 		}
 	}
+	e.bypassHosts = nextHosts
 	e.servers.Store(&m)
 }
 

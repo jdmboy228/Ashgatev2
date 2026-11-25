@@ -4,6 +4,7 @@ package gui
 
 import (
 	"fmt"
+	"runtime"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -33,6 +34,10 @@ func openExe(owner uintptr) (string, error) {
 		Title:      title,
 	}
 	r, _, _ := pGetOpenFileName.Call(uintptr(unsafe.Pointer(&ofn)))
+	runtime.KeepAlive(&ofn)
+	runtime.KeepAlive(filter)
+	runtime.KeepAlive(title)
+	runtime.KeepAlive(buf)
 	if r == 0 {
 		// Zero means the user closed the dialog. The thread's last error is
 		// stale here and said nothing about the dialog.

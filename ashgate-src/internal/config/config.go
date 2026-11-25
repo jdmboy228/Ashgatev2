@@ -631,9 +631,15 @@ func Load(path string) (*Config, error) {
 
 // LoadOrInit loads the file or writes the defaults when it does not exist.
 func LoadOrInit(path string) (*Config, error) {
-	// The window, "run" and the service all start here: lock down the
-	// shared folder before reading anything from it.
-	secureDir(filepath.Dir(path))
+	// The window, "run" and the service all start here: ensure and lock down
+	// the shared folder before reading anything from it.
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, err
+	}
+	if err := secureDir(dir); err != nil {
+		return nil, err
+	}
 	cfg, err := Load(path)
 	if err == nil {
 		return cfg, nil
@@ -670,7 +676,9 @@ func Save(path string, cfg *Config) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	secureDir(dir)
+	if err := secureDir(dir); err != nil {
+		return err
+	}
 	tmp := path + ".tmp"
 	// A leftover or planted temp file would keep its own owner and access
 	// list through the rename. Start from a new file.

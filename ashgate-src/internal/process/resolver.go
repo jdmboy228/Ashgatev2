@@ -273,6 +273,11 @@ func (r *Resolver) pruneLocked(now time.Time) {
 			delete(r.missAt, k)
 		}
 	}
+	if !r.helperAt.IsZero() && now.Sub(r.helperAt) > closeGrace {
+		clear(r.helper)
+		clear(r.helperWild)
+		r.helperAt = time.Time{}
+	}
 	if len(r.images) > maxImages {
 		clear(r.images)
 	}
@@ -352,8 +357,17 @@ func (r *Resolver) Owner(proto uint8, src packet.Addr, start Start, final bool) 
 		r.mu.Lock()
 	}
 	// The socket's event may have come while the tables were read.
-	p, ok, closed = r.socketLocked(proto, src, r.now(), start)
-	if !ok && r.tableFromLocked(closed) {
+	now = r.now()
+	p, ok, closed = r.socketLocked(proto, src, now, start)
+	minAt := closed
+	if start != Continuing {
+		if since.After(minAt) {
+			minAt = since
+		}
+	} else if cut := now.Add(-closeGrace); cut.After(minAt) {
+		minAt = cut
+	}
+	if !ok && r.tableFromLocked(minAt) {
 		p, ok = r.helperLocked(proto, src)
 	}
 	r.mu.Unlock()

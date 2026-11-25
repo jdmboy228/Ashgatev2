@@ -8,3 +8,7 @@ Changes:
 - `pkg/edge/chromium.go`, `PermissionRequested`: `get_PermissionKind` now gets `&kind`
   instead of the value of `kind`. With the value, every request read as kind 0 (unknown), so
   the library's clipboard-read allow never applied and WebView2 showed a clipboard prompt.
+- `webviewloader/module.go`: removed the `nativeModule` (`LoadLibraryW("WebView2Loader")`)
+  disk-search path so `CreateCoreWebView2EnvironmentWithOptions`, `CompareBrowserVersions`,
+  and `GetInstalledVersion` always load `WebView2Loader.dll` exclusively from the embedded
+  in-memory copy (`loadFromMemory`), preventing DLL sideloading from CWD or user `PATH`.

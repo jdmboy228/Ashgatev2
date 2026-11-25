@@ -23,9 +23,9 @@ import (
 // go-webview2 has the vtable slots but no methods, and keeps its browser
 // object in an unexported field, hence the reflection.
 
-// IID_ICoreWebView2Settings4
-var iidSettings4 = windows.GUID{Data1: 0xfdb5ab74, Data2: 0xaf33, Data3: 0x4854,
-	Data4: [8]byte{0x84, 0xf0, 0x0a, 0x63, 0x1d, 0xeb, 0x5e, 0xba}}
+// IID_ICoreWebView2Settings4 = {cb56846c-4168-4d53-b04f-03b6d6796ff2}
+var iidSettings4 = windows.GUID{Data1: 0xcb56846c, Data2: 0x4168, Data3: 0x4d53,
+	Data4: [8]byte{0xb0, 0x4f, 0x03, 0xb6, 0xd6, 0x79, 0x6f, 0xf2}}
 
 // comObject is any COM interface pointer: its first word is the vtable.
 type comObject struct{ vtbl *[29]uintptr }
@@ -59,6 +59,7 @@ func disableAutofill(w webview2.WebView) error {
 		return fmt.Errorf("WebView2 settings: %v", err)
 	}
 	unk := (*comObject)(unsafe.Pointer(s))
+	defer syscall.SyscallN(unk.vtbl[slotRelease], uintptr(unsafe.Pointer(unk)))
 	var s4 *comObject
 	hr, _, _ := syscall.SyscallN(unk.vtbl[slotQueryInterface], uintptr(unsafe.Pointer(unk)),
 		uintptr(unsafe.Pointer(&iidSettings4)), uintptr(unsafe.Pointer(&s4)))

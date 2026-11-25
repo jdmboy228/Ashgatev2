@@ -104,11 +104,14 @@ type controller struct {
 
 	// Subscriptions at run time (see subs.go). saveMu serialises
 	// read-modify-write of the config file between the window and
-	// background updates. done stops subsLoop.
+	// background updates. applyMu serialises bridge and session config
+	// updates so older snapshots cannot overwrite newer ones. done stops
+	// subsLoop.
 	subs         map[string]*subGroup
 	subFetching  bool
 	subFetchName string
 	saveMu       sync.Mutex
+	applyMu      sync.Mutex
 	done         chan struct{}
 	doneOnce     sync.Once
 	// loopDone is closed when subsLoop has returned.
@@ -702,6 +705,12 @@ func (c *controller) start() error {
 	// Unlock before anything below takes c.mu again: sync.Mutex is not
 	// reentrant, and holding it here froze the window on Start (0.7.1).
 	c.mu.Unlock()
+	// Capture is up, so the firewall block can be lifted. Wait for it (and
+	// for the guard), like stop does: until then proxied apps are still
+	// blocked, and the window would already say "running". Persist targets
+	// before starting the failure watcher so blockNow has them on an early
+	// failure.
+	c.syncKill()
 	c.sessWg.Add(1)
 	go func() {
 		defer c.sessWg.Done()
@@ -724,10 +733,6 @@ func (c *controller) start() error {
 			c.syncKill()
 		}
 	}()
-	// Capture is up, so the firewall block can be lifted. Wait for it (and
-	// for the guard), like stop does: until then proxied apps are still
-	// blocked, and the window would already say "running".
-	c.syncKill()
 	return nil
 }
 
@@ -804,9 +809,6 @@ func (c *controller) replaceLocked(next *config.Config) error {
 		}
 	}
 	c.syncSubsLocked(cp, time.Now())
-	rcfg := c.materializeLocked(cloneCfg(cp))
-	sess := c.sess
-	running := sess != nil && sess.Running()
 	c.mu.Unlock()
 	if old != nil && engineView(old) == engineView(cp) {
 		// Only window settings changed (theme, a collapsed group): nothing
@@ -814,6 +816,13 @@ func (c *controller) replaceLocked(next *config.Config) error {
 		// would also clear the engine's per-connection caches.
 		return nil
 	}
+	c.applyMu.Lock()
+	defer c.applyMu.Unlock()
+	rcfg := c.runtimeCfg()
+	c.mu.Lock()
+	sess := c.sess
+	running := sess != nil && sess.Running()
+	c.mu.Unlock()
 	syncErr := c.syncBridges(rcfg)
 	c.kickKill()
 	if running {

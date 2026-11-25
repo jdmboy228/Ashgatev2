@@ -21,4 +21,4 @@ func DefaultPath() string {
 
 // secureDir has nothing to do outside Windows: the directory is created
 // with mode 0755 and the files with 0600.
-func secureDir(string) {}
+func secureDir(string) error { return nil }

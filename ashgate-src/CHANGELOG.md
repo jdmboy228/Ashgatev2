@@ -1,5 +1,15 @@
 # История изменений
 
+## 0.9.5
+
+Безопасность привилегированного процесса, надёжность failover, VLESS и Kill Switch:
+
+- **Безопасность WebView2 и DLL:** `WebView2Loader.dll` теперь загружается исключительно из встроенной копии в памяти (исключён DLL-hijacking через `PATH`/CWD), на старте вызывается `SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32)`, перед созданием WebView2 очищаются переменные среды `WEBVIEW2_*`, а профиль WebView2 при запуске от администратора перенесён в защищённый каталог `%ProgramData%\Ashgate\WebView2` с проверкой отсутствия NTFS junction в `RemoveWebViewData`.
+- **Защита ACL, IPC и локальных путей:** `secureDir`/`ProtectedDir` теперь создают каталог до назначения прав, используют `FOLDERID_ProgramData`, отклоняют NTFS junction (`FILE_ATTRIBUTE_REPARSE_POINT`), выставляют владельца `O:BA` + защищённый DACL и не кешируют неудачные попытки; событие `Global\AshgateQuit` отклоняет сквоттинг (`ERROR_ALREADY_EXISTS`) и дожидается выхода горутин `watchEvent` перед `CloseHandle`; `InstalledApps` принимает только локальные пути дисков (`[A-Z]:\...\.exe`) без UNC-запросов.
+- **Исправления Win32/COM:** добавлен `runtime.KeepAlive` для аргументов блокирующего `GetOpenFileNameW`, исправлен GUID `IID_ICoreWebView2Settings4` (`{cb56846c-4168-4d53-b04f-03b6d6796ff2}`) и добавлен `Release()` объекта настроек WebView2.
+- **Failover и подписки:** устранён deadlock failover при отказах сервера (`failover.Failed`) из-за повторного срабатывания `g.alive()` по старому `RelayHealth.LastGood`; добавлены поколения `gen`/`applyGen` в `subGroup` (игнорирование устаревших проверок/проб), фиксация состояния `subApply` только после успешного `config.Save` и сериализация `applySubs`/`replaceLocked` через `applyMu`.
+- **VLESS, движок и Kill Switch:** `vless.Manager.Sync` закрывает удалённые и изменённые мосты до запуска новых (исправлены конфликты фиксированных `SOCKSPort` при переименовании/обмене) и дедуплицирует имена, `Close()` отменяет контекст до захвата мьютекса, `waitPort` реагирует на отмену контекста; `process.Resolver` проверяет свежесть таблицы IP Helper и очищает её по `closeGrace`; `Session.Apply` сериализован и фиксирует порты релея, а `Engine.RefreshBypass` сохраняет прежние IP при временной ошибке DoH; Kill Switch не снимает правила при ошибке сохранения/сторожа и не очищает активную блокировку в `blockNow` при раннем сбое сессии.
+
 ## 0.9.4
 
 Надёжность остановки, защита от утечек UDP/DNS и Kill Switch:

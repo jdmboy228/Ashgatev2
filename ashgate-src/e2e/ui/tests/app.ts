@@ -32,22 +32,20 @@ export class App {
 
   static async launch(): Promise<App> {
     const app = new App();
-    await app.start(!policyUsed);
-    if (!(await app.attach(60_000))) {
-      // WebView2 ignored the variable: use the policy for this job only.
-      app.quitProcess();
+    if (!policyUsed) {
+      // Ashgate strips WEBVIEW2_* env vars for security, so configure remote
+      // debugging via the admin-only HKLM WebView2 policy for this job.
       execFileSync("reg", ["add", POLICY, "/v", "ashgate.exe", "/t", "REG_SZ", "/d", `--remote-debugging-port=${PORT}`, "/f"]);
       policyUsed = true;
-      await app.start(false);
-      if (!(await app.attach(60_000))) throw new Error("cannot attach to the Ashgate window over CDP");
     }
+    await app.start();
+    if (!(await app.attach(60_000))) throw new Error("cannot attach to the Ashgate window over CDP");
     return app;
   }
 
-  private async start(withEnv: boolean) {
+  private async start() {
     const env = { ...process.env };
     delete env.WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS;
-    if (withEnv) env.WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS = `--remote-debugging-port=${PORT}`;
     const child = spawn(EXE, [], { env, detached: true, stdio: "ignore" });
     child.unref();
     this.pid = child.pid || 0;

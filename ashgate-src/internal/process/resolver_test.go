@@ -1,6 +1,7 @@
 package process
 
 import (
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -473,5 +474,55 @@ func TestFlowDeletedAllowsPruneWhileWildcardStaysOpen(t *testing.T) {
 	}
 	if !wildExists {
 		t.Fatal("open wildcard socket entry was pruned")
+	}
+}
+
+// On final = true, Owner must not fall back to a stale IP Helper table when no
+// fresh read ran (rate-limited by helperGap or transient loadHelper error),
+// even if the prior socket's CLOSE event was missed (closed is zero).
+// pruneLocked also expires stale helper maps past closeGrace.
+func TestFinalOwnerRejectsStaleHelperTable(t *testing.T) {
+	start := time.Unix(1000, 0)
+	r, clock := testResolver(start)
+	local := packet.V4(10, 0, 0, 9, 55000)
+	var loadErr error
+	r.SetHelper(func() ([]Endpoint, error) {
+		if loadErr != nil {
+			return nil, loadErr
+		}
+		return []Endpoint{{Proto: packet.ProtoUDP, Addr: local, PID: 3}}, nil
+	})
+	// Initial helper load at start records PID 3.
+	if p, ok := r.Lookup(packet.ProtoUDP, local); !ok || p.PID != 3 {
+		t.Fatalf("initial helper lookup: %+v %v", p, ok)
+	}
+	// Within helperGap (< 50 ms) with no CLOSE event observed, a NewFlow final
+	// lookup cannot refresh the table and must reject the older table.
+	*clock = start.Add(20 * time.Millisecond)
+	if p, ok := r.Owner(packet.ProtoUDP, local, NewFlow, true); ok {
+		t.Fatalf("NewFlow final used stale helper table under helperGap: %+v", p)
+	}
+	// Past helperGap, if loadHelper transiently fails, NewFlow final must still
+	// reject the older table.
+	loadErr = errors.New("helper failed")
+	*clock = start.Add(100 * time.Millisecond)
+	if p, ok := r.Owner(packet.ProtoUDP, local, NewFlow, true); ok {
+		t.Fatalf("NewFlow final used stale helper table after load error: %+v", p)
+	}
+	// Continuing final rejects a table older than closeGrace when refresh fails.
+	*clock = start.Add(closeGrace + time.Second)
+	if p, ok := r.Owner(packet.ProtoUDP, local, Continuing, true); ok {
+		t.Fatalf("Continuing final used helper table older than closeGrace: %+v", p)
+	}
+	// pruneLocked expires helper tables older than closeGrace. First Observe
+	// initializes r.pruneAt; the second Observe pruneEvery later runs pruneLocked.
+	r.Observe(packet.ProtoTCP, packet.V4(10, 0, 0, 9, 55001), 4, false)
+	*clock = start.Add(pruneEvery + closeGrace + 2*time.Second)
+	r.Observe(packet.ProtoTCP, packet.V4(10, 0, 0, 9, 55002), 4, false)
+	r.mu.Lock()
+	hLen, wLen, hAt := len(r.helper), len(r.helperWild), r.helperAt
+	r.mu.Unlock()
+	if hLen != 0 || wLen != 0 || !hAt.IsZero() {
+		t.Fatalf("stale helper not expired by pruneLocked: helper=%d wild=%d at=%v", hLen, wLen, hAt)
 	}
 }

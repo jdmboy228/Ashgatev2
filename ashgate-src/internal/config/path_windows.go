@@ -3,6 +3,8 @@
 package config
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -51,15 +53,25 @@ func fileExists(path string) bool {
 // user's own programs could swap it before it is read.
 func ProtectedDir() (string, error) {
 	dir := filepath.Dir(sharedPath())
+	if err := checkNotReparsePoint(dir); err != nil &&
+		!errors.Is(err, windows.ERROR_FILE_NOT_FOUND) &&
+		!errors.Is(err, windows.ERROR_PATH_NOT_FOUND) {
+		return "", err
+	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", err
 	}
-	secureDir(dir)
+	if err := secureDir(dir); err != nil {
+		return "", err
+	}
 	return dir, nil
 }
 
 func sharedPath() string {
-	programData := os.Getenv("ProgramData")
+	programData, err := windows.KnownFolderPath(windows.FOLDERID_ProgramData, 0)
+	if err != nil || programData == "" {
+		programData = os.Getenv("ProgramData")
+	}
 	if programData == "" {
 		programData = `C:\ProgramData`
 	}
@@ -85,36 +97,75 @@ func ownerReadACE() string {
 	return "(A;OICI;0x1200a9;;;" + u.User.Sid.String() + ")"
 }
 
-var secureOnce sync.Once
+var (
+	secureMu      sync.Mutex
+	securedShared bool
+)
 
-// secureDir locks down the shared ProgramData folder once per process. It
-// only acts when this process is elevated (the window and the service are)
-// and dir is that folder; a -config path elsewhere is left as the user set it.
-// Failures are ignored: the folder still works with its inherited rights.
-func secureDir(dir string) {
-	if !strings.EqualFold(filepath.Clean(dir), filepath.Dir(sharedPath())) {
-		return
+func checkNotReparsePoint(dir string) error {
+	p, err := windows.UTF16PtrFromString(dir)
+	if err != nil {
+		return err
 	}
-	secureOnce.Do(func() {
-		if !windows.GetCurrentProcessToken().IsElevated() {
-			return
-		}
-		sd, err := windows.SecurityDescriptorFromString(sharedDirSDDL + ownerReadACE())
-		if err != nil {
-			return
-		}
-		// A standard user who ran ashgate first owns the folder, and an
-		// owner can always rewrite its access list. Take ownership first.
-		if owner, _, err := sd.Owner(); err == nil {
-			_ = windows.SetNamedSecurityInfo(dir, windows.SE_FILE_OBJECT,
-				windows.OWNER_SECURITY_INFORMATION, owner, nil, nil, nil)
-		}
-		dacl, _, err := sd.DACL()
-		if err != nil {
-			return
-		}
-		_ = windows.SetNamedSecurityInfo(dir, windows.SE_FILE_OBJECT,
-			windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,
-			nil, nil, dacl, nil)
-	})
+	attrs, err := windows.GetFileAttributes(p)
+	if err != nil {
+		return err
+	}
+	if attrs&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+		return fmt.Errorf("refusing reparse point on protected config directory %q", dir)
+	}
+	return nil
+}
+
+// secureDir locks down the shared ProgramData folder when this process is
+// elevated (the window and the service are) and dir is that folder; a -config
+// path elsewhere is left as the user set it. Reparse points (such as NTFS
+// junctions) are always rejected, and ACL application is latched only after it
+// succeeds.
+func secureDir(dir string) error {
+	if !strings.EqualFold(filepath.Clean(dir), filepath.Dir(sharedPath())) {
+		return nil
+	}
+	if !windows.GetCurrentProcessToken().IsElevated() {
+		return nil
+	}
+	if err := checkNotReparsePoint(dir); err != nil {
+		return err
+	}
+	secureMu.Lock()
+	defer secureMu.Unlock()
+	if securedShared {
+		return nil
+	}
+	sd, err := windows.SecurityDescriptorFromString(sharedDirSDDL + ownerReadACE())
+	if err != nil {
+		return err
+	}
+	// A standard user who ran ashgate first owns the folder, and an
+	// owner can always rewrite its access list. Take ownership first.
+	owner, _, err := sd.Owner()
+	if err != nil {
+		return err
+	}
+	if owner == nil {
+		return errors.New("shared folder security descriptor missing owner")
+	}
+	if err := windows.SetNamedSecurityInfo(dir, windows.SE_FILE_OBJECT,
+		windows.OWNER_SECURITY_INFORMATION, owner, nil, nil, nil); err != nil {
+		return err
+	}
+	dacl, _, err := sd.DACL()
+	if err != nil {
+		return err
+	}
+	if dacl == nil {
+		return errors.New("shared folder security descriptor missing DACL")
+	}
+	if err := windows.SetNamedSecurityInfo(dir, windows.SE_FILE_OBJECT,
+		windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,
+		nil, nil, dacl, nil); err != nil {
+		return err
+	}
+	securedShared = true
+	return nil
 }

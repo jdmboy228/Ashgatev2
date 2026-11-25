@@ -10,6 +10,12 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+func init() {
+	// Restrict default DLL search directories to System32 so implicit or lazy
+	// DLL loads cannot be hijacked from the working directory or user PATH.
+	_ = windows.SetDefaultDllDirectories(windows.LOAD_LIBRARY_SEARCH_SYSTEM32)
+}
+
 func prepareConsole() {
 	kernel := windows.NewLazySystemDLL("kernel32.dll")
 	r, _, _ := kernel.NewProc("AttachConsole").Call(^uintptr(0))

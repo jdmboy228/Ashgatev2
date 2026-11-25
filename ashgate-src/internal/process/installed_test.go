@@ -73,3 +73,40 @@ func TestMergeInstalled(t *testing.T) {
 		t.Fatalf("%+v", got)
 	}
 }
+
+func TestUsableTargetRejectsUNCAndRelative(t *testing.T) {
+	old := fileExists
+	var statCalls []string
+	fileExists = func(p string) bool {
+		statCalls = append(statCalls, p)
+		return true
+	}
+	defer func() { fileExists = old }()
+
+	rejected := []string{
+		`\\attacker\share\app.exe`,
+		`\\attacker\C:\app.exe`,
+		`\\?\UNC\attacker\share\app.exe`,
+		`relative\app.exe`,
+		`1:\Apps\app.exe`,
+		`C:\Apps\readme.txt`,
+	}
+	for _, p := range rejected {
+		if usableTarget(p) {
+			t.Errorf("usableTarget(%q) = true, want false", p)
+		}
+	}
+	if len(statCalls) != 0 {
+		t.Fatalf("fileExists called on rejected paths: %v", statCalls)
+	}
+
+	accepted := []string{
+		`C:\Program Files\App\app.exe`,
+		`d:\Tools\tool.EXE`,
+	}
+	for _, p := range accepted {
+		if !usableTarget(p) {
+			t.Errorf("usableTarget(%q) = false, want true", p)
+		}
+	}
+}

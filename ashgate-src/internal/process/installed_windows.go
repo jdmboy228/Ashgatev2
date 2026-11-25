@@ -27,11 +27,10 @@ var fileExists = func(path string) bool {
 // the current user), App Paths and the Uninstall entries' DisplayIcon.
 func scanInstalled() []Installed {
 	var out []Installed
-	for _, root := range []string{
-		filepath.Join(os.Getenv("ProgramData"), `Microsoft\Windows\Start Menu\Programs`),
-		filepath.Join(os.Getenv("APPDATA"), `Microsoft\Windows\Start Menu\Programs`),
-	} {
-		out = append(out, scanShortcuts(root)...)
+	for _, env := range []string{"ProgramData", "APPDATA"} {
+		if base := strings.TrimSpace(os.Getenv(env)); base != "" {
+			out = append(out, scanShortcuts(filepath.Join(base, `Microsoft\Windows\Start Menu\Programs`))...)
+		}
 	}
 	for _, root := range []registry.Key{registry.LOCAL_MACHINE, registry.CURRENT_USER} {
 		out = append(out, scanAppPaths(root)...)
@@ -51,7 +50,7 @@ func scanInstalled() []Installed {
 
 func scanShortcuts(root string) []Installed {
 	var out []Installed
-	if root == "" {
+	if root == "" || !filepath.IsAbs(root) {
 		return nil
 	}
 	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {

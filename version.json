@@ -1,5 +1,5 @@
 {
-  "version": "0.9.4",
+  "version": "0.9.5",
   "download_url": "https://github.com/jdmboy228/Ashgatev2/releases/latest",
-  "release_notes": "Переключение серверов подписки по реальному трафику за секунды без таймера и дёрганий. Исправлены гонки при остановке перехвата и закрытии окна, очистка устаревших UDP/DNS-записей и потоков при смене настроек, надёжное снятие и защита правил Kill Switch."
+  "release_notes": "Исправлены критические ошибки безопасности и надёжности: блокировка DLL-hijacking WebView2Loader и перехвата WEBVIEW2_*, защита ACL/junction для %ProgramData%\\Ashgate и профиля WebView2, устранение зависания failover при отказах сервера, гонок подписок/Session.Apply, конфликтов портов VLESS и обходов Kill Switch."
 }

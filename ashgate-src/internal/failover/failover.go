@@ -194,6 +194,7 @@ func New(n int, now time.Time, cfg Config, rnd func() float64) *Group {
 func (g *Group) Reset(n, active int, now time.Time, switched bool, reason string) {
 	if switched || n == 0 {
 		g.verified = false
+		g.provenAt = time.Time{}
 	}
 	g.n, g.Active = n, active
 	g.fails, g.primaryOK = 0, 0
@@ -238,7 +239,7 @@ func (g *Group) Observe(now time.Time, ev Evidence) bool {
 	if ev.LastUse.After(g.lastUse) {
 		g.lastUse = ev.LastUse
 	}
-	if !ev.LastGood.Before(g.from) && !ev.LastGood.IsZero() {
+	if !ev.LastGood.IsZero() && !ev.LastGood.Before(g.from) && ev.LastGood.After(g.provenAt) {
 		g.alive(ev.LastGood)
 	}
 	if now.Before(g.notBefore) || now.Before(g.roundAt) {
@@ -355,6 +356,7 @@ func (g *Group) alive(at time.Time) {
 // reconnect storm.
 func (g *Group) switchAway(now time.Time, why string, label func(int) string) bool {
 	g.verified = false
+	g.provenAt = time.Time{}
 	g.failed[g.Active] = true
 	g.fails, g.primaryOK, g.wanted = 0, 0, false
 	g.gap, g.okAt = 0, time.Time{}
@@ -453,6 +455,7 @@ func (g *Group) Probe(now time.Time, ok bool, label func(int) string) bool {
 	}
 	g.Active = 0
 	g.verified = false
+	g.provenAt = time.Time{}
 	g.Reason = label(0) + ": основной сервер снова отвечает"
 	g.SwitchedAt, g.returnedAt, g.from = now, now, now
 	g.primaryOK, g.fails, g.wanted = 0, 0, false

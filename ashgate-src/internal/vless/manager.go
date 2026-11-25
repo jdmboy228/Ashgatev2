@@ -75,21 +75,36 @@ func (m *Manager) Sync(ctx context.Context, items []Endpoint) (map[string]Status
 		return nil, errors.New("VLESS: локальный мост не запущен")
 	}
 
-	next := make(map[string]*running, len(items))
-	status := make(map[string]Status, len(items))
-	var errs []error
+	// Deduplicate by Name (first occurrence wins) so no started bridge is leaked.
+	unique := make([]Endpoint, 0, len(items))
+	want := make(map[string]string, len(items))
 	for _, item := range items {
-		fp := fingerprint(item)
-		if cur, ok := m.by[item.Name]; ok {
-			if cur.fp == fp {
-				next[item.Name] = cur
-				status[item.Name] = statusOf(cur.bridge)
-				continue
-			}
-			// Changed: stop the old bridge first. It is replaced either way,
-			// and a fixed SOCKSPort it still held would make Listen fail.
+		if _, dup := want[item.Name]; dup {
+			continue
+		}
+		want[item.Name] = fingerprint(item)
+		unique = append(unique, item)
+	}
+
+	// Pass 1: stop all removed and changed bridges before starting any new ones
+	// so fixed SOCKSPort renames, replacements, and port swaps do not conflict.
+	for name, cur := range m.by {
+		if fp, ok := want[name]; !ok || cur.fp != fp {
 			cur.bridge.Close()
-			delete(m.by, item.Name)
+			delete(m.by, name)
+		}
+	}
+
+	// Pass 2: keep unchanged bridges and start missing or changed ones.
+	next := make(map[string]*running, len(unique))
+	status := make(map[string]Status, len(unique))
+	var errs []error
+	for _, item := range unique {
+		fp := want[item.Name]
+		if cur, ok := m.by[item.Name]; ok {
+			next[item.Name] = cur
+			status[item.Name] = statusOf(cur.bridge)
+			continue
 		}
 		br, err := ListenWith(m.ctx, item.Address, item.Params, item.Inbound, item.Routing)
 		if err != nil {
@@ -99,11 +114,6 @@ func (m *Manager) Sync(ctx context.Context, items []Endpoint) (map[string]Status
 		}
 		next[item.Name] = &running{fp: fp, bridge: br}
 		status[item.Name] = statusOf(br)
-	}
-	for name, cur := range m.by {
-		if next[name] != cur {
-			cur.bridge.Close()
-		}
 	}
 	m.by = next
 	if len(errs) > 0 {
@@ -117,12 +127,13 @@ func (m *Manager) Close() {
 	if m == nil {
 		return
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	// Cancel before locking m.mu so in-flight ListenWith/DoH/waitPort calls
+	// inside Sync abort immediately. m.cancel is immutable after NewManager.
 	if m.cancel != nil {
 		m.cancel()
-		m.cancel = nil
 	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	for name, cur := range m.by {
 		cur.bridge.Close()
 		delete(m.by, name)
