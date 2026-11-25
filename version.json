@@ -1,5 +1,5 @@
 {
-  "version": "0.9.5",
+  "version": "0.9.6",
   "download_url": "https://github.com/jdmboy228/Ashgatev2/releases/latest",
-  "release_notes": "Исправлены критические ошибки безопасности и надёжности: блокировка DLL-hijacking WebView2Loader и перехвата WEBVIEW2_*, защита ACL/junction для %ProgramData%\\Ashgate и профиля WebView2, устранение зависания failover при отказах сервера, гонок подписок/Session.Apply, конфликтов портов VLESS и обходов Kill Switch."
+  "release_notes": "Исправлен запуск окна WebView2 при работе с правами администратора: профиль возвращён в LocalAppData (через KnownFolderPath с защитой от NTFS junction), так как процессы Microsoft Edge WebView2 деэлевации требуют права записи пользователя."
 }

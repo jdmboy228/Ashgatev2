@@ -137,7 +137,7 @@ func Run(configPath string, startCapture bool) error {
 		alert(err.Error())
 		return err
 	}
-	if isReparsePoint(data) {
+	if isReparsePoint(filepath.Dir(data)) || isReparsePoint(data) {
 		err := errors.New("каталог данных WebView2 является точкой повторного анализа")
 		alert(err.Error())
 		return err
@@ -818,29 +818,22 @@ func clearWebViewEnv() {
 	}
 }
 
-// webViewDataDir is the WebView2 profile of the window. When elevated, it
-// lives under config.ProtectedDir() so non-elevated processes cannot tamper
-// with Chromium profile files or plant junctions. Non-elevated runs (dev/tests)
-// fall back to %LOCALAPPDATA%\Ashgate\WebView2 or os.UserCacheDir().
+// webViewDataDir is the WebView2 profile of the window, under the user's
+// LocalAppData folder resolved via KnownFolderPath (ignoring HKCU env
+// overrides). Microsoft Edge WebView2 de-elevates its browser and AppContainer
+// processes even when hosted by an elevated window, so the profile must live
+// in a user-writable folder rather than admin-only %ProgramData%\Ashgate.
 func webViewDataDir() (string, error) {
-	if windows.GetCurrentProcessToken().IsElevated() {
-		dir, err := config.ProtectedDir()
-		if err != nil {
-			return "", err
-		}
-		return filepath.Join(dir, "WebView2"), nil
+	if base, err := windows.KnownFolderPath(windows.FOLDERID_LocalAppData, 0); err == nil && base != "" {
+		return filepath.Join(base, "Ashgate", "WebView2"), nil
 	}
-	return legacyWebViewDataDir(), nil
-}
-
-func legacyWebViewDataDir() string {
 	if base := os.Getenv("LOCALAPPDATA"); base != "" {
-		return filepath.Join(base, "Ashgate", "WebView2")
+		return filepath.Join(base, "Ashgate", "WebView2"), nil
 	}
 	if base, err := os.UserCacheDir(); err == nil && base != "" {
-		return filepath.Join(base, "Ashgate", "WebView2")
+		return filepath.Join(base, "Ashgate", "WebView2"), nil
 	}
-	return filepath.Join(os.TempDir(), "Ashgate", "WebView2")
+	return filepath.Join(os.TempDir(), "Ashgate", "WebView2"), nil
 }
 
 // isReparsePoint reports whether path is an NTFS reparse point (junction or
@@ -884,20 +877,20 @@ func removeWebViewSubdir(dir string) {
 
 // RemoveWebViewData deletes the WebView2 profile (ashgate cleanup, run by
 // the uninstaller). Its processes can hold files for a moment after the
-// window closed, so it retries for up to 10 seconds. It only deletes the
-// WebView2 subdirectory (never ProtectedDir itself) and refuses reparse points.
+// window closed, so it retries for up to 10 seconds. It refuses reparse points
+// so an NTFS junction cannot redirect elevated deletion.
 func RemoveWebViewData() {
-	var primary string
-	if dir, err := webViewDataDir(); err == nil {
-		primary = dir
-		removeWebViewSubdir(primary)
-	}
-	legacy := legacyWebViewDataDir()
-	if legacy != "" && !strings.EqualFold(filepath.Clean(legacy), filepath.Clean(primary)) {
-		removeWebViewSubdir(legacy)
-		parent := filepath.Dir(legacy)
+	if dir, err := webViewDataDir(); err == nil && dir != "" {
+		removeWebViewSubdir(dir)
+		parent := filepath.Dir(dir)
 		if !isReparsePoint(parent) {
-			_ = os.Remove(parent) // legacy Ashgate folder, if now empty
+			_ = os.Remove(parent) // %LocalAppData%\Ashgate, if now empty
+		}
+	}
+	// Clean up any leftover ProgramData\Ashgate\WebView2 created by 0.9.5.
+	if windows.GetCurrentProcessToken().IsElevated() {
+		if dir, err := config.ProtectedDir(); err == nil && dir != "" {
+			removeWebViewSubdir(filepath.Join(dir, "WebView2"))
 		}
 	}
 }

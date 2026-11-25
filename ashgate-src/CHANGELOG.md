@@ -1,5 +1,9 @@
 # История изменений
 
+## 0.9.6
+
+- **Исправление запуска WebView2:** каталог профиля WebView2 возвращён в `%LocalAppData%\Ashgate\WebView2` (получается через `FOLDERID_LocalAppData` вместо переменной среды `LOCALAPPDATA`, с проверкой отсутствия NTFS junction при запуске и в `RemoveWebViewData`), поскольку Microsoft Edge WebView2 деэлевирует дочерние процессы и не может писать в admin-only `%ProgramData%\Ashgate\WebView2`. При удалении (`ashgate cleanup`) также очищается оставшийся от `0.9.5` каталог `%ProgramData%\Ashgate\WebView2`.
+
 ## 0.9.5
 
 Безопасность привилегированного процесса, надёжность failover, VLESS и Kill Switch:
