@@ -322,7 +322,7 @@ jobs:
         run: npm ci --no-audit --no-fund
       - name: Install Setup.exe
         run: |
-          New-Item -ItemType Directory -Force $env:E2E_OUT, C:\ashgate-e2e\apps | Out-Null
+          New-Item -ItemType Directory -Force $env:E2E_OUT, C:\ashgate-e2e\apps, C:\ashgate-e2e\control | Out-Null
           $p = Start-Process -FilePath $env:E2E_SETUP -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/SP-',"/LOG=$env:E2E_OUT\setup.log" -Wait -PassThru
           if ($p.ExitCode) { throw "Setup.exe exit code $($p.ExitCode)" }
           Copy-Item "$env:E2E_BIN\ashgate-e2e-client.exe" C:\ashgate-e2e\apps\ashgate-e2e-client.exe
