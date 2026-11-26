@@ -1,5 +1,5 @@
 {
-  "version": "0.9.8",
+  "version": "0.9.9",
   "download_url": "https://github.com/jdmboy228/Ashgatev2/releases/latest",
-  "release_notes": "Комплексное исправление оставшихся Medium и Low замечаний аудита: защита config.json от чтения без прав администратора, инкрементальное обновление таблицы журнала и кэш иконок без токена в URL, IPv6 DoH и DoQ, TCP NAT по (Src,Dst), оптимизация горячего пути, исправления VLESS/SOCKS5/HTTP/bootstrap/Kill Switch/autostart/go-webview2 и скриптов сборки."
+  "release_notes": "Разрешён параметр mode внутри ?extra={...} в ссылках VLESS XHTTP (с проверкой допустимых режимов XHTTP: auto, packet-up, stream-up, stream-one) для совместимости с экспортом 3x-ui."
 }

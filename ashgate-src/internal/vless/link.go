@@ -254,6 +254,7 @@ const (
 // downloadSettings (arbitrary StreamConfig / masterKeyLog / cert files / sockopt),
 // nested extra, and sessionIDTable/sessionIDLength (roomSize DoS) are forbidden.
 var allowedExtraKeys = map[string]bool{
+	"mode":                 true,
 	"headers":              true,
 	"xPaddingBytes":        true,
 	"xPaddingObfsMode":     true,
@@ -305,6 +306,18 @@ func sanitizeExtra(raw json.RawMessage) (json.RawMessage, error) {
 			return nil, badLink("недопустимый параметр extra: " + k)
 		}
 		switch k {
+		case "mode":
+			if !bytes.Equal(v, []byte("null")) {
+				var m string
+				if err := json.Unmarshal(v, &m); err != nil {
+					return nil, badLink("неверное значение extra.mode")
+				}
+				switch m {
+				case "", "auto", "packet-up", "stream-up", "stream-one":
+				default:
+					return nil, badLink("неверное значение extra.mode")
+				}
+			}
 		case "scMaxBufferedPosts":
 			if !bytes.Equal(v, []byte("null")) {
 				var n int64

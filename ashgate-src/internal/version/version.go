@@ -8,7 +8,7 @@ import (
 )
 
 // Version is the user-visible release.
-const Version = "0.9.8"
+const Version = "0.9.9"
 
 // Info identifies the exact build. Go records the git commit when the exe
 // is built from a git checkout; without one the fields are empty.

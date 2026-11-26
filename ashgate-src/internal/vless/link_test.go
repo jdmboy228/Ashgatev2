@@ -378,6 +378,19 @@ func TestExtraSanitization(t *testing.T) {
 		t.Fatalf("valid extra missing from ClientJSON: %s", body)
 	}
 
+	// Valid extra.mode values (matching Xray's SplitHTTP modes, empty, or null) are accepted.
+	for _, rawMode := range []string{`"auto"`, `"packet-up"`, `"stream-up"`, `"stream-one"`, `""`, `null`} {
+		rawExtra := `{"mode":` + rawMode + `,"xPaddingBytes":"100-1000"}`
+		gotMode, err := ParseLink(base + "&extra=" + url.QueryEscape(rawExtra))
+		if err != nil {
+			t.Fatalf("valid extra.mode %s rejected: %v", rawMode, err)
+		}
+		if !strings.Contains(string(gotMode.Params.Extra), `"mode":`) {
+			t.Fatalf("extra.mode %s was dropped: %s", rawMode, gotMode.Params.Extra)
+		}
+		mustClient(t, gotMode.Params, "1.2.3.4", 443)
+	}
+
 	// Real 3x-ui exports often include "downloadSettings": null or "extra": null;
 	// null no-ops are stripped cleanly without failing the link, and empty {} drops Extra.
 	for _, rawExtra := range []string{
@@ -437,6 +450,8 @@ func TestExtraSanitization(t *testing.T) {
 		{"xmux-extra", `{"xmux":{"extra":{}}}`},
 		{"xmux-not-object", `{"xmux":"bad"}`},
 		{"headers-not-string-map", `{"headers":{"X-A":123}}`},
+		{"mode-invalid", `{"mode":"invalid"}`},
+		{"mode-not-string", `{"mode":123}`},
 	}
 	for _, tc := range badExtras {
 		t.Run(tc.name, func(t *testing.T) {
