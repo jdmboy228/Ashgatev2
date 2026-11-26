@@ -289,6 +289,13 @@ function apUnitHTML(u) {
 function apPath(process) {
   return String(process || "").trim().replace(/^"+|"+$/g, "");
 }
+// apVersionBadge is the mask the backend would use for this rule's path, or
+// "" when the path is already version-proof.
+function apVersionBadge(r) {
+  const masks = state && state.ruleMasks;
+  return (masks && masks[apKey(r.process)]) || "";
+}
+
 function apSwitch(act, data, on, title) {
   return `<button class="ap-switch${on ? " on" : ""}" type="button" role="switch" aria-checked="${on}" data-act="${act}" ${data} title="${esc(title)}"><i></i></button>`;
 }
@@ -304,7 +311,7 @@ function apRuleHTML(i, inGroup) {
   apTele["r" + i] = apTelemetry(s);
   return `<div class="ap-card${eff.enabled ? "" : " dim"}${inGroup ? " member" : ""}${selected ? " picked" : ""}" draggable="${inGroup ? "false" : "true"}" data-unit="r:${i}">
     <div class="ap-left">${inGroup ? "" : `<span class="ap-slot">${check}</span>`}<span class="ap-ic">${appIconHTML(apPath(r.process))}<i class="ap-dot ${s.dot}" title="${esc(s.error || (s.flows ? "Трафик идёт через прокси" : s.line))}"></i></span>
-      <div class="ap-name"><div class="nm"><span>${esc(apLabel(r.process))}</span>${s.badge ? `<em class="bad">${esc(s.badge)}</em>` : ""}</div>
+      <div class="ap-name"><div class="nm"><span>${esc(apLabel(r.process))}</span>${s.badge ? `<em class="bad">${esc(s.badge)}</em>` : ""}${apVersionBadge(r) ? `<em class="ver" title="Путь содержит папку версии: после обновления приложения правило перестанет совпадать. Обобщить — в меню правила.">версия</em>` : ""}</div>
       <div class="sub"><span class="path">${esc(apPath(r.process))}</span></div></div></div>
     <div class="ap-tele" data-tele="r${i}"></div>
     <div class="ap-routecell">${route}</div>
@@ -326,6 +333,7 @@ function apRuleMenu(i, inGroup) {
     <div class="sep"></div>
     <button type="button" data-act="ap-up" data-i="${i}">${icon("up", 14)}<span class="txt"><span class="nm">Выше</span></span></button>
     <button type="button" data-act="ap-down" data-i="${i}">${icon("down", 14)}<span class="txt"><span class="nm">Ниже</span></span></button>
+    ${apVersionBadge(r) ? `<button type="button" data-act="ap-generalize" data-i="${i}">${icon("edit", 14)}<span class="txt"><span class="nm">Обобщить путь для обновлений</span><span class="sub">${esc(apVersionBadge(r))}</span></span></button>` : ""}
     <button type="button" data-act="ap-edit" data-i="${i}">${icon("edit", 14)}<span class="txt"><span class="nm">Изменить путь / маску…</span></span></button>
     <button type="button" data-act="copy-text" data-text="${esc(r.process)}">${icon("copy", 14)}<span class="txt"><span class="nm">Скопировать путь</span></span></button>
     <button type="button" class="danger" data-act="ap-del" data-i="${i}">${icon("trash", 14)}<span class="txt"><span class="nm">Удалить правило</span></span></button></div>`;
@@ -524,6 +532,14 @@ function appsClick(id, act) {
       // The selection is by position: any reorder clears it.
       if (apMoveUnit("g:" + gname, id === "ap-gup" ? -1 : 1)) { apSelected.clear(); return apSave(); }
       return fillApps();
+    case "ap-generalize": {
+      const r = rules[i];
+      const mask = r && apVersionBadge(r);
+      if (!mask) return;
+      r.process = mask;
+      apOpen = "";
+      return apSave(`${apLabel(mask)}: путь обобщён для обновлений`);
+    }
     case "ap-edit": return apOpenEdit(i);
     case "ap-del": {
       const r = rules[i];
@@ -634,7 +650,7 @@ function apLoadApps(m) {
 
 function apOpenAdd() {
   const route = apDefaultRoute();
-  modal = { kind: "ap-add", q: "", path: "", auto: false, action: route.action, proxy: route.proxy, children: true, ks: apGlobalKS(), tcpOnly: false, apps: [], installed: null };
+  modal = { kind: "ap-add", q: "", path: "", exact: "", family: "", auto: false, action: route.action, proxy: route.proxy, children: true, ks: apGlobalKS(), tcpOnly: false, apps: [], installed: null };
   apLoadApps(modal);
   renderModal();
 }
@@ -674,25 +690,45 @@ function apCandidates(m, q, limit) {
     const score = pickMatch(q, name, path);
     if (q && !score) return;
     seen.add(k);
-    out.push({ name, path, src, score: score + (src === "run" && extra && extra.window ? 0.5 : 0), extra });
+    out.push({ name, path, src, score: score + (src === "run" && extra && extra.window ? 0.5 : 0), extra, mask: (extra && extra.mask) || "", family: (extra && extra.family) || "" });
   };
   (m.apps || []).forEach((a) => push(a.name.replace(/\.exe$/i, ""), a.path, "run", a));
   (m.installed || []).forEach((a) => push(a.name, a.path, "inst"));
   out.sort((a, b) => b.score - a.score);
   return out.slice(0, limit);
 }
+
+// apGeneralized is the process field for a chosen app: its version-proof
+// mask when the backend found one, else the exact path. apExact keeps the
+// path so «Использовать точный путь» can bring it back.
+function apGeneralized(path, mask) {
+  return mask || path;
+}
 function apAutoPath(m) {
   if (!m.q.trim() || (m.path && !m.auto)) return;
   const best = apCandidates(m, m.q, 1)[0];
-  if (best && best.score >= 3) { m.path = best.path; m.auto = true; }
-  else if (m.auto) { m.path = ""; }
+  if (best && best.score >= 3) {
+    m.exact = best.mask ? best.path : "";
+    m.path = apGeneralized(best.path, best.mask);
+    m.family = best.family;
+    m.auto = true;
+  } else if (m.auto) {
+    m.path = "";
+    m.exact = "";
+    m.family = "";
+  }
 }
 
 function apAddHTML() {
   const m = modal;
   const list = m.q.trim() ? apCandidates(m, m.q, 6) : apCandidates(m, "", 40).filter((c) => c.src === "run" && c.extra && c.extra.window).slice(0, 6);
   const cur = String(m.path || "").toLowerCase();
-  const chips = list.map((c) => `<button type="button" class="ap-pick${cur === String(c.path).toLowerCase() ? " on" : ""}" data-act="ap-pick" data-name="${esc(c.name)}" data-path="${esc(c.path)}">${appIconHTML(c.path, "width:22px;height:22px;border-radius:5px;font-size:11px")}<span class="txt"><span class="nm">${esc(c.name)}</span><span class="sub">${esc(c.extra && c.extra.title ? c.extra.title : c.path)}</span></span><span class="src">${c.src === "run" ? "запущено" : "установлено"}</span></button>`).join("");
+  const pick = (c) => {
+    const proc = apGeneralized(c.path, c.mask);
+    const exact = c.mask ? c.path : "";
+    return `<button type="button" class="ap-pick${cur === String(proc).toLowerCase() ? " on" : ""}" data-act="ap-pick" data-name="${esc(c.name)}" data-path="${esc(proc)}" data-exact="${esc(exact)}" data-family="${esc(c.family || "")}">${appIconHTML(c.path, "width:22px;height:22px;border-radius:5px;font-size:11px")}<span class="txt"><span class="nm">${esc(c.name)}</span><span class="sub">${esc(c.extra && c.extra.title ? c.extra.title : c.path)}</span></span><span class="src">${c.src === "run" ? "запущено" : "установлено"}</span></button>`;
+  };
+  const chips = list.map(pick).join("");
   const empty = m.q.trim()
     ? (m.installed === null ? "Ищу установленные приложения…" : "Не найдено. Укажите путь вручную или через «Обзор…».")
     : "Открытых окон нет.";
@@ -702,9 +738,10 @@ function apAddHTML() {
     <div class="body">
       <label class="lbl" for="ap-add-q">Поиск приложения по названию</label>
       <div class="field search">${icon("search")}<input id="ap-add-q" value="${esc(m.q)}" placeholder="Например: Telegram, Discord, Steam…" autocomplete="off" autofocus></div>
-      <div class="ap-pathline"><span class="lbl">Путь (.exe)</span>${m.auto && m.path ? `<span class="auto">найден автоматически</span>` : ""}</div>
+      <div class="ap-pathline"><span class="lbl">Путь (.exe)</span>${m.auto && m.path ? `<span class="auto">найден автоматически</span>` : ""}${m.exact ? `<button type="button" class="auto link" data-act="ap-exact">обобщено для обновлений — использовать точный путь</button>` : ""}</div>
       <div class="proc-line"><div class="field"><input class="mono" id="ap-add-path" value="${esc(m.path)}" placeholder="Подставится при вводе названия" autocomplete="off"></div><button class="btn" type="button" data-act="ap-browse">${icon("folder")}Обзор…</button></div>
       <div class="help">Пусто — правило по имени файла. Знак * — любые символы в пути: *\\Discord\\app-*\\Discord.exe</div>
+      ${apFamilyHint(m)}
       <div class="ap-or"><span>${m.q.trim() ? "совпадения" : "или выберите открытое окно"}</span></div>
       <div class="ap-picks">${chips || `<div class="ap-none">${esc(empty)}</div>`}</div>
       <label class="lbl" style="margin-top:14px">Маршрутизировать через</label>
@@ -718,14 +755,31 @@ function apAddHTML() {
   </form></div>`;
 }
 
+// apFamilyHint explains what else a rule for a known emulator or launcher
+// covers, since its network process is started by a service rather than by
+// the launcher itself.
+const AP_FAMILY_HINT = {
+  ldplayer: "Ld9BoxHeadless.exe и другие процессы LDPlayer",
+  bluestacks: "HD-Player.exe и другие процессы BlueStacks",
+  nox: "NoxVMHandle.exe и другие процессы Nox",
+  memu: "MEmuHeadless.exe и другие процессы MEmu",
+};
+function apFamilyHint(m) {
+  const fam = m.family || "";
+  const what = AP_FAMILY_HINT[fam];
+  if (!what) return "";
+  return `<div class="help ap-fam">Правило учтёт также ${esc(what)}: сетевой процесс эмулятора запускает служба, а не сам лаунчер.</div>`;
+}
+
 function apWindowsHTML() {
   const m = modal;
   const have = new Set((cfg().rules || []).map((r) => apKey(r.process)));
   const list = (m.apps || []).filter((a) => a.window);
   const rows = list.map((a) => {
-    const added = have.has(apKey(a.path)) || have.has(apKey(a.name));
+    const proc = apGeneralized(a.path, a.mask);
+    const added = have.has(apKey(a.path)) || have.has(apKey(a.name)) || have.has(apKey(proc));
     return `<div class="ap-win">${appIconHTML(a.path, "width:28px;height:28px;border-radius:7px;font-size:12px")}<span class="txt"><span class="nm">${esc(a.title || a.name)}</span><span class="sub">${esc(a.name)} · PID ${a.pid} · ${esc(a.path)}</span></span>
-      ${added ? `<span class="done">${icon("check", 14)}Уже в правилах</span>` : `<button class="btn sm pri" type="button" data-act="ap-win-add" data-name="${esc(a.name)}" data-path="${esc(a.path)}">Добавить</button>`}</div>`;
+      ${added ? `<span class="done">${icon("check", 14)}Уже в правилах</span>` : `<button class="btn sm pri" type="button" data-act="ap-win-add" data-name="${esc(a.name)}" data-path="${esc(proc)}" data-family="${esc(a.family || "")}">Добавить</button>`}</div>`;
   }).join("");
   const none = m.error ? "Не удалось получить список окон: " + m.error : "Открытых окон не найдено.";
   const body = m.apps === null ? `<div class="ap-none">Загружаю окна…</div>` : rows || `<div class="ap-none">${esc(none)}</div>`;
@@ -826,7 +880,14 @@ function appsModalClick(id, act) {
     case "ap-pick":
       modal.q = act.dataset.name;
       modal.path = act.dataset.path;
+      modal.exact = act.dataset.exact || "";
+      modal.family = act.dataset.family || "";
       modal.auto = false;
+      return renderModal();
+    case "ap-exact":
+      if (!modal.exact) return;
+      modal.path = modal.exact;
+      modal.exact = "";
       return renderModal();
     case "ap-add-children": modal.children = !modal.children; return renderModal();
     case "ap-add-ks": modal.ks = !modal.ks; return renderModal();
@@ -837,8 +898,10 @@ function appsModalClick(id, act) {
       // Cancel answers an empty path: nothing to say.
       return post("/api/browse").then((res) => {
         if (!res || !res.path || modal !== m) return;
-        m.path = res.path;
+        m.exact = res.mask ? res.path : "";
+        m.path = apGeneralized(res.path, res.mask);
         m.auto = false;
+        m.family = "";
         if (!m.q.trim()) m.q = apLabel(res.path);
         renderModal();
       }).catch((err) => showToast(err.message));

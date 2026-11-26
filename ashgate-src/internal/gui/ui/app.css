@@ -494,6 +494,12 @@ table.table { min-width: 560px; }
 /* An error badge matters more than the children chip. */
 .ap-name .nm:has(em.bad) .chip { display: none; }
 .ap-name em.bad { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-style: normal; font-size: 12px; line-height: 16px; font-weight: 400; padding: 2px 8px; border-radius: 8px; color: var(--err); background: var(--err-bg); }
+/* "версия": the rule's path names one Squirrel folder and will stop
+   matching after an update. */
+.ap-name em.ver { flex: 0 0 auto; font-style: normal; font-size: 11px; line-height: 16px; font-weight: 500; padding: 1px 7px; border-radius: 8px; color: var(--tx2); background: var(--neutral); border: 1px solid var(--stroke); cursor: help; }
+.ap-pathline .auto.link { background: none; border: 0; padding: 0; font: inherit; font-size: 12px; color: var(--acc); cursor: pointer; text-align: left; }
+.ap-pathline .auto.link:hover { text-decoration: underline; }
+.ap-dlg .help.ap-fam { margin-top: 8px; }
 .ap-name .chip {
   flex: none; display: inline-flex; align-items: center; gap: 4px; height: 22px; padding: 0 8px 0 6px; border-radius: 8px;
   font-size: 12px; font-weight: 400; color: var(--tx2); background: var(--neutral);

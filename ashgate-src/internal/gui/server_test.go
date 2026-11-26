@@ -2,6 +2,7 @@ package gui
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net"
@@ -1125,5 +1126,60 @@ func TestIconAPIRejectsUNCAndNonExeWithoutStat(t *testing.T) {
 		if p != "" {
 			t.Fatalf("iconPNG called with non-empty rejected path %q", p)
 		}
+	}
+}
+
+func TestRuleMasks(t *testing.T) {
+	cfg := &config.Config{Rules: []config.Rule{
+		{Process: `C:\Users\u\AppData\Local\Discord\app-1.0.9187\Discord.exe`},
+		{Process: `C:\Program Files\App\App.exe`},
+		{Process: `*\Slack\app-*\slack.exe`},
+		{Process: "curl"},
+	}}
+	got := ruleMasks(cfg)
+	want := map[string]string{
+		`c:\users\u\appdata\local\discord\app-1.0.9187\discord.exe`: `C:\Users\u\AppData\Local\Discord\app-*\Discord.exe`,
+	}
+	if len(got) != len(want) {
+		t.Fatalf("ruleMasks = %v", got)
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Fatalf("%q = %q, want %q", k, got[k], v)
+		}
+	}
+	if ruleMasks(nil) != nil {
+		t.Fatal("nil config must give no masks")
+	}
+}
+
+func TestBrowseAnswersMask(t *testing.T) {
+	dir := t.TempDir()
+	exe := filepath.Join(dir, "app-1.0.9187", "Discord.exe")
+	if err := os.MkdirAll(filepath.Dir(exe), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(exe, []byte("MZ"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c := newController(filepath.Join(dir, "config.json"), config.Default(), nil, hooks{
+		browse: func() (string, error) { return exe, nil },
+	})
+	body := strings.NewReader(`{}`)
+	r := httptest.NewRequest(http.MethodPost, "/api/browse", body)
+	w := httptest.NewRecorder()
+	c.api(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", w.Code, w.Body)
+	}
+	var out map[string]string
+	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if out["path"] != exe {
+		t.Fatalf("path = %q", out["path"])
+	}
+	if want := filepath.Join(dir, "app-*", "Discord.exe"); out["mask"] != want {
+		t.Fatalf("mask = %q, want %q", out["mask"], want)
 	}
 }

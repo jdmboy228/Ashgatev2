@@ -22,6 +22,27 @@ func ruleKey(p string) string {
 	return strings.ToLower(strings.Trim(strings.TrimSpace(p), `"`))
 }
 
+// ruleMasks maps every rule whose path still names one Squirrel version to
+// the mask that would survive an update. The page shows a badge and offers
+// the change; the config is never rewritten here.
+func ruleMasks(cfg *config.Config) map[string]string {
+	if cfg == nil {
+		return nil
+	}
+	var out map[string]string
+	for _, r := range cfg.Rules {
+		mask, ok := rules.VersionMask(r.Process)
+		if !ok {
+			continue
+		}
+		if out == nil {
+			out = map[string]string{}
+		}
+		out[ruleKey(r.Process)] = mask
+	}
+	return out
+}
+
 // aliveRules reports, for every rule, whether a process it names is running
 // now. Only the process itself counts, not its children.
 func aliveRules(rs []config.Rule, procs []rules.Process) map[string]bool {

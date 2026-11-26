@@ -11,6 +11,8 @@ type App struct {
 	Path   string `json:"path"`
 	Window bool   `json:"window"`
 	Title  string `json:"title,omitempty"`
+	Mask   string `json:"mask,omitempty"`
+	Family string `json:"family,omitempty"`
 }
 
 // List is empty outside Windows.

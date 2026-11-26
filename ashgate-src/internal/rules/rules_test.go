@@ -159,3 +159,125 @@ func TestShellOrSystemDoesNotInheritParentRule(t *testing.T) {
 		t.Fatalf("shell process inherited parent rule: %+v", d)
 	}
 }
+
+func TestVersionMask(t *testing.T) {
+	cases := []struct {
+		in, want string
+		ok       bool
+	}{
+		{`C:\Users\u\AppData\Local\Discord\app-1.0.9187\Discord.exe`, `C:\Users\u\AppData\Local\Discord\app-*\Discord.exe`, true},
+		{`D:/Games/Slack/app-4.36.140/slack.exe`, `D:/Games/Slack/app-*/slack.exe`, true},
+		{`C:\Program Files\App\app-1.0\bin\app.exe`, `C:\Program Files\App\app-*\bin\app.exe`, true},
+		{`C:\Apps\Thing\app-1.0\app-2.0\thing.exe`, `C:\Apps\Thing\app-*\app-*\thing.exe`, true},
+		{`C:\Program Files\App\App.exe`, "", false},
+		{`C:\Apps\appdata-1\App.exe`, "", false},
+		{`*\Discord\app-*\Discord.exe`, "", false},
+		{`discord`, "", false},
+		{`C:\Apps\app-\App.exe`, "", false},
+	}
+	for _, c := range cases {
+		got, ok := VersionMask(c.in)
+		if got != c.want || ok != c.ok {
+			t.Fatalf("VersionMask(%q) = %q, %v; want %q, %v", c.in, got, ok, c.want, c.ok)
+		}
+	}
+}
+
+func TestCompanionByFolder(t *testing.T) {
+	s := Compile([]config.Rule{{Process: `C:\LDPlayer\LDPlayer9\dnplayer.exe`, Action: "proxy", Proxy: "v"}})
+	// A service started the network process: no ancestor in the app's tree.
+	head := Process{Name: "Ld9BoxHeadless.exe", Path: `C:\LDPlayer\LDPlayer9\Ld9BoxHeadless.exe`}
+	if d := s.Match(head); d.Action != "proxy" || d.Parent != "dnplayer.exe" {
+		t.Fatalf("companion in the install folder: %+v", d)
+	}
+	sub := Process{Name: "engine.exe", Path: `C:\LDPlayer\LDPlayer9\bin\engine.exe`}
+	if d := s.Match(sub); d.Action != "proxy" {
+		t.Fatalf("companion in a subfolder: %+v", d)
+	}
+	if d := s.Match(Process{Name: "other.exe", Path: `C:\LDPlayer\LDPlayer9x\other.exe`}); d.Action != "" {
+		t.Fatalf("prefix of a folder name matched: %+v", d)
+	}
+	if d := s.Match(Process{Name: "other.exe", Path: `C:\Other\other.exe`}); d.Action != "" {
+		t.Fatalf("unrelated folder matched: %+v", d)
+	}
+}
+
+func TestCompanionRespectsChildrenSwitch(t *testing.T) {
+	off := false
+	s := Compile([]config.Rule{{Process: `C:\LDPlayer\LDPlayer9\dnplayer.exe`, Action: "proxy", Proxy: "v", Children: &off}})
+	if d := s.Match(Process{Name: "Ld9BoxHeadless.exe", Path: `C:\LDPlayer\LDPlayer9\Ld9BoxHeadless.exe`}); d.Action != "" {
+		t.Fatalf("children off still covered a companion: %+v", d)
+	}
+}
+
+func TestCompanionByFamily(t *testing.T) {
+	s := Compile([]config.Rule{{Process: "dnplayer", Action: "proxy", Proxy: "v"}})
+	head := Process{Name: "Ld9BoxHeadless.exe", Path: `D:\Somewhere\Ld9BoxHeadless.exe`}
+	if d := s.Match(head); d.Action != "proxy" || d.Parent != "dnplayer.exe" {
+		t.Fatalf("family companion: %+v", d)
+	}
+	if d := s.Match(Process{Name: "chrome.exe", Path: `D:\Somewhere\chrome.exe`}); d.Action != "" {
+		t.Fatalf("family caught another program: %+v", d)
+	}
+	if got := Family("Ld9BoxHeadless.exe"); got != "ldplayer" {
+		t.Fatalf("Family = %q", got)
+	}
+	if got := Family(`C:\Program Files\BlueStacks_nxt\HD-Player.exe`); got != "bluestacks" {
+		t.Fatalf("Family = %q", got)
+	}
+	if got := Family("curl.exe"); got != "" {
+		t.Fatalf("Family of curl = %q", got)
+	}
+}
+
+func TestCompanionSharedRoots(t *testing.T) {
+	// A rule naming an exe straight in Program Files names no folder of its own.
+	s := Compile([]config.Rule{{Process: `C:\Program Files\tool.exe`, Action: "proxy", Proxy: "v"}})
+	if d := s.Match(Process{Name: "neighbour.exe", Path: `C:\Program Files\neighbour.exe`}); d.Action != "" {
+		t.Fatalf("shared root covered a neighbour: %+v", d)
+	}
+	// Nor does a portable exe in Downloads or on the Desktop.
+	for _, dir := range []string{`C:\Users\me\Downloads`, `C:\Users\me\Desktop`, `C:\Users\me\Documents`} {
+		s := Compile([]config.Rule{{Process: dir + `\portable.exe`, Action: "proxy", Proxy: "v"}})
+		if d := s.Match(Process{Name: "other.exe", Path: dir + `\other.exe`}); d.Action != "" {
+			t.Fatalf("%s covered a neighbour: %+v", dir, d)
+		}
+	}
+}
+
+func TestCompanionSkipsSystem(t *testing.T) {
+	s := Compile([]config.Rule{{Process: `C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`, Action: "proxy", Proxy: "v"}})
+	// services.exe is not matched itself, and the folder rule must not catch it.
+	if d := s.Match(Process{Name: "services.exe", Path: `C:\Windows\System32\services.exe`}); d.Action != "" {
+		t.Fatalf("system process caught by folder: %+v", d)
+	}
+	// A sibling in the same System32 subfolder is a real companion.
+	if d := s.Match(Process{Name: "helper.exe", Path: `C:\Windows\System32\WindowsPowerShell\v1.0\helper.exe`}); d.Action != "proxy" {
+		t.Fatalf("folder companion in System32 subfolder: %+v", d)
+	}
+}
+
+func TestAncestorWinsOverFolder(t *testing.T) {
+	s := Compile([]config.Rule{
+		{Process: `C:\Games\Launcher\launcher.exe`, Action: "proxy", Proxy: "ancestor"},
+		{Process: `C:\Games\Launcher\other.exe`, Action: "direct"},
+	})
+	// other.exe's rule names the same folder; the process is started by
+	// launcher.exe, so the ancestor's rule decides first.
+	game := Process{Name: "game.exe", Path: `C:\Games\Launcher\game.exe`, Parents: []Process{{Name: "launcher.exe", Path: `C:\Games\Launcher\launcher.exe`}}}
+	if d := s.Match(game); d.Action != "proxy" || d.Proxy != "ancestor" || d.Parent != "launcher.exe" {
+		t.Fatalf("ancestor did not win: %+v", d)
+	}
+}
+
+func TestCompanionDirOfMask(t *testing.T) {
+	// A mask names the folder before its first wildcard: …\Discord.
+	s := Compile([]config.Rule{{Process: `C:\Users\u\AppData\Local\Discord\app-*\Discord.exe`, Action: "proxy", Proxy: "v"}})
+	helper := Process{Name: "DiscordHelper.exe", Path: `C:\Users\u\AppData\Local\Discord\DiscordHelper.exe`}
+	if d := s.Match(helper); d.Action != "proxy" {
+		t.Fatalf("mask folder companion: %+v", d)
+	}
+	if d := s.Match(Process{Name: "x.exe", Path: `C:\Users\u\AppData\Local\Other\x.exe`}); d.Action != "" {
+		t.Fatalf("mask folder too wide: %+v", d)
+	}
+}

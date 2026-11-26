@@ -472,7 +472,11 @@ func (c *controller) api(w http.ResponseWriter, r *http.Request) {
 			if path == "" {
 				return map[string]any{"path": "", "cancelled": true}, nil
 			}
-			return map[string]string{"path": path}, nil
+			out := map[string]string{"path": path}
+			if mask, ok := rules.VersionMask(path); ok {
+				out["mask"] = mask
+			}
+			return out, nil
 		})
 	case "/api/log/clear":
 		c.post(w, r, func() (any, error) {
@@ -539,6 +543,10 @@ type stateView struct {
 	Subs       map[string]subView      `json:"subs"`
 	// Alive: rule key -> its app is running. Absent until the first scan.
 	Alive map[string]bool `json:"alive,omitempty"`
+	// RuleMasks: rule key -> the rule's path generalized for versioned
+	// (Squirrel) folders, for rules whose saved path still names one
+	// version. The page offers to apply it; nothing changes on its own.
+	RuleMasks map[string]string `json:"ruleMasks,omitempty"`
 	// Hidden tells the page it is in the tray, so it polls slowly.
 	Hidden     bool        `json:"hidden,omitempty"`
 	Events     []eventView `json:"events"`
@@ -635,6 +643,7 @@ func (c *controller) snapshotSince(since uint64) stateView {
 		RuleStats:  c.ruleStatsLocked(time.Now()),
 		Subs:       c.subViewsLocked(),
 		Alive:      c.alive,
+		RuleMasks:  ruleMasks(cfg),
 		Hidden:     hidden,
 		Events:     events,
 		EventsSame: same,
