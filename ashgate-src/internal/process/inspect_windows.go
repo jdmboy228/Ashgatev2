@@ -151,9 +151,6 @@ const (
 	cmsgSignerInfoParam                  = 6
 	certNameSimpleDisplayType            = 4
 	processCommandLineInformation        = 60
-	statusInfoLengthMismatch             = 0xC0000004
-	statusBufferOverflow                 = 0x80000005
-	statusBufferTooSmall                 = 0xC0000023
 	maxCommandLineBufferBytes            = 64 * 1024
 )
 
@@ -340,48 +337,66 @@ func verQuery(buf []byte, subBlock string) (unsafe.Pointer, uint32, bool) {
 
 // queryCommandLine fetches a process's command line via ProcessCommandLineInformation.
 func queryCommandLine(pid uint32) string {
+	cmd, _ := queryCommandLineErr(pid)
+	return cmd
+}
+
+// queryCommandLineErr queries ProcessCommandLineInformation using the canonical
+// two-step size probe (required on Windows Server builds where an oversized or
+// static buffer fails with STATUS_INFO_LENGTH_MISMATCH).
+func queryCommandLineErr(pid uint32) (string, error) {
 	h, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
 	if err != nil {
-		return ""
+		return "", fmt.Errorf("OpenProcess(%d): %w", pid, err)
 	}
 	defer windows.CloseHandle(h)
 
-	buf := make([]byte, 2048)
+	const headerSize = uint32(unsafe.Sizeof(windows.NTUnicodeString{}))
 	var retLen uint32
-	err = windows.NtQueryInformationProcess(
-		h,
-		processCommandLineInformation,
-		unsafe.Pointer(&buf[0]),
-		uint32(len(buf)),
-		&retLen,
-	)
-	if err != nil {
-		if errno, ok := err.(windows.NTStatus); ok &&
-			(errno == statusInfoLengthMismatch || errno == statusBufferOverflow || errno == statusBufferTooSmall) &&
-			retLen > uint32(len(buf)) && retLen <= maxCommandLineBufferBytes {
-			buf = make([]byte, retLen)
-			err = windows.NtQueryInformationProcess(
-				h,
-				processCommandLineInformation,
-				unsafe.Pointer(&buf[0]),
-				uint32(len(buf)),
-				&retLen,
-			)
+	err = windows.NtQueryInformationProcess(h, processCommandLineInformation, nil, 0, &retLen)
+	if retLen < headerSize || retLen > maxCommandLineBufferBytes {
+		return "", fmt.Errorf("size probe: err=%v retLen=%d", err, retLen)
+	}
+
+	// Retry up to 2 times in case the required length grew slightly between calls.
+	var buf []byte
+	for attempt := 0; attempt < 2; attempt++ {
+		if retLen < headerSize || retLen > maxCommandLineBufferBytes {
+			return "", fmt.Errorf("invalid retLen=%d", retLen)
 		}
+		words := make([]uint64, (retLen+7)/8)
+		buf = unsafe.Slice((*byte)(unsafe.Pointer(&words[0])), len(words)*8)
+		var outLen uint32
+		err = windows.NtQueryInformationProcess(
+			h,
+			processCommandLineInformation,
+			unsafe.Pointer(&buf[0]),
+			retLen,
+			&outLen,
+		)
+		if err == nil {
+			break
+		}
+		if outLen > retLen && outLen <= maxCommandLineBufferBytes {
+			retLen = outLen
+			continue
+		}
+		return "", fmt.Errorf("query(len=%d): err=%v outLen=%d", retLen, err, outLen)
 	}
-	if err != nil || len(buf) < int(unsafe.Sizeof(windows.NTUnicodeString{})) {
-		return ""
+	if err != nil {
+		return "", fmt.Errorf("query retry failed: %v", err)
 	}
+
 	us := (*windows.NTUnicodeString)(unsafe.Pointer(&buf[0]))
 	if us.Length == 0 || us.Buffer == nil {
-		return ""
+		return "", fmt.Errorf("empty UNICODE_STRING (len=%d max=%d buf=%v)", us.Length, us.MaximumLength, us.Buffer)
 	}
 	base := uintptr(unsafe.Pointer(&buf[0]))
 	end := base + uintptr(len(buf))
 	ptr := uintptr(unsafe.Pointer(us.Buffer))
 	byteLen := uintptr(us.Length)
 	if ptr < base || ptr+byteLen > end {
-		return ""
+		return "", fmt.Errorf("out-of-bounds buffer ptr=%x range=[%x,%x) len=%d", ptr, base, end, byteLen)
 	}
-	return strings.TrimSpace(windows.UTF16ToString(unsafe.Slice(us.Buffer, us.Length/2)))
+	return strings.TrimSpace(us.String()), nil
 }

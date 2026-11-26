@@ -15,6 +15,9 @@ func TestInspectorSystemBinaryAndSelfCommandLine(t *testing.T) {
 	// CommandLine of the current test process must be readable with
 	// PROCESS_QUERY_LIMITED_INFORMATION and contain our binary name.
 	pid := uint32(os.Getpid())
+	if raw, err := queryCommandLineErr(pid); err != nil || raw == "" {
+		t.Fatalf("queryCommandLineErr(self=%d) = (%q, %v)", pid, raw, err)
+	}
 	cmd := ins.CommandLine(pid, 1)
 	if cmd == "" {
 		t.Fatal("CommandLine(self) returned empty string")
