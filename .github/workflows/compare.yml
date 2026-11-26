@@ -1,0 +1,126 @@
+# External comparison of Ashgate with other Windows proxy clients.
+# Manual only: it does not run on push, pull request, or the nightly schedule.
+# The lab generates its own keys. Do not point it at a real server.
+name: Compare
+
+on:
+  workflow_dispatch:
+    inputs:
+      rounds:
+        description: Rounds of the short measurements
+        default: "3"
+        required: false
+      soak_minutes:
+        description: Minutes of the resource-growth sample for each client
+        default: "10"
+        required: false
+      throughput_seconds:
+        description: Seconds of transfer in each direction
+        default: "8"
+        required: false
+
+concurrency:
+  group: compare-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    runs-on: windows-latest
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: ashgate-src/go.mod
+          cache-dependency-path: |
+            ashgate-src/go.sum
+            compare/lab/go.sum
+
+      - name: Inno Setup
+        run: |
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) {
+            choco install innosetup -y --no-progress
+            if ($LASTEXITCODE) { exit 1 }
+          }
+
+      - name: Build Ashgate Setup.exe
+        run: ./build-installer.ps1 -Strict
+
+      - name: Install Ashgate
+        run: |
+          $setup = Join-Path $pwd "ashgate-src\dist\Setup.exe"
+          $p = Start-Process -FilePath $setup -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/SP-' -Wait -PassThru
+          if ($p.ExitCode) { throw "Setup.exe exit code $($p.ExitCode)" }
+          $exe = Join-Path $env:ProgramFiles "Ashgate\ashgate.exe"
+          if (-not (Test-Path $exe)) { throw "ashgate.exe was not installed at $exe" }
+
+      - name: Build the lab and the workload
+        run: |
+          $bin = Join-Path (Get-Location) "compare-bin"
+          New-Item -ItemType Directory -Force $bin | Out-Null
+          Push-Location compare/lab
+          go build -o (Join-Path $bin "lab.exe") .
+          if ($LASTEXITCODE) { exit 1 }
+          Pop-Location
+          Push-Location compare/probe
+          go build -o (Join-Path $bin "compare-probe.exe") .
+          if ($LASTEXITCODE) { exit 1 }
+          Pop-Location
+
+      - name: Download pinned clients and the test server
+        run: |
+          $pins = Get-Content -Raw compare/VERSIONS.json | ConvertFrom-Json
+          $dest = Join-Path $env:RUNNER_TEMP "compare-pins"
+          New-Item -ItemType Directory -Force $dest | Out-Null
+          function Get-Pinned([string]$Url, [string]$Name, [string]$Sha) {
+            $file = Join-Path $dest $Name
+            Invoke-WebRequest -Uri $Url -OutFile $file | Out-Null
+            $got = (Get-FileHash -Algorithm SHA256 $file).Hash.ToLower()
+            if ($got -ne $Sha.ToLower()) { throw "$Name checksum is $got, pinned $Sha" }
+            $dir = Join-Path $dest ($Name + ".dir")
+            Expand-Archive -Path $file -DestinationPath $dir -Force
+            return $dir
+          }
+          $xrayDir = Get-Pinned $pins.server.url $pins.server.file $pins.server.sha256
+          $singDir = Get-Pinned $pins.clients.'sing-box'.url $pins.clients.'sing-box'.file $pins.clients.'sing-box'.sha256
+          $v2Dir = Get-Pinned $pins.clients.v2rayn.url $pins.clients.v2rayn.file $pins.clients.v2rayn.sha256
+          $xray = Join-Path $xrayDir "xray.exe"
+          $sing = (Get-ChildItem $singDir -Recurse -Filter sing-box.exe | Select-Object -First 1).FullName
+          $v2 = (Get-ChildItem $v2Dir -Recurse -Filter v2rayN.exe | Select-Object -First 1).FullName
+          if (-not (Test-Path $xray)) { throw "xray.exe missing" }
+          if (-not $sing) { throw "sing-box.exe missing" }
+          if (-not $v2) { throw "v2rayN.exe missing" }
+          "xray=$xray" | Out-File -Encoding utf8 "$dest\paths.txt"
+          "sing=$sing" | Out-File -Encoding utf8 -Append "$dest\paths.txt"
+          "v2=$v2" | Out-File -Encoding utf8 -Append "$dest\paths.txt"
+          "pin_dir=$dest" | Out-File -Encoding utf8 $env:GITHUB_ENV
+          "XRAY=$xray" | Out-File -Encoding utf8 -Append $env:GITHUB_ENV
+          "SING=$sing" | Out-File -Encoding utf8 -Append $env:GITHUB_ENV
+          "V2RAYN=$v2" | Out-File -Encoding utf8 -Append $env:GITHUB_ENV
+
+      - name: Run the comparison
+        run: |
+          ./compare/run.ps1 `
+            -Xray $env:XRAY `
+            -SingBox $env:SING `
+            -V2rayN $env:V2RAYN `
+            -Ashgate (Join-Path $env:ProgramFiles "Ashgate\ashgate.exe") `
+            -Lab (Join-Path $pwd "compare-bin\lab.exe") `
+            -Probe (Join-Path $pwd "compare-bin\compare-probe.exe") `
+            -Rounds ([int]'${{ github.event.inputs.rounds || '1' }}') `
+            -SoakMinutes ([int]'${{ github.event.inputs.soak_minutes || '0' }}') `
+            -ThroughputSeconds ([int]'${{ github.event.inputs.throughput_seconds || '4' }}') `
+            -Out (Join-Path $pwd "compare-out")
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: compare-results
+          path: compare-out/publish
+          if-no-files-found: warn
