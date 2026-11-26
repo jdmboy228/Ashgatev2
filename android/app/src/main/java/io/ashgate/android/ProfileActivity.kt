@@ -1,6 +1,7 @@
 package io.ashgate.android
 
 import android.app.Activity
+import android.content.Intent
 import android.os.Bundle
 import android.view.View
 import android.view.WindowManager
@@ -9,11 +10,6 @@ import android.widget.EditText
 import android.widget.RadioGroup
 import android.widget.TextView
 import io.ashgate.android.TunnelService.State
-import io.ashgate.mobile.Mobile
-import org.json.JSONArray
-import org.json.JSONObject
-import java.net.HttpURLConnection
-import java.net.URL
 import kotlin.concurrent.thread
 
 /**
@@ -22,11 +18,17 @@ import kotlin.concurrent.thread
  * and HTTP take the form. The Go core checks all of it.
  */
 class ProfileActivity : Activity() {
+    companion object {
+        private const val REQ_QR_SCAN = 101
+    }
+
     private lateinit var kind: RadioGroup
     private lateinit var link: EditText
     private lateinit var proxy: View
     private lateinit var error: TextView
     private lateinit var save: Button
+    private lateinit var scanQr: Button
+    private lateinit var showQr: Button
     private lateinit var delete: Button
     private var id: String? = null
 
@@ -45,6 +47,8 @@ class ProfileActivity : Activity() {
         proxy = findViewById(R.id.proxy)
         error = findViewById(R.id.error)
         save = findViewById(R.id.save)
+        scanQr = findViewById(R.id.scan_qr)
+        showQr = findViewById(R.id.show_qr)
         delete = findViewById(R.id.delete)
 
         id = intent.getStringExtra("id")
@@ -70,6 +74,15 @@ class ProfileActivity : Activity() {
                 field(R.id.user).setText(old.optString("user"))
                 field(R.id.pass).setText(old.optString("pass"))
             }
+            showQr.apply {
+                visibility = View.VISIBLE
+                onClick {
+                    startActivity(
+                        Intent(this@ProfileActivity, ProfileQrActivity::class.java)
+                            .putExtra(ProfileQrActivity.EXTRA_PROFILE_ID, id),
+                    )
+                }
+            }
             delete.apply {
                 visibility = View.VISIBLE
                 onClick {
@@ -78,6 +91,13 @@ class ProfileActivity : Activity() {
                     Store.delete(this@ProfileActivity, this@ProfileActivity.id!!)
                     if (wasSelected) reconnect()
                     finish()
+                }
+            }
+        } else {
+            scanQr.apply {
+                visibility = View.VISIBLE
+                onClick {
+                    startActivityForResult(Intent(this@ProfileActivity, QrScanActivity::class.java), REQ_QR_SCAN)
                 }
             }
         }
@@ -89,6 +109,14 @@ class ProfileActivity : Activity() {
         super.onDestroy()
     }
 
+    @Deprecated("Deprecated in Java")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == REQ_QR_SCAN && resultCode == RESULT_OK) {
+            finish()
+        }
+    }
+
     private fun field(id: Int): EditText = findViewById(id)
 
     private fun text(id: Int): String = field(id).text.toString()
@@ -96,45 +124,27 @@ class ProfileActivity : Activity() {
     private fun save() {
         error.visibility = View.GONE
         save.isEnabled = false
+        scanQr.isEnabled = false
+        showQr.isEnabled = false
         delete.isEnabled = false
         val vless = kind.checkedRadioButtonId == R.id.kind_vless
         val pasted = link.text.toString().trim()
         val proxyKind = if (kind.checkedRadioButtonId == R.id.kind_http) "http" else "socks5"
         val form = listOf(R.id.name, R.id.host, R.id.port, R.id.user, R.id.pass).map(::text)
-        // The subscription is downloaded here, so off the main thread.
         thread {
-            var changed = emptySet<String>()
             val failure = try {
-                val found: List<JSONObject> = when {
-                    !vless -> listOf(
-                        JSONObject(
-                            Mobile.parseProxy(
-                                proxyKind, form[0], form[1], form[2].trim().toLongOrNull() ?: 0, form[3], form[4],
-                            ),
-                        ),
-                    )
-                    else -> when (ProfileInput.kind(pasted)) {
-                        ProfileInput.Kind.INSECURE_SUBSCRIPTION -> throw Exception(getString(R.string.sub_insecure))
-                        ProfileInput.Kind.SUBSCRIPTION -> {
-                            val arr = JSONArray(Mobile.parseSubscription(download(pasted)))
-                            List(arr.length()) { arr.getJSONObject(it) }
-                        }
-                        ProfileInput.Kind.LINK -> listOf(JSONObject(Mobile.parseLink(pasted)))
-                    }
-                }
-                if (closed || isFinishing || isDestroyed) return@thread
-                // An edited profile keeps its place. A server that is already
-                // saved (the same subscription imported again) is replaced
-                // instead of added a second time.
-                val saved = Store.profiles(this)
-                    .mapNotNull { p -> ProfileInput.serverKey(p.optString("link"))?.let { it to p.getString("id") } }
-                    .groupBy({ it.first }, { it.second })
-                val incomingKeys = found.map { ProfileInput.serverKey(it.optString("link")) }
-                val ids = ProfileInput.ids(saved, incomingKeys, id)
-                found.forEachIndexed { i, p -> ids[i]?.let { p.put("id", it) } }
-                Store.putAll(this, found)
-                ProfileInput.duplicateOnEdit(saved, incomingKeys, ids, id)?.let { Store.delete(this, it) }
-                changed = found.map { it.getString("id") }.toSet()
+                ProfileImporter.importForm(
+                    this,
+                    vless,
+                    pasted,
+                    proxyKind,
+                    form[0],
+                    form[1],
+                    form[2].trim().toLongOrNull() ?: 0,
+                    form[3],
+                    form[4],
+                    id,
+                )
                 null
             } catch (e: Exception) {
                 e.message ?: e.javaClass.simpleName
@@ -142,11 +152,11 @@ class ProfileActivity : Activity() {
             runOnUiThread {
                 if (closed || isFinishing || isDestroyed) return@runOnUiThread
                 if (failure == null) {
-                    // The selected profile changed (edited, or replaced by a re-import).
-                    if (Store.selectedId(this)?.let { it in changed } == true) reconnect()
                     finish()
                 } else {
                     save.isEnabled = true
+                    scanQr.isEnabled = true
+                    showQr.isEnabled = true
                     delete.isEnabled = true
                     error.text = failure
                     error.visibility = View.VISIBLE
@@ -159,35 +169,5 @@ class ProfileActivity : Activity() {
     private fun reconnect() {
         if (TunnelService.state == State.OFF) return
         if (Store.selectedId(this) == null) TunnelService.disconnect(this) else TunnelService.connect(this)
-    }
-
-    /** Errors never quote the address: it holds the subscription's token. */
-    private fun download(address: String): ByteArray {
-        try {
-            val conn = URL(address).openConnection() as HttpURLConnection
-            conn.connectTimeout = 15_000
-            conn.readTimeout = 15_000
-            try {
-                if (conn.responseCode != 200) throw Exception()
-                return conn.inputStream.use { it.readAtMost(1 shl 20) }
-            } finally {
-                conn.disconnect()
-            }
-        } catch (e: Exception) {
-            throw Exception(getString(R.string.sub_failed))
-        }
-    }
-
-    /** Reads at most [limit] bytes; fails if the stream is longer so a subscription is never cut in half. */
-    private fun java.io.InputStream.readAtMost(limit: Int): ByteArray {
-        val out = java.io.ByteArrayOutputStream()
-        val buf = ByteArray(8192)
-        while (out.size() <= limit) {
-            val n = read(buf, 0, minOf(buf.size, limit + 1 - out.size()))
-            if (n < 0) break
-            out.write(buf, 0, n)
-        }
-        if (out.size() > limit) throw Exception()
-        return out.toByteArray()
     }
 }

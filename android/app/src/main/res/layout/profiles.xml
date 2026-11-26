@@ -33,6 +33,18 @@
             android:visibility="gone" />
     </LinearLayout>
 
+    <ImageButton
+        android:id="@+id/scan_qr"
+        android:layout_width="48dp"
+        android:layout_height="48dp"
+        android:layout_gravity="top|end"
+        android:layout_marginRight="12dp"
+        android:layout_marginTop="4dp"
+        android:background="?android:attr/selectableItemBackgroundBorderless"
+        android:contentDescription="@string/qr_scan"
+        android:scaleType="center"
+        android:src="@drawable/ic_qr_scan" />
+
     <LinearLayout
         android:id="@+id/add"
         style="@style/MainButton"

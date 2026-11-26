@@ -39,4 +39,24 @@
 
     <!-- Доступность -->
     <string name="back">Назад</string>                                  <!-- derived, contentDescription -->
+
+    <!-- QR-код и сканер -->
+    <string name="qr_show">Показать QR-код</string>
+    <string name="qr_scan">Сканировать QR-код</string>
+    <string name="qr_scan_title">Сканировать QR</string>
+    <string name="qr_scan_hint">Наведите камеру на QR-код профиля VLESS, SOCKS5 или HTTP</string>
+    <string name="qr_pick_gallery">Выбрать из галереи</string>
+    <string name="qr_torch">Фонарик</string>
+    <string name="qr_share_desc">QR-код профиля</string>
+    <string name="qr_security_hint">QR-код содержит ключи или пароль профиля. Показывайте его только тому, кому доверяете.</string>
+    <string name="qr_invalid">QR-код не содержит профиль VLESS, SOCKS5 или HTTP</string>
+    <string name="qr_not_found_image">На изображении не найден QR-код</string>
+    <string name="qr_image_failed">Не удалось открыть изображение</string>
+    <string name="qr_gen_failed">Не удалось создать QR-код</string>
+    <string name="qr_camera_denied">Нет доступа к камере. Разрешите камеру или выберите изображение с QR-кодом из галереи.</string>
+    <string name="qr_camera_unavailable">Камера недоступна. Выберите изображение с QR-кодом из галереи.</string>
+    <string name="qr_grant_camera">Разрешить камеру</string>
+    <string name="qr_importing">Проверка профиля…</string>
+    <string name="qr_imported_one">Профиль добавлен: %s</string>
+    <string name="qr_imported_many">Добавлено профилей: %d</string>
 </resources>

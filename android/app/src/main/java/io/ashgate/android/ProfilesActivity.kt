@@ -27,6 +27,7 @@ class ProfilesActivity : Activity() {
         if (!Store.usable(this)) return finish()
         setContentView(R.layout.profiles)
         findViewById<View>(R.id.back).onClick { finish() }
+        findViewById<View>(R.id.scan_qr).onClick { startActivity(Intent(this, QrScanActivity::class.java)) }
         findViewById<TextView>(R.id.title).apply { setText(R.string.profiles); typeface = Fonts.extrabold(context) }
         findViewById<TextView>(R.id.sub).apply { setText(R.string.profiles_sub); typeface = Fonts.medium(context) }
         Fonts.set(Fonts.medium(this), findViewById(R.id.empty))
@@ -100,6 +101,12 @@ class ProfilesActivity : Activity() {
             v.findViewById<TextView>(R.id.meta).apply {
                 text = meta(p)
                 typeface = Fonts.mono(context)
+            }
+            v.findViewById<View>(R.id.qr).onClick {
+                startActivity(
+                    Intent(this@ProfilesActivity, ProfileQrActivity::class.java)
+                        .putExtra(ProfileQrActivity.EXTRA_PROFILE_ID, p.getString("id")),
+                )
             }
             v.findViewById<View>(R.id.check).visibility = if (selected) View.VISIBLE else View.INVISIBLE
             return v

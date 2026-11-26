@@ -122,6 +122,24 @@
             android:text="@string/save" />
 
         <Button
+            android:id="@+id/scan_qr"
+            style="?android:attr/borderlessButtonStyle"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/qr_scan"
+            android:textColor="@color/ag_accent"
+            android:visibility="gone" />
+
+        <Button
+            android:id="@+id/show_qr"
+            style="?android:attr/borderlessButtonStyle"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/qr_show"
+            android:textColor="@color/ag_text1"
+            android:visibility="gone" />
+
+        <Button
             android:id="@+id/delete"
             style="?android:attr/borderlessButtonStyle"
             android:layout_width="match_parent"

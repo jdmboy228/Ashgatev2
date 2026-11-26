@@ -1,0 +1,82 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@color/ag_bg"
+    android:fillViewport="true"
+    android:fitsSystemWindows="true">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical">
+
+        <FrameLayout style="@style/AppBar">
+
+            <ImageButton
+                android:id="@+id/back"
+                style="@style/BackButton" />
+        </FrameLayout>
+
+        <TextView
+            android:id="@+id/title"
+            style="@style/ScreenTitle" />
+
+        <TextView
+            android:id="@+id/sub"
+            style="@style/ScreenSub"
+            android:ellipsize="end"
+            android:singleLine="true" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1"
+            android:gravity="center"
+            android:orientation="vertical"
+            android:paddingLeft="@dimen/ag_screen_h"
+            android:paddingRight="@dimen/ag_screen_h"
+            android:paddingTop="16dp"
+            android:paddingBottom="24dp">
+
+            <LinearLayout
+                android:id="@+id/qr_card"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:background="@drawable/bg_qr_card"
+                android:gravity="center"
+                android:padding="20dp">
+
+                <ImageView
+                    android:id="@+id/qr_image"
+                    android:layout_width="260dp"
+                    android:layout_height="260dp"
+                    android:contentDescription="@string/qr_share_desc"
+                    android:scaleType="fitCenter" />
+            </LinearLayout>
+
+            <TextView
+                android:id="@+id/qr_error"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:gravity="center"
+                android:includeFontPadding="false"
+                android:textColor="@color/ag_error"
+                android:textSize="@dimen/ag_ts_body"
+                android:visibility="gone" />
+
+            <TextView
+                android:id="@+id/qr_hint"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginLeft="@dimen/ag_screen_h"
+                android:layout_marginRight="@dimen/ag_screen_h"
+                android:layout_marginTop="24dp"
+                android:gravity="center"
+                android:includeFontPadding="false"
+                android:text="@string/qr_security_hint"
+                android:textColor="@color/ag_text2"
+                android:textSize="14sp" />
+        </LinearLayout>
+    </LinearLayout>
+</ScrollView>
