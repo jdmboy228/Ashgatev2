@@ -7,6 +7,7 @@ import (
 	"errors"
 	"image"
 	"image/png"
+	"strings"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -30,9 +31,11 @@ var (
 )
 
 const (
-	diNormal       = 3
-	shgfiIcon      = 0x000000100
-	shgfiLargeIcon = 0x000000000
+	diNormal               = 3
+	shgfiIcon              = 0x000000100
+	shgfiLargeIcon         = 0x000000000
+	shgfiUseFileAttributes = 0x000000010
+	fileAttributeNormal    = 0x00000080
 )
 
 // shFileInfo is SHFILEINFOW.
@@ -58,10 +61,23 @@ type bitmapInfoHeader struct {
 	ClrImportant  uint32
 }
 
+// IsLocalExePath reports whether path is an absolute local-drive .exe path
+// (e.g. C:\Program Files\App\app.exe), rejecting UNC, device, relative and non-exe paths.
+func IsLocalExePath(path string) bool {
+	low := strings.ToLower(strings.TrimSpace(path))
+	return strings.HasSuffix(low, ".exe") &&
+		len(low) > len(`a:\.exe`) &&
+		low[0] >= 'a' && low[0] <= 'z' &&
+		low[1] == ':' && low[2] == '\\' &&
+		low[len(low)-5] != '\\' && low[len(low)-5] != '/' &&
+		!strings.ContainsRune(low, 0)
+}
+
 // ExeIconPNG extracts the first icon of a Windows executable as a 32×32 PNG.
 func ExeIconPNG(path string) ([]byte, error) {
-	if path == "" {
-		return nil, errors.New("пустой путь")
+	path = strings.TrimSpace(path)
+	if !IsLocalExePath(path) {
+		return nil, errors.New("недопустимый путь к приложению")
 	}
 	p, err := windows.UTF16PtrFromString(path)
 	if err != nil {
@@ -78,10 +94,13 @@ func ExeIconPNG(path string) ([]byte, error) {
 	if small != 0 {
 		defer procDestroyIcon.Call(small)
 	}
-	if r == 0 || large == 0 {
-		// No icon of its own (curl.exe, helpers): take the one Explorer
-		// shows, which for such an exe is the generic program icon.
-		if png, err := shellIconPNG(p); err == nil {
+	if large != 0 {
+		defer procDestroyIcon.Call(large)
+	}
+	if r == 0 || r == ^uintptr(0) || large == 0 {
+		// No icon of its own (curl.exe, helpers): ask the shell for the
+		// generic .exe icon by extension without touching the target file.
+		if png, err := genericExeIconPNG(); err == nil {
 			return png, nil
 		}
 		if callErr != nil && callErr != windows.ERROR_SUCCESS {
@@ -89,18 +108,21 @@ func ExeIconPNG(path string) ([]byte, error) {
 		}
 		return nil, errors.New("у файла нет иконки")
 	}
-	defer procDestroyIcon.Call(large)
 	return hiconPNG(large, 32)
 }
 
-func shellIconPNG(path *uint16) ([]byte, error) {
+func genericExeIconPNG() ([]byte, error) {
+	ext, err := windows.UTF16PtrFromString(".exe")
+	if err != nil {
+		return nil, err
+	}
 	var info shFileInfo
 	r, _, _ := procSHGetFileInfoW.Call(
-		uintptr(unsafe.Pointer(path)),
-		0,
+		uintptr(unsafe.Pointer(ext)),
+		fileAttributeNormal,
 		uintptr(unsafe.Pointer(&info)),
 		unsafe.Sizeof(info),
-		shgfiIcon|shgfiLargeIcon,
+		shgfiIcon|shgfiLargeIcon|shgfiUseFileAttributes,
 	)
 	if r == 0 || info.Icon == 0 {
 		return nil, errors.New("у файла нет иконки")

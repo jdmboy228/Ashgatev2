@@ -129,8 +129,20 @@ func New() *Resolver {
 	return r
 }
 
-// Observe records a SOCKET or FLOW event. closing keeps the entry for closeGrace.
+// Observe records a LayerSocket event (BIND, CONNECT, ACCEPT, CLOSE).
+// closing keeps the entry for closeGrace.
 func (r *Resolver) Observe(proto uint8, local packet.Addr, pid uint32, closing bool) {
+	r.observe(proto, local, pid, closing, false)
+}
+
+// ObserveFlow records a LayerFlow event (ESTABLISHED, DELETED).
+// Unlike LayerSocket events, a delayed ESTABLISHED event never overwrites
+// another process's open socket or resurrects a socket LayerSocket already closed.
+func (r *Resolver) ObserveFlow(proto uint8, local packet.Addr, pid uint32, closing bool) {
+	r.observe(proto, local, pid, closing, true)
+}
+
+func (r *Resolver) observe(proto uint8, local packet.Addr, pid uint32, closing, fromFlow bool) {
 	if r == nil || pid == 0 || local.Port == 0 || (proto != packet.ProtoTCP && proto != packet.ProtoUDP) {
 		return
 	}
@@ -176,6 +188,22 @@ func (r *Resolver) Observe(proto uint8, local packet.Addr, pid uint32, closing b
 			case (!hasCur || !cur.until.IsZero()) && r.wildOpenForOtherLocked(wk, pid):
 				// Newer open wildcard socket belongs to another process; do not insert
 				// a closed exact entry that would shadow it.
+			default:
+				r.setExactLocked(ek, e)
+			}
+		} else if fromFlow {
+			cur, hasCur := r.exact[ek]
+			w, hasWild := r.wild[wk]
+			wildAlive := hasWild && alive(w, now)
+			switch {
+			case hasCur && cur.until.IsZero() && cur.proc.PID != pid:
+				// Newer open exact socket belongs to another process.
+			case hasCur && !cur.until.IsZero() && cur.proc.PID == pid && alive(cur, now):
+				// LayerSocket already closed this exact socket for pid.
+			case wildAlive && w.until.IsZero() && w.proc.PID != pid:
+				// Newer open wildcard socket belongs to another process.
+			case wildAlive && !w.until.IsZero() && w.proc.PID == pid:
+				// LayerSocket already closed pid's wildcard socket on this port.
 			default:
 				r.setExactLocked(ek, e)
 			}

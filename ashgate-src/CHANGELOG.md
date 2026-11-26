@@ -1,5 +1,19 @@
 # История изменений
 
+## 0.9.7
+
+Усиление безопасности и устранение утечек (повторный аудит):
+
+- **VLESS XHTTP `extra`:** добавлен строгий белый список параметров `sanitizeExtra` (с лимитом размера 4 КиБ и проверкой диапазонов, а также безопасным пропуском `"downloadSettings": null`/`"extra": null` из 3x-ui); запрещены `downloadSettings`, вложенный `extra`, `sessionIDTable`/`sessionIDLength` (исключены запись/чтение файлов от администратора, утечка NTLM, panic и CPU/OOM DoS).
+- **TCP `splice` и `ObserveFlow`:** `splice` сразу закрывает сторону приложения при ошибке апстрима и завершает зависшие в `CLOSE_WAIT` сокеты после чистого `EOF` по таймауту простоя `appCloseGrace` (30 с), устраняя утечку `LISTEN`-сокетов `OSAllocator`, горутин и буферов 64 КиБ; события `LayerFlow` выделены в `ObserveFlow`, чтобы задержанный `ESTABLISHED` не перекрывал переиспользованные порты и не воскрешал закрытые сокеты.
+- **Запуск перехвата и Kill Switch:** `controller.start()` теперь синхронизирует `c.bridgeSt` и применяет актуальный конфиг под `c.applyMu` *до* публикации `c.sess` и снятия правил Kill Switch; при ошибке применения сессия останавливается без снятия блокировки.
+- **Защита Windows-слоя от EoP, TOCTOU и OOM:**
+  - `RemoveWebViewData()` и создание каталога WebView2 переведены на `os.OpenRoot` от корня тома (`OBJ_DONT_REPARSE` на каждом сегменте без junction TOCTOU).
+  - `secureDir()` переведён на похендловую защиту (`FILE_FLAG_OPEN_REPARSE_POINT` + `SetSecurityInfo` с `SeTakeOwnershipPrivilege` и явным защищённым DACL для папки и файлов), а `config.Save()` — на `atomicfile.Write`.
+  - При запуске от администратора WebView2 Runtime резолвится строго из `HKLM` (все 4 канала, путь под `Program Files`) с отказом при подмене политик в `HKCU\Software\Policies\Microsoft\Edge\WebView2` и добавлен `runtime.KeepAlive` в `webviewloader`.
+  - `windowPIDs()` переведён на `InternalGetWindowText` с фиксированным буфером `[256]uint16` (устранены OOM и зависание по `WM_GETTEXTLENGTH`).
+  - `gui/server.go:iconPath` и `process.ExeIconPNG` принимают только локальные `.exe` пути (`process.IsLocalExePath`), а fallback-иконка запрашивается через `SHGFI_USEFILEATTRIBUTES` без обращения к файлам/UNC.
+
 ## 0.9.6
 
 - **Исправление запуска WebView2:** каталог профиля WebView2 возвращён в `%LocalAppData%\Ashgate\WebView2` (получается через `FOLDERID_LocalAppData` вместо переменной среды `LOCALAPPDATA`, с проверкой отсутствия NTFS junction при запуске и в `RemoveWebViewData`), поскольку Microsoft Edge WebView2 деэлевирует дочерние процессы и не может писать в admin-only `%ProgramData%\Ashgate\WebView2`. При удалении (`ashgate cleanup`) также очищается оставшийся от `0.9.5` каталог `%ProgramData%\Ashgate\WebView2`.

@@ -526,3 +526,59 @@ func TestFinalOwnerRejectsStaleHelperTable(t *testing.T) {
 		t.Fatalf("stale helper not expired by pruneLocked: helper=%d wild=%d at=%v", hLen, wLen, hAt)
 	}
 }
+
+func TestObserveFlowDoesNotShadowReusedWildcardPort(t *testing.T) {
+	start := time.Unix(1000, 0)
+	r, _ := testResolver(start)
+	wild := packet.V4(0, 0, 0, 0, 54330)
+	exact := packet.V4(192, 168, 1, 10, 54330)
+
+	// PID 10 binds and closes wildcard port; PID 20 binds the same wildcard port.
+	r.Observe(packet.ProtoUDP, wild, 10, false)
+	r.Observe(packet.ProtoUDP, wild, 10, true)
+	r.Observe(packet.ProtoUDP, wild, 20, false)
+
+	// Delayed LayerFlow ESTABLISHED for PID 10 must not insert an open exact entry
+	// that shadows PID 20's open wildcard socket.
+	r.ObserveFlow(packet.ProtoUDP, exact, 10, false)
+	if p, ok := r.Owner(packet.ProtoUDP, exact, NewFlow, false); !ok || p.PID != 20 {
+		t.Fatalf("delayed ObserveFlow shadowed wildcard owner: %+v %v, want PID 20", p, ok)
+	}
+	if p, ok := r.Owner(packet.ProtoUDP, exact, Continuing, false); !ok || p.PID != 20 {
+		t.Fatalf("delayed ObserveFlow shadowed Continuing owner: %+v %v, want PID 20", p, ok)
+	}
+
+	// Also verify delayed ObserveFlow does not overwrite another PID's open exact socket.
+	exact2 := packet.V4(192, 168, 1, 10, 54331)
+	r.Observe(packet.ProtoTCP, exact2, 20, false)
+	r.ObserveFlow(packet.ProtoTCP, exact2, 10, false)
+	if p, ok := r.Owner(packet.ProtoTCP, exact2, NewFlow, false); !ok || p.PID != 20 {
+		t.Fatalf("delayed ObserveFlow overwrote open exact owner: %+v %v, want PID 20", p, ok)
+	}
+}
+
+func TestObserveFlowDoesNotResurrectClosedSocket(t *testing.T) {
+	start := time.Unix(1000, 0)
+	r, _ := testResolver(start)
+	wild := packet.V4(0, 0, 0, 0, 54332)
+	exact := packet.V4(192, 168, 1, 10, 54332)
+
+	// Case 1: LayerSocket already closed PID 10's wildcard socket.
+	r.Observe(packet.ProtoUDP, wild, 10, false)
+	r.Observe(packet.ProtoUDP, wild, 10, true)
+	// Delayed LayerFlow ESTABLISHED for PID 10 must not resurrect an open exact entry.
+	r.ObserveFlow(packet.ProtoUDP, exact, 10, false)
+	if p, ok := r.Owner(packet.ProtoUDP, exact, NewFlow, false); ok {
+		t.Fatalf("delayed ObserveFlow resurrected closed wildcard socket: %+v", p)
+	}
+
+	// Case 2: LayerSocket already closed PID 10's exact socket.
+	exact2 := packet.V4(192, 168, 1, 10, 54333)
+	r.Observe(packet.ProtoTCP, exact2, 10, false)
+	r.Observe(packet.ProtoTCP, exact2, 10, true)
+	// Delayed LayerFlow ESTABLISHED for PID 10 must not resurrect it.
+	r.ObserveFlow(packet.ProtoTCP, exact2, 10, false)
+	if p, ok := r.Owner(packet.ProtoTCP, exact2, NewFlow, false); ok {
+		t.Fatalf("delayed ObserveFlow resurrected closed exact socket: %+v", p)
+	}
+}

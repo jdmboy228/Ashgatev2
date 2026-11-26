@@ -38,10 +38,14 @@ func NewFakeSession(cancel context.CancelFunc, done chan struct{}) *Session {
 	return &Session{cancel: cancel, done: done}
 }
 
+// ErrNoEngine is returned by Session.Apply when the session has no capture
+// engine attached (for example, a test double from NewFakeSession).
+var ErrNoEngine = errors.New("движок не запущен")
+
 // Apply installs a new configuration. Existing TCP flows keep their proxy.
 func (s *Session) Apply(cfg *config.Config) error {
 	if s == nil || s.eng == nil {
-		return errors.New("движок не запущен")
+		return ErrNoEngine
 	}
 	s.applyMu.Lock()
 	defer s.applyMu.Unlock()

@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync/atomic"
 	"unsafe"
 
@@ -31,7 +32,8 @@ type Chromium struct {
 	environment *ICoreWebView2Environment
 
 	// Settings
-	DataPath string
+	DataPath                string
+	BrowserExecutableFolder string
 
 	// permissions
 	permissions      map[CoreWebView2PermissionKind]CoreWebView2PermissionState
@@ -84,7 +86,20 @@ func (e *Chromium) Embed(hwnd uintptr) bool {
 		dataPath = filepath.Join(os.Getenv("AppData"), currentExeName)
 	}
 
-	res, err := createCoreWebView2EnvironmentWithOptions(nil, windows.StringToUTF16Ptr(dataPath), 0, e.envCompleted)
+	var browserFolder *uint16
+	if e.BrowserExecutableFolder != "" {
+		var err error
+		browserFolder, err = windows.UTF16PtrFromString(e.BrowserExecutableFolder)
+		if err != nil {
+			log.Printf("Invalid BrowserExecutableFolder: %v", err)
+			return false
+		}
+	}
+
+	userDataPtr := windows.StringToUTF16Ptr(dataPath)
+	res, err := createCoreWebView2EnvironmentWithOptions(browserFolder, userDataPtr, 0, e.envCompleted)
+	runtime.KeepAlive(browserFolder)
+	runtime.KeepAlive(userDataPtr)
 	if err != nil {
 		log.Printf("Error calling Webview2Loader: %v", err)
 		return false

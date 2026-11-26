@@ -3,11 +3,13 @@
 package vless
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"net"
 	"net/url"
+	"strconv"
 	"strings"
 	"unicode"
 )
@@ -229,10 +231,180 @@ func (p *Params) Normalize() error {
 	if p.Network == "grpc" && strings.TrimSpace(p.ServiceName) == "" {
 		return badLink("для gRPC укажите serviceName")
 	}
-	if len(p.Extra) > 0 && !json.Valid(p.Extra) {
-		return badLink("поле extra не является JSON")
+	if p.Network != "xhttp" {
+		p.Extra = nil
+	} else if len(p.Extra) > 0 {
+		clean, err := sanitizeExtra(p.Extra)
+		if err != nil {
+			return err
+		}
+		p.Extra = clean
 	}
 	return nil
+}
+
+const (
+	maxExtraBytes         = 4096
+	maxExtraBufferedPosts = 1024
+	maxExtraPaddingBytes  = 65536
+	maxExtraPostBytes     = 10485760
+)
+
+// allowedExtraKeys are the XHTTP tuning keys permitted in vless:// ?extra=.
+// downloadSettings (arbitrary StreamConfig / masterKeyLog / cert files / sockopt),
+// nested extra, and sessionIDTable/sessionIDLength (roomSize DoS) are forbidden.
+var allowedExtraKeys = map[string]bool{
+	"headers":              true,
+	"xPaddingBytes":        true,
+	"xPaddingObfsMode":     true,
+	"xPaddingKey":          true,
+	"xPaddingHeader":       true,
+	"xPaddingPlacement":    true,
+	"xPaddingMethod":       true,
+	"uplinkHTTPMethod":     true,
+	"noGRPCHeader":         true,
+	"noSSEHeader":          true,
+	"scMaxEachPostBytes":   true,
+	"scMinPostsIntervalMs": true,
+	"scMaxBufferedPosts":   true,
+	"scStreamUpServerSecs": true,
+	"xmux":                 true,
+}
+
+// allowedXmuxKeys are the tuning keys permitted inside extra.xmux.
+var allowedXmuxKeys = map[string]bool{
+	"maxConcurrency":   true,
+	"maxConnections":   true,
+	"cMaxReuseTimes":   true,
+	"hMaxRequestTimes": true,
+	"hMaxReusableSecs": true,
+	"hKeepAlivePeriod": true,
+}
+
+func sanitizeExtra(raw json.RawMessage) (json.RawMessage, error) {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
+		return nil, nil
+	}
+	if len(raw) > maxExtraBytes {
+		return nil, badLink("поле extra слишком велико")
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return nil, badLink("поле extra должно быть JSON-объектом")
+	}
+	clean := make(map[string]json.RawMessage, len(obj))
+	for k, v := range obj {
+		v = bytes.TrimSpace(v)
+		if (k == "downloadSettings" || k == "extra") && bytes.Equal(v, []byte("null")) {
+			// Real 3x-ui XHTTP exports often include "downloadSettings": null.
+			// Omit null no-ops while continuing to reject any non-null value.
+			continue
+		}
+		if !allowedExtraKeys[k] {
+			return nil, badLink("недопустимый параметр extra: " + k)
+		}
+		switch k {
+		case "scMaxBufferedPosts":
+			if !bytes.Equal(v, []byte("null")) {
+				var n int64
+				if err := json.Unmarshal(v, &n); err != nil || n < 0 || n > maxExtraBufferedPosts {
+					return nil, badLink("неверное значение extra.scMaxBufferedPosts")
+				}
+			}
+		case "xPaddingBytes":
+			if !bytes.Equal(v, []byte("null")) {
+				lo, hi, err := parseExtraRange(v)
+				if err != nil || lo < 0 || hi < 0 || lo > maxExtraPaddingBytes || hi > maxExtraPaddingBytes {
+					return nil, badLink("неверное значение extra.xPaddingBytes")
+				}
+			}
+		case "scMaxEachPostBytes":
+			if !bytes.Equal(v, []byte("null")) {
+				lo, hi, err := parseExtraRange(v)
+				if err != nil || lo < 0 || hi < 0 || lo > maxExtraPostBytes || hi > maxExtraPostBytes {
+					return nil, badLink("неверное значение extra.scMaxEachPostBytes")
+				}
+			}
+		case "xmux":
+			if !bytes.Equal(v, []byte("null")) {
+				cleanXmux, err := sanitizeXmux(v)
+				if err != nil {
+					return nil, err
+				}
+				v = cleanXmux
+			}
+		case "headers":
+			if !bytes.Equal(v, []byte("null")) {
+				var hdrs map[string]string
+				if err := json.Unmarshal(v, &hdrs); err != nil {
+					return nil, badLink("неверное значение extra.headers")
+				}
+			}
+		}
+		clean[k] = v
+	}
+	if len(clean) == 0 {
+		return nil, nil
+	}
+	out, err := json.Marshal(clean)
+	if err != nil {
+		return nil, badLink("поле extra не является JSON")
+	}
+	if len(out) > maxExtraBytes {
+		return nil, badLink("поле extra слишком велико")
+	}
+	return json.RawMessage(out), nil
+}
+
+func sanitizeXmux(raw json.RawMessage) (json.RawMessage, error) {
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return nil, badLink("поле extra.xmux должно быть JSON-объектом")
+	}
+	clean := make(map[string]json.RawMessage, len(obj))
+	for k, v := range obj {
+		if !allowedXmuxKeys[k] {
+			return nil, badLink("недопустимый параметр extra.xmux: " + k)
+		}
+		clean[k] = v
+	}
+	out, err := json.Marshal(clean)
+	if err != nil {
+		return nil, badLink("неверное значение extra.xmux")
+	}
+	return json.RawMessage(out), nil
+}
+
+func parseExtraRange(raw json.RawMessage) (int64, int64, error) {
+	var n int64
+	if err := json.Unmarshal(raw, &n); err == nil {
+		return n, n, nil
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return 0, 0, err
+	}
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, 0, errors.New("empty range")
+	}
+	if n, err := strconv.ParseInt(s, 10, 64); err == nil {
+		return n, n, nil
+	}
+	left, right, ok := strings.Cut(s, "-")
+	if !ok || left == "" || right == "" {
+		return 0, 0, errors.New("bad range")
+	}
+	a, err := strconv.ParseInt(left, 10, 64)
+	if err != nil {
+		return 0, 0, err
+	}
+	b, err := strconv.ParseInt(right, 10, 64)
+	if err != nil {
+		return 0, 0, err
+	}
+	return a, b, nil
 }
 
 // DialFlow is the flow Xray will accept for this transport.

@@ -2,6 +2,7 @@ package webviewloader
 
 import (
 	"fmt"
+	"runtime"
 	"sync"
 	"unsafe"
 
@@ -42,6 +43,8 @@ func CompareBrowserVersions(v1 string, v2 string) (int, error) {
 		uint64(uintptr(unsafe.Pointer(_v1))),
 		uint64(uintptr(unsafe.Pointer(_v2))),
 		uint64(uintptr(unsafe.Pointer(&result))))
+	runtime.KeepAlive(_v1)
+	runtime.KeepAlive(_v2)
 	if err != windows.ERROR_SUCCESS {
 		return result, err
 	}
@@ -91,6 +94,8 @@ func CreateCoreWebView2EnvironmentWithOptions(browserExecutableFolder, userDataF
 		uint64(environmentOptions),
 		uint64(environmentCompletedHandle),
 	)
+	runtime.KeepAlive(browserExecutableFolder)
+	runtime.KeepAlive(userDataFolder)
 	return uintptr(res), nil
 }
 

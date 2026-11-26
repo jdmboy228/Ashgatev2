@@ -16,6 +16,7 @@ import (
 
 	"golang.org/x/net/idna"
 
+	"ashgate/internal/atomicfile"
 	"ashgate/internal/vless"
 )
 
@@ -679,21 +680,7 @@ func Save(path string, cfg *Config) error {
 	if err := secureDir(dir); err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	// A leftover or planted temp file would keep its own owner and access
-	// list through the rename. Start from a new file.
-	if err := os.Remove(tmp); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	return nil
+	return atomicfile.Write(path, data)
 }
 
 func (c *Config) marshal() ([]byte, error) {

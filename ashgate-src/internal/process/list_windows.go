@@ -23,17 +23,17 @@ type App struct {
 }
 
 var (
-	user32            = windows.NewLazySystemDLL("user32.dll")
-	procGetWindow     = user32.NewProc("GetWindow")
-	procGetWindowLen  = user32.NewProc("GetWindowTextLengthW")
-	procGetWindowLong = user32.NewProc("GetWindowLongPtrW")
-	procGetWindowText = user32.NewProc("GetWindowTextW")
+	user32              = windows.NewLazySystemDLL("user32.dll")
+	procGetWindow       = user32.NewProc("GetWindow")
+	procGetWindowLong   = user32.NewProc("GetWindowLongPtrW")
+	procInternalGetText = user32.NewProc("InternalGetWindowText")
 )
 
 const (
 	gwOwner         = 4
 	gwlExStyle      = ^uintptr(19) // -20
 	wsExToolWindow  = 0x00000080
+	maxWindowTitle  = 256
 	backgroundWords = "crashpad crashhandler crashreport update helper webview service svc broker elevation agent daemon tray watchdog launcherhelper"
 )
 
@@ -125,19 +125,18 @@ func windowPIDs() map[uint32]string {
 			if owner, _, _ := procGetWindow.Call(uintptr(hwnd), gwOwner); owner != 0 {
 				return 1
 			}
-			n, _, _ := procGetWindowLen.Call(uintptr(hwnd))
-			if n == 0 {
+			if ex, _, _ := procGetWindowLong.Call(uintptr(hwnd), gwlExStyle); ex&wsExToolWindow != 0 {
 				return 1
 			}
-			if ex, _, _ := procGetWindowLong.Call(uintptr(hwnd), gwlExStyle); ex&wsExToolWindow != 0 {
+			var buf [maxWindowTitle]uint16
+			n, _, _ := procInternalGetText.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
+			if int32(n) <= 0 {
 				return 1
 			}
 			var pid uint32
 			if _, err := windows.GetWindowThreadProcessId(hwnd, &pid); err == nil && pid != 0 {
 				if _, seen := enumOut[pid]; !seen {
-					buf := make([]uint16, n+1)
-					procGetWindowText.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
-					enumOut[pid] = windows.UTF16ToString(buf)
+					enumOut[pid] = windows.UTF16ToString(buf[:min(int(n), len(buf))])
 				}
 			}
 			return 1

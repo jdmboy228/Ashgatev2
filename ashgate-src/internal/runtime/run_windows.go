@@ -230,7 +230,11 @@ func readEvents(ctx context.Context, cancel context.CancelFunc, s *Session, what
 		}
 		ev := addr.Event()
 		closing := ev == windivert.EventSocketClose || ev == windivert.EventFlowDeleted
-		res.Observe(addr.Protocol(), addr.Local(), addr.ProcessID(), closing)
+		if ev == windivert.EventFlowEstablished || ev == windivert.EventFlowDeleted {
+			res.ObserveFlow(addr.Protocol(), addr.Local(), addr.ProcessID(), closing)
+		} else {
+			res.Observe(addr.Protocol(), addr.Local(), addr.ProcessID(), closing)
+		}
 		if ev == windivert.EventSocketClose && addr.Protocol() == udpProto {
 			// The port's next socket may be a routed program's.
 			eng.ForgetUDPPort(addr.Local().Port)

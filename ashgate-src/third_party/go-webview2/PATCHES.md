@@ -12,3 +12,9 @@ Changes:
   disk-search path so `CreateCoreWebView2EnvironmentWithOptions`, `CompareBrowserVersions`,
   and `GetInstalledVersion` always load `WebView2Loader.dll` exclusively from the embedded
   in-memory copy (`loadFromMemory`), preventing DLL sideloading from CWD or user `PATH`.
+- `webview.go`, `pkg/edge/chromium.go`, `webviewloader/module.go`: added
+  `BrowserExecutableFolder` to `WebViewOptions` and `edge.Chromium` and forwarded it to
+  `CreateCoreWebView2EnvironmentWithOptions` (with `runtime.KeepAlive` on the UTF-16 string
+  pointers across the `winloader.Proc.Call` boundary), so an elevated host can pin the
+  machine-wide `HKLM` WebView2 Runtime under Program Files instead of letting
+  `WebView2Loader.dll` fall back to user-writable `HKCU` registry keys.

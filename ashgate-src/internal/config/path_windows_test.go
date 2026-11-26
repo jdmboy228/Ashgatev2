@@ -83,3 +83,70 @@ func TestSecureDirNonSharedIsNoOp(t *testing.T) {
 		t.Fatalf("secureDir on non-shared dir returned error: %v", err)
 	}
 }
+
+func TestSecureHandleRefusesNilDACLAndJunction(t *testing.T) {
+	u, err := windows.GetCurrentProcessToken().GetTokenUser()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sddl := "O:" + u.User.Sid.String() + "D:PAI(A;OICI;FA;;;" + u.User.Sid.String() + ")"
+	sd, err := windows.SecurityDescriptorFromString(sddl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner, _, err := sd.Owner()
+	if err != nil || owner == nil {
+		t.Fatalf("owner: %v %v", owner, err)
+	}
+	dacl, _, err := sd.DACL()
+	if err != nil || dacl == nil {
+		t.Fatalf("dacl: %v %v", dacl, err)
+	}
+
+	base := t.TempDir()
+	realDir := filepath.Join(base, "real")
+	if err := os.Mkdir(realDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	filePath := filepath.Join(realDir, "config.json")
+	if err := os.WriteFile(filePath, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Must never allow a nil DACL (which grants Everyone Full Control on Windows).
+	if err := secureHandle(filePath, owner, nil, false); err == nil {
+		t.Fatal("secureHandle accepted nil DACL")
+	}
+	if err := secureHandle(filePath, nil, dacl, false); err == nil {
+		t.Fatal("secureHandle accepted nil owner")
+	}
+
+	// Normal directory + file tree (including a deep leftover WebView2 cache
+	// tree that exceeds normal nesting) succeeds without recursing into WebView2.
+	deepWV := filepath.Join(realDir, "WebView2", "a", "b", "c", "d", "e", "f", "g", "h", "i", "j")
+	if err := os.MkdirAll(deepWV, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(deepWV, "cache.dat"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := secureTree(realDir, owner, dacl, 0); err != nil {
+		t.Fatalf("secureTree on normal dir failed: %v", err)
+	}
+
+	// NTFS junction must be refused by both secureHandle and secureTree.
+	junction := filepath.Join(base, "junction")
+	if out, err := exec.Command("cmd", "/c", "mklink", "/J", junction, realDir).CombinedOutput(); err != nil {
+		t.Skipf("mklink /J unavailable: %v (%s)", err, strings.TrimSpace(string(out)))
+	}
+	if err := secureHandle(junction, owner, dacl, true); err == nil {
+		t.Fatal("secureHandle accepted NTFS junction")
+	}
+	childJunction := filepath.Join(realDir, "evil")
+	if out, err := exec.Command("cmd", "/c", "mklink", "/J", childJunction, base).CombinedOutput(); err != nil {
+		t.Skipf("mklink /J unavailable: %v (%s)", err, strings.TrimSpace(string(out)))
+	}
+	if err := secureTree(realDir, owner, dacl, 0); err == nil {
+		t.Fatal("secureTree accepted child NTFS junction")
+	}
+}

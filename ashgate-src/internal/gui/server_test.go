@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -856,5 +857,273 @@ func TestConcurrentStopsKeepStoppingUntilDone(t *testing.T) {
 	}
 	if got := fw.Blocked(); len(got) != 1 || got[0] != `C:\Apps\app.exe` {
 		t.Fatalf("kill switch blocked = %v after stop", got)
+	}
+}
+
+func TestStartReconcilesBridgeStatusAfterInitialFailure(t *testing.T) {
+	dir := t.TempDir()
+	// Bind an ephemeral loopback port to force the initial VLESS bridge start to fail.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	busyPort := ln.Addr().(*net.TCPAddr).Port
+	const link = "vless://b7e2c1a0-4f3a-4c2b-9a11-111111111111@203.0.113.10:443?encryption=none&security=reality&type=xhttp&path=%2Fxhttp&mode=auto&sni=www.microsoft.com&fp=chrome&pbk=AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8&sid=ab12#v1"
+	cfg := config.Default()
+	cfg.Proxies = []config.Proxy{{
+		Name:      "v1",
+		Type:      "vless",
+		Address:   "203.0.113.10:443",
+		SOCKSPort: busyPort,
+		Link:      link,
+	}}
+	c := newController(filepath.Join(dir, "config.json"), cfg, nil, hooks{})
+	defer c.shutdown()
+
+	c.mu.Lock()
+	initialSt := c.bridgeSt["v1"]
+	c.mu.Unlock()
+	if initialSt.Up || initialSt.Err == "" {
+		ln.Close()
+		t.Fatalf("expected initial bridge failure on busy port %d, got %+v", busyPort, initialSt)
+	}
+
+	// Free the port so the bridge can bind when start() reconciles bridges.
+	ln.Close()
+
+	sessDone := make(chan struct{})
+	var stopOnce sync.Once
+	sess := rt.NewFakeSession(func() {
+		stopOnce.Do(func() { close(sessDone) })
+	}, sessDone)
+	c.startSession = func(context.Context, *config.Config, *logbuf.Buffer, *vless.Manager) (*rt.Session, error) {
+		return sess, nil
+	}
+	if err := c.start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	c.mu.Lock()
+	afterSt := c.bridgeSt["v1"]
+	c.mu.Unlock()
+	if !afterSt.Up || afterSt.Err != "" || afterSt.SOCKS == "" {
+		t.Fatalf("bridgeSt not reconciled by start(): %+v", afterSt)
+	}
+}
+
+func TestStartAppliesConcurrentConfigSaveBeforeSyncKill(t *testing.T) {
+	dir := t.TempDir()
+	var orderMu sync.Mutex
+	var events []string
+	var appliedRule string
+
+	fw := killswitch.NewWithRunner(filepath.Join(dir, "killswitch.json"), func(line string) error {
+		if strings.Contains(line, "delete rule") {
+			orderMu.Lock()
+			events = append(events, "unblock")
+			orderMu.Unlock()
+		}
+		return nil
+	})
+	cfg := config.Default()
+	cfg.KillSwitch = true
+	cfg.Proxies = []config.Proxy{{Name: "p", Type: "socks5", Address: "127.0.0.1:1080"}}
+	cfg.Rules = []config.Rule{{Process: `C:\Apps\old.exe`, Action: "proxy", Proxy: "p"}}
+
+	c := &controller{
+		path:     filepath.Join(dir, "config.json"),
+		cfg:      cfg,
+		checks:   map[string]probe.Report{},
+		bridgeSt: map[string]vless.Status{},
+		bridges:  vless.NewManager(),
+		done:     make(chan struct{}),
+		loopDone: make(chan struct{}),
+		hooks: hooks{
+			firewall: fw,
+			guard:    func(string) (func(), error) { return func() {}, nil },
+		},
+	}
+	defer c.shutdown()
+	c.syncKill()
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	sessDone := make(chan struct{})
+	var stopOnce sync.Once
+	sess := rt.NewFakeSession(func() {
+		stopOnce.Do(func() { close(sessDone) })
+	}, sessDone)
+
+	c.startSession = func(context.Context, *config.Config, *logbuf.Buffer, *vless.Manager) (*rt.Session, error) {
+		close(entered)
+		<-release
+		return sess, nil
+	}
+	c.applySession = func(_ *rt.Session, applied *config.Config) error {
+		orderMu.Lock()
+		events = append(events, "apply")
+		if len(applied.Rules) > 0 {
+			appliedRule = applied.Rules[0].Process
+		}
+		orderMu.Unlock()
+		return nil
+	}
+
+	startErr := make(chan error, 1)
+	go func() { startErr <- c.start() }()
+	<-entered
+
+	// Save a newer config while startSession is still running (before c.sess is set).
+	next := config.Default()
+	next.KillSwitch = true
+	next.Proxies = []config.Proxy{{Name: "p", Type: "socks5", Address: "127.0.0.1:1080"}}
+	next.Rules = []config.Rule{{Process: `C:\Apps\new.exe`, Action: "proxy", Proxy: "p"}}
+	if err := c.replace(next); err != nil {
+		t.Fatalf("concurrent replace: %v", err)
+	}
+
+	close(release)
+	if err := <-startErr; err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	orderMu.Lock()
+	gotRule := appliedRule
+	gotEvents := append([]string(nil), events...)
+	orderMu.Unlock()
+	if gotRule != `C:\Apps\new.exe` {
+		t.Fatalf("applied rule = %q, want %q", gotRule, `C:\Apps\new.exe`)
+	}
+	applyIdx, unblockIdx := -1, -1
+	for i, ev := range gotEvents {
+		if ev == "apply" && applyIdx == -1 {
+			applyIdx = i
+		}
+		if ev == "unblock" && unblockIdx == -1 {
+			unblockIdx = i
+		}
+	}
+	if applyIdx == -1 || unblockIdx == -1 || applyIdx > unblockIdx {
+		t.Fatalf("expected apply before kill-switch unblock, got events %v", gotEvents)
+	}
+}
+
+func TestStartAbortsWithoutUnblockingOnApplyError(t *testing.T) {
+	dir := t.TempDir()
+	var unblocks int
+	fw := killswitch.NewWithRunner(filepath.Join(dir, "killswitch.json"), func(line string) error {
+		if strings.Contains(line, "delete rule") {
+			unblocks++
+		}
+		return nil
+	})
+	cfg := config.Default()
+	cfg.KillSwitch = true
+	cfg.Proxies = []config.Proxy{{Name: "p", Type: "socks5", Address: "127.0.0.1:1080"}}
+	cfg.Rules = []config.Rule{{Process: `C:\Apps\app.exe`, Action: "proxy", Proxy: "p"}}
+
+	c := &controller{
+		path:     filepath.Join(dir, "config.json"),
+		cfg:      cfg,
+		checks:   map[string]probe.Report{},
+		bridgeSt: map[string]vless.Status{},
+		bridges:  vless.NewManager(),
+		done:     make(chan struct{}),
+		loopDone: make(chan struct{}),
+		hooks: hooks{
+			firewall: fw,
+			guard:    func(string) (func(), error) { return func() {}, nil },
+		},
+	}
+	defer c.shutdown()
+	c.syncKill()
+	unblocks = 0
+
+	sessDone := make(chan struct{})
+	var stopOnce sync.Once
+	sess := rt.NewFakeSession(func() {
+		stopOnce.Do(func() { close(sessDone) })
+	}, sessDone)
+	c.startSession = func(context.Context, *config.Config, *logbuf.Buffer, *vless.Manager) (*rt.Session, error) {
+		return sess, nil
+	}
+	c.applySession = func(*rt.Session, *config.Config) error {
+		// Simulate a concurrent ksLoop() tick while sess.Apply is in flight:
+		// c.sess must not be published yet, so syncKill must keep the block up.
+		c.syncKill()
+		return errors.New("apply failed")
+	}
+
+	if err := c.start(); err == nil || !strings.Contains(err.Error(), "apply failed") {
+		t.Fatalf("start err = %v, want apply failed", err)
+	}
+	c.mu.Lock()
+	published := c.sess
+	c.mu.Unlock()
+	if published != nil {
+		t.Fatal("failed session was published on controller")
+	}
+	if sess.Running() {
+		t.Fatal("session still running after apply error")
+	}
+	if unblocks != 0 {
+		t.Fatalf("kill switch unblocked %d times on apply error", unblocks)
+	}
+	if got := fw.Blocked(); len(got) != 1 || got[0] != `C:\Apps\app.exe` {
+		t.Fatalf("kill switch blocked = %v after apply error", got)
+	}
+}
+
+func TestIconAPIRejectsUNCAndNonExeWithoutStat(t *testing.T) {
+	oldPNG, oldRun, oldInst, oldLook, oldStat := iconPNG, listRunning, listInstalled, lookPath, statFile
+	defer func() {
+		iconPNG, listRunning, listInstalled, lookPath, statFile = oldPNG, oldRun, oldInst, oldLook, oldStat
+	}()
+
+	var statCalls []string
+	var pngCalls []string
+	statFile = func(p string) (os.FileInfo, error) {
+		statCalls = append(statCalls, p)
+		return nil, os.ErrNotExist
+	}
+	iconPNG = func(p string) ([]byte, error) {
+		pngCalls = append(pngCalls, p)
+		if p == "" {
+			return nil, errors.New("empty")
+		}
+		return []byte("png"), nil
+	}
+	listRunning = func() ([]process.App, error) {
+		return []process.App{{Name: "evil.exe", Path: `\\127.0.0.1\share\evil.exe`}}, nil
+	}
+	listInstalled = func() []process.Installed { return nil }
+	lookPath = func(string) (string, error) { return "", errors.New("not found") }
+	icons = &iconCache{m: map[string]iconEntry{}}
+
+	c := newController(filepath.Join(t.TempDir(), "config.json"), config.Default(), nil, hooks{})
+	defer c.shutdown()
+	h := c.Handler()
+
+	for _, bad := range []string{
+		`\\127.0.0.1\share\a.exe`,
+		`//127.0.0.1/share/a.exe`,
+		`\\?\UNC\127.0.0.1\share\a.exe`,
+		`C:\Windows\notepad.txt`,
+		`evil.exe`,
+	} {
+		req := httptest.NewRequest(http.MethodGet, "/api/icon?path="+bad+"&t="+c.token, nil)
+		req.Host = "127.0.0.1:5000"
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, req)
+		if rr.Code != http.StatusNotFound {
+			t.Fatalf("path %q: got status %d, want 404", bad, rr.Code)
+		}
+	}
+	if len(statCalls) != 0 {
+		t.Fatalf("statFile was called for rejected paths: %v", statCalls)
+	}
+	for _, p := range pngCalls {
+		if p != "" {
+			t.Fatalf("iconPNG called with non-empty rejected path %q", p)
+		}
 	}
 }

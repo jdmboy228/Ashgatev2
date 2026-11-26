@@ -68,6 +68,9 @@ type controller struct {
 	// startSession starts capture; tests replace it. Nil means
 	// runtime.StartWith.
 	startSession func(context.Context, *config.Config, *logbuf.Buffer, *vless.Manager) (*rt.Session, error)
+	// applySession applies config to a running session; tests replace it.
+	// Nil means (*rt.Session).Apply.
+	applySession func(*rt.Session, *config.Config) error
 	// autoBusy is set while a background autostart read runs.
 	autoBusy bool
 	// alive says, per rule key, whether the rule's app is running; see alive.go.
@@ -685,19 +688,48 @@ func (c *controller) start() error {
 		startSession = rt.StartWith
 	}
 	sess, err := startSession(context.Background(), cfg, logs, c.bridges)
-	c.mu.Lock()
 	if err != nil {
+		c.mu.Lock()
 		c.errText = err.Error()
 		c.mu.Unlock()
 		return err
 	}
+	// Hold applyMu BEFORE publishing c.sess so neither ksLoop nor a
+	// concurrent replace's kickKill can see c.sess != nil and lift the kill
+	// switch before bridges and sess.Apply(rcfg) finish reconciling.
+	// Lock order: startMu -> applyMu -> c.mu.
+	c.applyMu.Lock()
+	c.mu.Lock()
+	closedNow := c.closed
+	c.mu.Unlock()
+	if closedNow {
+		c.applyMu.Unlock()
+		stopUnpublished(sess)
+		return errors.New("Ashgate завершает работу")
+	}
+	rcfg := c.runtimeCfg()
+	_ = c.syncBridges(rcfg)
+	var applyErr error
+	if sess.Running() {
+		applyFn := c.applySession
+		if applyFn == nil {
+			applyFn = (*rt.Session).Apply
+		}
+		applyErr = applyFn(sess, rcfg)
+	}
+	if applyErr != nil && !errors.Is(applyErr, rt.ErrNoEngine) {
+		c.mu.Lock()
+		c.errText = applyErr.Error()
+		c.mu.Unlock()
+		c.applyMu.Unlock()
+		stopUnpublished(sess)
+		return applyErr
+	}
+	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
-		sess.Stop()
-		select {
-		case <-sess.Done():
-		case <-time.After(8 * time.Second):
-		}
+		c.applyMu.Unlock()
+		stopUnpublished(sess)
 		return errors.New("Ashgate завершает работу")
 	}
 	c.sess = sess
@@ -705,6 +737,7 @@ func (c *controller) start() error {
 	// Unlock before anything below takes c.mu again: sync.Mutex is not
 	// reentrant, and holding it here froze the window on Start (0.7.1).
 	c.mu.Unlock()
+	c.applyMu.Unlock()
 	// Capture is up, so the firewall block can be lifted. Wait for it (and
 	// for the guard), like stop does: until then proxied apps are still
 	// blocked, and the window would already say "running". Persist targets
@@ -734,6 +767,17 @@ func (c *controller) start() error {
 		}
 	}()
 	return nil
+}
+
+func stopUnpublished(sess *rt.Session) {
+	if sess == nil {
+		return
+	}
+	sess.Stop()
+	select {
+	case <-sess.Done():
+	case <-time.After(8 * time.Second):
+	}
 }
 
 func (c *controller) stop() error {
@@ -1105,22 +1149,27 @@ func writeErr(w http.ResponseWriter, err error) {
 // programs. A full path that no longer exists (an update moved the exe) is
 // looked up by its file name, and a bare name of a program that is neither
 // running nor installed (curl.exe in System32) is searched on PATH.
-func iconPath(process string) string {
-	process = strings.Trim(strings.TrimSpace(process), `"`)
-	exact := rules.IsPath(process) && !strings.ContainsAny(process, "*?")
-	if exact && fileExists(process) {
-		return process
-	}
-	match := process
+func iconPath(proc string) string {
+	proc = strings.Trim(strings.TrimSpace(proc), `"`)
+	exact := rules.IsPath(proc) && !strings.ContainsAny(proc, "*?")
 	if exact {
-		match = rules.Base(process)
+		if !process.IsLocalExePath(proc) {
+			return ""
+		}
+		if fileExists(proc) {
+			return proc
+		}
+	}
+	match := proc
+	if exact {
+		match = rules.Base(proc)
 	}
 	if match == "" {
 		return ""
 	}
 	one := rules.Compile([]config.Rule{{Process: match, Action: "direct"}})
 	hit := func(name, path string) bool {
-		return path != "" && one.Match(rules.Process{Name: name, Path: path}).Action != ""
+		return process.IsLocalExePath(path) && one.Match(rules.Process{Name: name, Path: path}).Action != ""
 	}
 	if apps, err := listRunning(); err == nil {
 		for _, a := range apps {
@@ -1139,12 +1188,12 @@ func iconPath(process string) string {
 		if !strings.HasSuffix(strings.ToLower(name), ".exe") {
 			name += ".exe"
 		}
-		if p, err := lookPath(name); err == nil && p != "" {
+		if p, err := lookPath(name); err == nil && process.IsLocalExePath(p) {
 			return p
 		}
 	}
 	if exact {
-		return process
+		return proc
 	}
 	return ""
 }

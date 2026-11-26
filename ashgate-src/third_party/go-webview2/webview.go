@@ -74,6 +74,10 @@ type WebViewOptions struct {
 	// browser instance.
 	DataPath string
 
+	// BrowserExecutableFolder optionally pins the WebView2 runtime folder
+	// passed to CreateCoreWebView2EnvironmentWithOptions.
+	BrowserExecutableFolder string
+
 	// AutoFocus will try to keep the WebView2 widget focused when the window
 	// is focused.
 	AutoFocus bool
@@ -102,6 +106,7 @@ func NewWithOptions(options WebViewOptions) WebView {
 	chromium := edge.NewChromium()
 	chromium.MessageCallback = w.msgcb
 	chromium.DataPath = options.DataPath
+	chromium.BrowserExecutableFolder = options.BrowserExecutableFolder
 	chromium.SetPermission(edge.CoreWebView2PermissionKindClipboardRead, edge.CoreWebView2PermissionStateAllow)
 
 	w.browser = chromium

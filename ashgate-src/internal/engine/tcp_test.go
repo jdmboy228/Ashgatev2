@@ -444,3 +444,178 @@ func TestServeFlowCancelsDialAndSplice(t *testing.T) {
 		t.Fatal("serveFlow stuck in splice after context cancel")
 	}
 }
+
+// halfCloseConn simulates a TCP connection where CloseWrite does NOT unblock
+// Read (the peer stays in CLOSE_WAIT), while Close unblocks Read.
+type halfCloseConn struct {
+	net.Conn
+	readCh    chan []byte
+	closed    chan struct{}
+	once      sync.Once
+	wroteMu   sync.Mutex
+	wrote     []byte
+	closeWr   atomic.Bool
+	fullClose atomic.Bool
+}
+
+func newHalfCloseConn() *halfCloseConn {
+	return &halfCloseConn{
+		readCh: make(chan []byte, 16),
+		closed: make(chan struct{}),
+	}
+}
+
+func (c *halfCloseConn) Read(p []byte) (int, error) {
+	select {
+	case data, ok := <-c.readCh:
+		if !ok {
+			return 0, io.EOF
+		}
+		return copy(p, data), nil
+	case <-c.closed:
+		return 0, net.ErrClosed
+	}
+}
+
+func (c *halfCloseConn) Write(p []byte) (int, error) {
+	c.wroteMu.Lock()
+	c.wrote = append(c.wrote, p...)
+	c.wroteMu.Unlock()
+	return len(p), nil
+}
+
+func (c *halfCloseConn) CloseWrite() error {
+	c.closeWr.Store(true)
+	return nil
+}
+
+func (c *halfCloseConn) Close() error {
+	c.fullClose.Store(true)
+	c.once.Do(func() { close(c.closed) })
+	return nil
+}
+
+// errUpstream returns a configured error on Read and counts writes.
+type errUpstream struct {
+	net.Conn
+	readErr error
+	mu      sync.Mutex
+	written []byte
+}
+
+func (u *errUpstream) Read([]byte) (int, error) {
+	return 0, u.readErr
+}
+
+func (u *errUpstream) Write(p []byte) (int, error) {
+	u.mu.Lock()
+	u.written = append(u.written, p...)
+	u.mu.Unlock()
+	return len(p), nil
+}
+
+func (u *errUpstream) CloseWrite() error { return nil }
+func (u *errUpstream) Close() error      { return nil }
+
+func TestSpliceClosesAppImmediatelyOnUpstreamError(t *testing.T) {
+	app := newHalfCloseConn()
+	wantErr := errors.New("upstream reset")
+	up := &errUpstream{readErr: wantErr}
+
+	var a, b, c, d atomic.Int64
+	done := make(chan error, 1)
+	start := time.Now()
+	go func() {
+		done <- splice(app, up, counter{flow: &a, total: &b}, counter{flow: &c, total: &d})
+	}()
+	select {
+	case err := <-done:
+		if !errors.Is(err, wantErr) {
+			t.Fatalf("splice err = %v, want %v", err, wantErr)
+		}
+		if elapsed := time.Since(start); elapsed > time.Second {
+			t.Fatalf("splice took %v on upstream error", elapsed)
+		}
+		if !app.fullClose.Load() {
+			t.Fatal("app was not closed on upstream error")
+		}
+	case <-time.After(2 * time.Second):
+		_ = app.Close()
+		t.Fatal("splice hung waiting for idle app after upstream error")
+	}
+}
+
+func TestSpliceReapsSilentCloseWaitAfterCleanEOF(t *testing.T) {
+	old := appCloseGrace
+	appCloseGrace = 80 * time.Millisecond
+	defer func() { appCloseGrace = old }()
+
+	app := newHalfCloseConn()
+	up := &errUpstream{readErr: io.EOF}
+
+	var a, b, c, d atomic.Int64
+	done := make(chan error, 1)
+	start := time.Now()
+	go func() {
+		done <- splice(app, up, counter{flow: &a, total: &b}, counter{flow: &c, total: &d})
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("splice err = %v, want nil", err)
+		}
+		if took := time.Since(start); took < appCloseGrace/2 {
+			t.Fatalf("closed too early: %v", took)
+		}
+		if !app.closeWr.Load() || !app.fullClose.Load() {
+			t.Fatalf("expected half-close then full close, got closeWrite=%v close=%v", app.closeWr.Load(), app.fullClose.Load())
+		}
+	case <-time.After(2 * time.Second):
+		_ = app.Close()
+		t.Fatal("splice did not reap silent CLOSE_WAIT app after appCloseGrace")
+	}
+}
+
+func TestSpliceKeepsActiveHalfClosedUploadAlive(t *testing.T) {
+	old := appCloseGrace
+	appCloseGrace = 80 * time.Millisecond
+	defer func() { appCloseGrace = old }()
+
+	app := newHalfCloseConn()
+	up := &errUpstream{readErr: io.EOF}
+
+	var a, b, c, d atomic.Int64
+	done := make(chan error, 1)
+	go func() {
+		done <- splice(app, up, counter{flow: &a, total: &b}, counter{flow: &c, total: &d})
+	}()
+
+	// Stream chunks over 240 ms (3x appCloseGrace), then finish cleanly with EOF.
+	for i := 0; i < 8; i++ {
+		time.Sleep(30 * time.Millisecond)
+		if app.fullClose.Load() {
+			t.Fatalf("app closed prematurely at chunk %d during active upload", i)
+		}
+		app.readCh <- []byte("chunk")
+	}
+	close(app.readCh)
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("splice err = %v, want nil", err)
+		}
+	case <-time.After(2 * time.Second):
+		_ = app.Close()
+		t.Fatal("splice did not finish after half-closed upload EOF")
+	}
+	up.mu.Lock()
+	got := string(up.written)
+	up.mu.Unlock()
+	if got != "chunkchunkchunkchunkchunkchunkchunkchunk" {
+		t.Fatalf("uploaded %q, want 8 chunks", got)
+	}
+	if app.fullClose.Load() {
+		t.Fatal("active half-closed app was forcibly closed instead of finishing cleanly")
+	}
+}

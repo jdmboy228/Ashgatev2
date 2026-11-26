@@ -312,6 +312,10 @@ func relay(dst countWriter, src *source) {
 // for over a minute after the app was gone).
 var noReplyGrace = 5 * time.Second
 
+// appCloseGrace is how long an idle half-closed app connection (CLOSE_WAIT)
+// may stay open after the upstream finishes cleanly with EOF.
+var appCloseGrace = 30 * time.Second
+
 // splice copies both ways until both ends are done. Each side gets EOF
 // as a half-close when the other stops sending. It returns the error the
 // upstream's reads ended with: nil for EOF or a close of our own.
@@ -333,8 +337,48 @@ func splice(app, upstream net.Conn, up, down counter) error {
 	}()
 	from := &source{r: upstream}
 	relay(countWriter{app, down}, from)
-	closeWrite(app)
+	var (
+		appMu    sync.Mutex
+		appTimer *time.Timer
+		appDone  bool
+	)
+	if from.err != nil && from.err != io.EOF {
+		// Upstream broke or was closed (e.g. failover/reset): abort app side
+		// immediately so wg.Wait() cannot hang and RelayHealth.Dead records promptly.
+		_ = app.Close()
+	} else {
+		closeWrite(app)
+		// Allow legitimate half-closed uploads, but reap silent CLOSE_WAIT sockets.
+		graceDur := appCloseGrace
+		lastUp := up.flow.Load()
+		var check func()
+		check = func() {
+			appMu.Lock()
+			if appDone {
+				appMu.Unlock()
+				return
+			}
+			cur := up.flow.Load()
+			if cur == lastUp {
+				appMu.Unlock()
+				_ = app.Close()
+				return
+			}
+			lastUp = cur
+			appTimer.Reset(graceDur)
+			appMu.Unlock()
+		}
+		appMu.Lock()
+		appTimer = time.AfterFunc(graceDur, check)
+		appMu.Unlock()
+	}
 	wg.Wait()
+	appMu.Lock()
+	appDone = true
+	if appTimer != nil {
+		appTimer.Stop()
+	}
+	appMu.Unlock()
 	if t := grace.Load(); t != nil {
 		t.Stop()
 	}

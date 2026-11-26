@@ -117,11 +117,143 @@ func checkNotReparsePoint(dir string) error {
 	return nil
 }
 
+const maxSecureDepth = 32
+
+// enableTakeOwnership enables SeTakeOwnershipPrivilege on the current process
+// token on a best-effort basis so an elevated process can take ownership of
+// pre-planted files whose DACL excludes Administrators.
+func enableTakeOwnership() {
+	var tok windows.Token
+	if err := windows.OpenProcessToken(windows.CurrentProcess(), windows.TOKEN_ADJUST_PRIVILEGES|windows.TOKEN_QUERY, &tok); err != nil {
+		return
+	}
+	defer tok.Close()
+	name, err := windows.UTF16PtrFromString("SeTakeOwnershipPrivilege")
+	if err != nil {
+		return
+	}
+	var luid windows.LUID
+	if err := windows.LookupPrivilegeValue(nil, name, &luid); err != nil {
+		return
+	}
+	tp := windows.Tokenprivileges{
+		PrivilegeCount: 1,
+		Privileges: [1]windows.LUIDAndAttributes{{
+			Luid:       luid,
+			Attributes: windows.SE_PRIVILEGE_ENABLED,
+		}},
+	}
+	_ = windows.AdjustTokenPrivileges(tok, false, &tp, 0, nil, nil)
+}
+
+// secureHandle atomically locks down a single file or directory by handle,
+// refusing reparse points (junctions/symlinks) on both opens. Ownership is
+// taken in a first WRITE_OWNER handle so attacker-protected DACLs that exclude
+// Administrators do not cause ACCESS_DENIED before the second WRITE_DAC handle
+// applies the explicit, non-nil protected DACL.
+func secureHandle(path string, owner *windows.SID, dacl *windows.ACL, isDir bool) error {
+	if owner == nil || dacl == nil {
+		return errors.New("refusing to apply nil owner or nil DACL")
+	}
+	p, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return err
+	}
+	flags := uint32(windows.FILE_FLAG_OPEN_REPARSE_POINT)
+	if isDir {
+		flags |= windows.FILE_FLAG_BACKUP_SEMANTICS
+	}
+	const share = windows.FILE_SHARE_READ | windows.FILE_SHARE_WRITE | windows.FILE_SHARE_DELETE
+
+	hOwn, err := windows.CreateFile(p,
+		windows.WRITE_OWNER|windows.FILE_READ_ATTRIBUTES,
+		share, nil, windows.OPEN_EXISTING, flags, 0)
+	if err != nil {
+		return fmt.Errorf("open for ownership %q: %w", path, err)
+	}
+	var fi windows.ByHandleFileInformation
+	err = windows.GetFileInformationByHandle(hOwn, &fi)
+	if err == nil && fi.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+		err = fmt.Errorf("refusing reparse point %q", path)
+	}
+	if err == nil {
+		err = windows.SetSecurityInfo(hOwn, windows.SE_FILE_OBJECT,
+			windows.OWNER_SECURITY_INFORMATION, owner, nil, nil, nil)
+	}
+	windows.CloseHandle(hOwn)
+	if err != nil {
+		return fmt.Errorf("set owner %q: %w", path, err)
+	}
+
+	hDacl, err := windows.CreateFile(p,
+		windows.READ_CONTROL|windows.WRITE_DAC|windows.FILE_READ_ATTRIBUTES,
+		share, nil, windows.OPEN_EXISTING, flags, 0)
+	if err != nil {
+		return fmt.Errorf("open for DACL %q: %w", path, err)
+	}
+	defer windows.CloseHandle(hDacl)
+	var fi2 windows.ByHandleFileInformation
+	if err := windows.GetFileInformationByHandle(hDacl, &fi2); err != nil {
+		return err
+	}
+	if fi2.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+		return fmt.Errorf("refusing reparse point %q", path)
+	}
+	if err := windows.SetSecurityInfo(hDacl, windows.SE_FILE_OBJECT,
+		windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,
+		nil, nil, dacl, nil); err != nil {
+		return fmt.Errorf("set DACL %q: %w", path, err)
+	}
+	return nil
+}
+
+func secureTree(dir string, owner *windows.SID, dacl *windows.ACL, depth int) error {
+	if depth > maxSecureDepth {
+		return fmt.Errorf("protected directory nesting too deep at %q", dir)
+	}
+	if err := secureHandle(dir, owner, dacl, true); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		child := filepath.Join(dir, e.Name())
+		if e.Type()&(os.ModeSymlink|os.ModeIrregular) != 0 {
+			return fmt.Errorf("refusing reparse point %q", child)
+		}
+		if err := checkNotReparsePoint(child); err != nil {
+			return err
+		}
+		if e.IsDir() {
+			if depth == 0 && strings.EqualFold(e.Name(), "WebView2") {
+				// Lock down any leftover 0.9.5 ProgramData\Ashgate\WebView2
+				// directory handle itself without recursing into deep Chromium
+				// cache trees; Ashgate only removes this directory via os.Root.
+				if err := secureHandle(child, owner, dacl, true); err != nil {
+					return err
+				}
+				continue
+			}
+			if err := secureTree(child, owner, dacl, depth+1); err != nil {
+				return err
+			}
+		} else {
+			if err := secureHandle(child, owner, dacl, false); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // secureDir locks down the shared ProgramData folder when this process is
 // elevated (the window and the service are) and dir is that folder; a -config
 // path elsewhere is left as the user set it. Reparse points (such as NTFS
-// junctions) are always rejected, and ACL application is latched only after it
-// succeeds.
+// junctions) are always rejected, existing files/subdirectories inside dir
+// also have their owner and protected DACL reset by handle, and ACL
+// application is latched only after it succeeds.
 func secureDir(dir string) error {
 	if !strings.EqualFold(filepath.Clean(dir), filepath.Dir(sharedPath())) {
 		return nil
@@ -141,18 +273,16 @@ func secureDir(dir string) error {
 	if err != nil {
 		return err
 	}
-	// A standard user who ran ashgate first owns the folder, and an
-	// owner can always rewrite its access list. Take ownership first.
+	// A standard user who ran ashgate first owns the folder (and any
+	// pre-planted files inside it), and an owner can always rewrite the
+	// access list. Take ownership and apply the explicit protected DACL
+	// by handle on the folder and all existing children.
 	owner, _, err := sd.Owner()
 	if err != nil {
 		return err
 	}
 	if owner == nil {
 		return errors.New("shared folder security descriptor missing owner")
-	}
-	if err := windows.SetNamedSecurityInfo(dir, windows.SE_FILE_OBJECT,
-		windows.OWNER_SECURITY_INFORMATION, owner, nil, nil, nil); err != nil {
-		return err
 	}
 	dacl, _, err := sd.DACL()
 	if err != nil {
@@ -161,9 +291,8 @@ func secureDir(dir string) error {
 	if dacl == nil {
 		return errors.New("shared folder security descriptor missing DACL")
 	}
-	if err := windows.SetNamedSecurityInfo(dir, windows.SE_FILE_OBJECT,
-		windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,
-		nil, nil, dacl, nil); err != nil {
+	enableTakeOwnership()
+	if err := secureTree(dir, owner, dacl, 0); err != nil {
 		return err
 	}
 	securedShared = true

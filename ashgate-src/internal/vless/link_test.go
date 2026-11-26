@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net"
+	"net/url"
 	"reflect"
 	"strconv"
 	"strings"
@@ -357,5 +358,100 @@ func TestFingerprintDefaults(t *testing.T) {
 		if got.Params.Fingerprint != want {
 			t.Errorf("%q: fingerprint %q, want %q", fp, got.Params.Fingerprint, want)
 		}
+	}
+}
+
+func TestExtraSanitization(t *testing.T) {
+	base := "vless://" + sampleUUID + "@1.2.3.4:443?type=xhttp&security=reality&pbk=" + samplePBK + "&sni=example.com&sid=ab"
+
+	// Valid 3x-ui XHTTP extra is accepted and embedded in ClientJSON.
+	validExtra := `{"headers":{"User-Agent":"Mozilla/5.0"},"xPaddingBytes":"100-1000","xPaddingObfsMode":false,"noGRPCHeader":false,"noSSEHeader":false,"scMaxEachPostBytes":1000000,"scMinPostsIntervalMs":30,"scMaxBufferedPosts":30,"scStreamUpServerSecs":"20-80","xmux":{"maxConcurrency":"16-32","maxConnections":0,"cMaxReuseTimes":0,"hMaxRequestTimes":"600-900","hMaxReusableSecs":"1800-3000","hKeepAlivePeriod":0}}`
+	got, err := ParseLink(base + "&extra=" + url.QueryEscape(validExtra))
+	if err != nil {
+		t.Fatalf("valid extra rejected: %v", err)
+	}
+	if len(got.Params.Extra) == 0 {
+		t.Fatal("valid extra was dropped")
+	}
+	body := string(mustClient(t, got.Params, "1.2.3.4", 443))
+	if !strings.Contains(body, `"xPaddingBytes":"100-1000"`) || !strings.Contains(body, `"maxConcurrency":"16-32"`) {
+		t.Fatalf("valid extra missing from ClientJSON: %s", body)
+	}
+
+	// Real 3x-ui exports often include "downloadSettings": null or "extra": null;
+	// null no-ops are stripped cleanly without failing the link, and empty {} drops Extra.
+	for _, rawExtra := range []string{
+		`{"downloadSettings":null,"xPaddingBytes":"100-1000"}`,
+		`{"extra":null,"xPaddingBytes":"100-1000"}`,
+	} {
+		gotNull, err := ParseLink(base + "&extra=" + url.QueryEscape(rawExtra))
+		if err != nil {
+			t.Fatalf("null no-op extra %s rejected: %v", rawExtra, err)
+		}
+		s := string(gotNull.Params.Extra)
+		if !strings.Contains(s, `"xPaddingBytes":"100-1000"`) || strings.Contains(s, "downloadSettings") || strings.Contains(s, `"extra"`) {
+			t.Fatalf("unexpected sanitized extra for %s: %s", rawExtra, s)
+		}
+	}
+	for _, emptyExtra := range []string{`{}`, `{"downloadSettings":null}`} {
+		gotEmpty, err := ParseLink(base + "&extra=" + url.QueryEscape(emptyExtra))
+		if err != nil {
+			t.Fatalf("empty extra %s rejected: %v", emptyExtra, err)
+		}
+		if gotEmpty.Params.Extra != nil {
+			t.Fatalf("empty extra %s was not dropped: %s", emptyExtra, gotEmpty.Params.Extra)
+		}
+	}
+
+	// Non-xhttp networks drop Extra during Normalize.
+	tcpParams := Params{UUID: sampleUUID, Network: "tcp", Security: "none", Extra: json.RawMessage(`{"xPaddingBytes":"100-200"}`)}
+	if err := tcpParams.Normalize(); err != nil {
+		t.Fatalf("tcp normalize: %v", err)
+	}
+	if tcpParams.Extra != nil {
+		t.Fatalf("tcp kept Extra: %s", tcpParams.Extra)
+	}
+
+	// Malicious, unknown, oversized, or out-of-bounds extra payloads are rejected
+	// by ParseLink, Normalize, and ClientJSON.
+	badExtras := []struct {
+		name string
+		raw  string
+	}{
+		{"downloadSettings-masterKeyLog", `{"downloadSettings":{"address":"1.1.1.1","port":443,"network":"xhttp","security":"tls","tlsSettings":{"serverName":"1.1.1.1","masterKeyLog":"C:\\Windows\\temp\\k.log"}}}`},
+		{"downloadSettings-certFile", `{"downloadSettings":{"address":"1.1.1.1","port":443,"network":"xhttp","security":"tls","tlsSettings":{"certificates":[{"certificateFile":"\\\\attacker\\share\\c.pem"}]}}}`},
+		{"downloadSettings-panic", `{"downloadSettings":{"network":"xhttp"}}`},
+		{"downloadSettings-case", `{"DownloadSettings":{"network":"xhttp"}}`},
+		{"nested-extra", `{"extra":{"downloadSettings":{"network":"xhttp"}}}`},
+		{"sessionIDLength-dos", `{"sessionIDTable":"0123456789abcdef","sessionIDLength":"1-2147483647"}`},
+		{"sessionIDLength-only", `{"sessionIDLength":"1-100"}`},
+		{"unknown-key", `{"unknownField":true}`},
+		{"non-object-array", `["xPaddingBytes"]`},
+		{"oversized", `{"headers":{"X-Pad":"` + strings.Repeat("a", maxExtraBytes) + `"}}`},
+		{"buffered-posts-too-high", `{"scMaxBufferedPosts":2048}`},
+		{"buffered-posts-negative", `{"scMaxBufferedPosts":-1}`},
+		{"padding-too-high", `{"xPaddingBytes":"100-99999"}`},
+		{"padding-negative", `{"xPaddingBytes":-5}`},
+		{"post-bytes-too-high", `{"scMaxEachPostBytes":"1000-20000000"}`},
+		{"xmux-downloadSettings", `{"xmux":{"downloadSettings":{"network":"xhttp"}}}`},
+		{"xmux-extra", `{"xmux":{"extra":{}}}`},
+		{"xmux-not-object", `{"xmux":"bad"}`},
+		{"headers-not-string-map", `{"headers":{"X-A":123}}`},
+	}
+	for _, tc := range badExtras {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := ParseLink(base + "&extra=" + url.QueryEscape(tc.raw)); err == nil {
+				t.Fatalf("ParseLink accepted %s", tc.name)
+			}
+			p := Params{UUID: sampleUUID, Network: "xhttp", Security: "none", Extra: json.RawMessage(tc.raw)}
+			if err := p.Normalize(); err == nil {
+				t.Fatalf("Normalize accepted %s", tc.name)
+			}
+			if _, err := ClientJSON(ClientConfig{
+				Server: "1.2.3.4", ServerPort: 443, Params: p, Port: 1080, User: "u", Pass: "p",
+			}); err == nil {
+				t.Fatalf("ClientJSON accepted %s", tc.name)
+			}
+		})
 	}
 }

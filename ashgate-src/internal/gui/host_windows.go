@@ -25,9 +25,10 @@ import (
 	"ashgate/internal/service"
 	"github.com/jchv/go-webview2"
 	"golang.org/x/sys/windows"
+	"golang.org/x/sys/windows/registry"
 )
 
-const webviewMissing = "Не найден WebView2 Runtime. Установите Microsoft Edge WebView2:\nhttps://developer.microsoft.com/microsoft-edge/webview2/"
+const webviewMissing = "Не найден системный WebView2 Runtime. Установите Microsoft Edge WebView2 (для всех пользователей):\nhttps://developer.microsoft.com/microsoft-edge/webview2/"
 
 // host is the single GUI process: local page, WebView2 window, tray.
 type host struct {
@@ -132,26 +133,36 @@ func Run(configPath string, startCapture bool) error {
 		_ = srv.Shutdown(ctx)
 	}()
 
-	data, err := webViewDataDir()
+	base, err := webViewBaseDir()
 	if err != nil {
 		alert(err.Error())
 		return err
 	}
-	if isReparsePoint(filepath.Dir(data)) || isReparsePoint(data) {
-		err := errors.New("каталог данных WebView2 является точкой повторного анализа")
+	if err := mkdirAllUnderRoot(base, filepath.Join("Ashgate", "WebView2")); err != nil {
 		alert(err.Error())
 		return err
 	}
-	if err := os.MkdirAll(data, 0o700); err != nil {
-		alert(err.Error())
-		return err
-	}
+	data := filepath.Join(base, "Ashgate", "WebView2")
 	clearWebViewEnv()
+	var browserFolder string
+	if isAdmin() {
+		if err := checkHKCUWebViewPolicy(); err != nil {
+			alert(err.Error())
+			return err
+		}
+		runtimeDir, err := systemWebView2Dir()
+		if err != nil {
+			alert(err.Error())
+			return err
+		}
+		browserFolder = runtimeDir
+	}
 
 	w := webview2.NewWithOptions(webview2.WebViewOptions{
-		Debug:     false,
-		AutoFocus: true,
-		DataPath:  data,
+		Debug:                   false,
+		AutoFocus:               true,
+		DataPath:                data,
+		BrowserExecutableFolder: browserFolder,
 		WindowOptions: webview2.WindowOptions{
 			Title:  "Ashgate",
 			Width:  defWindowDIPW,
@@ -818,22 +829,105 @@ func clearWebViewEnv() {
 	}
 }
 
-// webViewDataDir is the WebView2 profile of the window, under the user's
-// LocalAppData folder resolved via KnownFolderPath (ignoring HKCU env
-// overrides). Microsoft Edge WebView2 de-elevates its browser and AppContainer
-// processes even when hosted by an elevated window, so the profile must live
-// in a user-writable folder rather than admin-only %ProgramData%\Ashgate.
-func webViewDataDir() (string, error) {
+// webViewBaseDir returns the user's LocalAppData directory resolved via
+// KnownFolderPath (ignoring HKCU env overrides). Microsoft Edge WebView2
+// de-elevates its browser and AppContainer processes even when hosted by an
+// elevated window, so the profile must live in a user-writable folder rather
+// than admin-only %ProgramData%\Ashgate.
+func webViewBaseDir() (string, error) {
 	if base, err := windows.KnownFolderPath(windows.FOLDERID_LocalAppData, 0); err == nil && base != "" {
-		return filepath.Join(base, "Ashgate", "WebView2"), nil
+		return base, nil
 	}
 	if base := os.Getenv("LOCALAPPDATA"); base != "" {
-		return filepath.Join(base, "Ashgate", "WebView2"), nil
+		return base, nil
 	}
 	if base, err := os.UserCacheDir(); err == nil && base != "" {
-		return filepath.Join(base, "Ashgate", "WebView2"), nil
+		return base, nil
 	}
-	return filepath.Join(os.TempDir(), "Ashgate", "WebView2"), nil
+	return os.TempDir(), nil
+}
+
+// webViewDataDir is the WebView2 profile of the window, under webViewBaseDir.
+func webViewDataDir() (string, error) {
+	base, err := webViewBaseDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(base, "Ashgate", "WebView2"), nil
+}
+
+// openRelRoot opens absPath anchored at its admin-owned volume root (e.g. C:\)
+// via volRoot.OpenRoot(rel) so Go opens every user-owned component with
+// OBJ_DONT_REPARSE and refuses NTFS junctions and escaping symlinks.
+func openRelRoot(absPath string) (*os.Root, error) {
+	clean := filepath.Clean(absPath)
+	vol := filepath.VolumeName(clean)
+	if len(vol) != 2 || vol[1] != ':' ||
+		!((vol[0] >= 'a' && vol[0] <= 'z') || (vol[0] >= 'A' && vol[0] <= 'Z')) {
+		return nil, fmt.Errorf("некорректный локальный путь %q", absPath)
+	}
+	if !noAncestorReparse(clean) {
+		return nil, fmt.Errorf("каталог данных WebView2 является точкой повторного анализа: %s", clean)
+	}
+	volRoot, err := os.OpenRoot(vol + `\`)
+	if err != nil {
+		return nil, err
+	}
+	rel := strings.TrimPrefix(clean, vol)
+	rel = strings.TrimPrefix(rel, `\`)
+	if rel == "" || rel == "." {
+		return volRoot, nil
+	}
+	sub, err := volRoot.OpenRoot(rel)
+	_ = volRoot.Close()
+	if err != nil {
+		return nil, err
+	}
+	return sub, nil
+}
+
+// mkdirAllUnderRoot safely creates rel under base using a volume-anchored
+// os.Root so no ancestor or created component can traverse an NTFS junction or
+// symlink.
+func mkdirAllUnderRoot(base, rel string) error {
+	cur, err := openRelRoot(base)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if cur != nil {
+			_ = cur.Close()
+		}
+	}()
+	cleanRel := filepath.Clean(rel)
+	if cleanRel == "" || cleanRel == "." {
+		return nil
+	}
+	for _, part := range strings.Split(cleanRel, `\`) {
+		if part == "" || part == "." {
+			continue
+		}
+		if part == ".." {
+			return fmt.Errorf("некорректный относительный путь %q", rel)
+		}
+		if err := cur.Mkdir(part, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+			return err
+		}
+		fi, err := cur.Lstat(part)
+		if err != nil {
+			return err
+		}
+		if fi.Mode()&os.ModeSymlink != 0 || !fi.IsDir() {
+			return fmt.Errorf("каталог данных WebView2 является точкой повторного анализа: %s", part)
+		}
+		next, err := cur.OpenRoot(part)
+		if err != nil {
+			return err
+		}
+		_ = cur.Close()
+		cur = next
+	}
+	return nil
 }
 
 // isReparsePoint reports whether path is an NTFS reparse point (junction or
@@ -853,23 +947,235 @@ func isReparsePoint(path string) bool {
 	return attrs&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0
 }
 
-func removeWebViewSubdir(dir string) {
-	if dir == "" {
+// noAncestorReparse reports whether path and every ancestor up to its volume
+// root exist without any NTFS reparse points.
+func noAncestorReparse(path string) bool {
+	clean := filepath.Clean(path)
+	vol := filepath.VolumeName(clean)
+	if len(vol) != 2 || vol[1] != ':' {
+		return false
+	}
+	root := vol + `\`
+	for cur := clean; ; cur = filepath.Dir(cur) {
+		if isReparsePoint(cur) {
+			return false
+		}
+		if strings.EqualFold(cur, root) {
+			return true
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return false
+		}
+	}
+}
+
+// isUnderProgramFiles reports whether dir resides strictly under the system
+// Program Files or Program Files (x86) directory resolved via KnownFolderPath.
+func isUnderProgramFiles(dir string) bool {
+	clean := filepath.Clean(dir)
+	if !filepath.IsAbs(clean) {
+		return false
+	}
+	for _, id := range []*windows.KNOWNFOLDERID{windows.FOLDERID_ProgramFiles, windows.FOLDERID_ProgramFilesX86} {
+		pf, err := windows.KnownFolderPath(id, 0)
+		if err != nil || pf == "" {
+			continue
+		}
+		pf = filepath.Clean(pf)
+		prefix := pf + `\`
+		if len(clean) > len(prefix) && strings.EqualFold(clean[:len(prefix)], prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func webViewArch() string {
+	switch runtime.GOARCH {
+	case "amd64":
+		return "x64"
+	case "arm64":
+		return "arm64"
+	case "386":
+		return "x86"
+	default:
+		return ""
+	}
+}
+
+func validSystemWebView2Dir(dir string) bool {
+	if dir == "" || !isUnderProgramFiles(dir) {
+		return false
+	}
+	arch := webViewArch()
+	if arch == "" {
+		return false
+	}
+	dll := filepath.Join(dir, "EBWebView", arch, "EmbeddedBrowserWebView.dll")
+	if !noAncestorReparse(dll) {
+		return false
+	}
+	st, err := os.Lstat(dll)
+	if err != nil || st.IsDir() || st.Mode()&os.ModeSymlink != 0 {
+		return false
+	}
+	root, err := openRelRoot(dir)
+	if err != nil {
+		return false
+	}
+	_ = root.Close()
+	return true
+}
+
+// webView2ChannelGUIDs lists all four Microsoft Edge WebView2 Runtime/Edge
+// channel GUIDs supported by WebView2Loader.dll.
+var webView2ChannelGUIDs = []string{
+	"{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}", // Evergreen WebView2 Runtime
+	"{2CD8A007-E189-409D-A2C8-9AF4EF3C72AA}", // Beta
+	"{0D50BFEC-CD6A-4F9A-964C-C7416E3ACB10}", // Dev
+	"{65C35B14-6C1D-4122-AC46-7148CC9D6497}", // Canary
+}
+
+// systemWebView2Dir resolves a machine-wide WebView2 Runtime strictly from
+// HKLM under Program Files / Program Files (x86) so an elevated host never
+// falls back to user-writable HKCU registry entries.
+func systemWebView2Dir() (string, error) {
+	views := []uint32{
+		registry.QUERY_VALUE | registry.WOW64_32KEY,
+		registry.QUERY_VALUE | registry.WOW64_64KEY,
+	}
+	for _, guid := range webView2ChannelGUIDs {
+		stateKey := `SOFTWARE\Microsoft\EdgeUpdate\ClientState\` + guid
+		for _, access := range views {
+			k, err := registry.OpenKey(registry.LOCAL_MACHINE, stateKey, access)
+			if err != nil {
+				continue
+			}
+			dir, _, err := k.GetStringValue("EBWebView")
+			_ = k.Close()
+			if err == nil && validSystemWebView2Dir(dir) {
+				return filepath.Clean(dir), nil
+			}
+		}
+		clientKey := `SOFTWARE\Microsoft\EdgeUpdate\Clients\` + guid
+		for _, access := range views {
+			k, err := registry.OpenKey(registry.LOCAL_MACHINE, clientKey, access)
+			if err != nil {
+				continue
+			}
+			loc, _, lerr := k.GetStringValue("location")
+			pv, _, perr := k.GetStringValue("pv")
+			_ = k.Close()
+			if lerr == nil && perr == nil && loc != "" && pv != "" {
+				dir := filepath.Join(loc, pv)
+				if validSystemWebView2Dir(dir) {
+					return filepath.Clean(dir), nil
+				}
+			}
+		}
+	}
+	return "", errors.New(webviewMissing)
+}
+
+// checkHKCUWebViewPolicy refuses launch when user-writable HKCU WebView2
+// policies try to override BrowserExecutableFolder or
+// AdditionalBrowserArguments (which WebView2Loader.dll applies even when
+// BrowserExecutableFolder is passed explicitly).
+func checkHKCUWebViewPolicy() error {
+	exeBase := "ashgate.exe"
+	if exe, err := os.Executable(); err == nil && exe != "" {
+		exeBase = filepath.Base(exe)
+	}
+	return checkWebViewPolicyKey(registry.CURRENT_USER, `Software\Policies\Microsoft\Edge\WebView2`, exeBase)
+}
+
+func checkWebViewPolicyKey(root registry.Key, baseSubkey, exeBase string) error {
+	policies := []string{"BrowserExecutableFolder", "AdditionalBrowserArguments"}
+	views := []uint32{
+		registry.QUERY_VALUE | registry.WOW64_64KEY,
+		registry.QUERY_VALUE | registry.WOW64_32KEY,
+	}
+	for _, access := range views {
+		if k, err := registry.OpenKey(root, baseSubkey, access); err == nil {
+			for _, name := range policies {
+				if val, _, verr := k.GetStringValue(name); verr == nil && strings.TrimSpace(val) != "" {
+					_ = k.Close()
+					return fmt.Errorf("обнаружена пользовательская политика WebView2 (HKCU %s); запуск от администратора запрещён", name)
+				}
+			}
+			_ = k.Close()
+		}
+		for _, pol := range policies {
+			sub, err := registry.OpenKey(root, baseSubkey+`\`+pol, access)
+			if err != nil {
+				continue
+			}
+			names, nerr := sub.ReadValueNames(0)
+			if nerr == nil {
+				for _, vn := range names {
+					if !policyMatchesApp(vn, exeBase) {
+						continue
+					}
+					if val, _, verr := sub.GetStringValue(vn); verr == nil && strings.TrimSpace(val) != "" {
+						_ = sub.Close()
+						return fmt.Errorf("обнаружена пользовательская политика WebView2 (HKCU %s\\%s); запуск от администратора запрещён", pol, vn)
+					}
+				}
+			}
+			_ = sub.Close()
+		}
+	}
+	return nil
+}
+
+func policyMatchesApp(valueName, exeBase string) bool {
+	v := strings.TrimSpace(valueName)
+	return v == "*" || strings.EqualFold(v, "ashgate.exe") || (exeBase != "" && strings.EqualFold(v, exeBase))
+}
+
+func removeWebViewInBase(base string) {
+	if base == "" {
 		return
 	}
-	parent := filepath.Dir(dir)
-	if isReparsePoint(parent) || isReparsePoint(dir) {
+	baseRoot, err := openRelRoot(base)
+	if err != nil {
 		return
 	}
-	if _, err := os.Lstat(dir); err != nil {
+	defer baseRoot.Close()
+	ashRoot, err := baseRoot.OpenRoot("Ashgate")
+	if err != nil {
+		return
+	}
+	removeWebViewChild(ashRoot)
+	_ = ashRoot.Close()
+	_ = baseRoot.Remove("Ashgate") // if now empty
+}
+
+func removeWebViewSubdirInRoot(parentDir string) {
+	if parentDir == "" {
+		return
+	}
+	root, err := openRelRoot(parentDir)
+	if err != nil {
+		return
+	}
+	defer root.Close()
+	removeWebViewChild(root)
+}
+
+func removeWebViewChild(parentRoot *os.Root) {
+	fi, err := parentRoot.Lstat("WebView2")
+	if err != nil || fi.Mode()&os.ModeSymlink != 0 || !fi.IsDir() {
 		return
 	}
 	for i := 0; i < 20; i++ {
-		if isReparsePoint(parent) || isReparsePoint(dir) {
+		fi2, lerr := parentRoot.Lstat("WebView2")
+		if lerr != nil || fi2.Mode()&os.ModeSymlink != 0 || !fi2.IsDir() {
 			return
 		}
-		if err := os.RemoveAll(dir); err == nil {
-			break
+		if err := parentRoot.RemoveAll("WebView2"); err == nil {
+			return
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
@@ -877,20 +1183,17 @@ func removeWebViewSubdir(dir string) {
 
 // RemoveWebViewData deletes the WebView2 profile (ashgate cleanup, run by
 // the uninstaller). Its processes can hold files for a moment after the
-// window closed, so it retries for up to 10 seconds. It refuses reparse points
-// so an NTFS junction cannot redirect elevated deletion.
+// window closed, so it retries for up to 10 seconds. It uses a volume-anchored
+// os.Root so NTFS junctions on user-owned paths cannot redirect elevated
+// deletion.
 func RemoveWebViewData() {
-	if dir, err := webViewDataDir(); err == nil && dir != "" {
-		removeWebViewSubdir(dir)
-		parent := filepath.Dir(dir)
-		if !isReparsePoint(parent) {
-			_ = os.Remove(parent) // %LocalAppData%\Ashgate, if now empty
-		}
+	if base, err := webViewBaseDir(); err == nil && base != "" {
+		removeWebViewInBase(base)
 	}
 	// Clean up any leftover ProgramData\Ashgate\WebView2 created by 0.9.5.
 	if windows.GetCurrentProcessToken().IsElevated() {
 		if dir, err := config.ProtectedDir(); err == nil && dir != "" {
-			removeWebViewSubdir(filepath.Join(dir, "WebView2"))
+			removeWebViewSubdirInRoot(dir)
 		}
 	}
 }
