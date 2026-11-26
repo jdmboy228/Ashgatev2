@@ -1,5 +1,10 @@
 # История изменений
 
+## 0.9.10
+
+- **QR-коды прокси-профилей:** добавлен офлайн-показ QR-кода для VLESS, SOCKS5, HTTP и подписок 3x-ui (с переключателем «Подписка / Активный сервер») для быстрого переноса профилей на Ashgate для Android. Генерация выполняется на Go-бэкенде (`POST /api/proxy/qr` под защитой токена и Origin, без раскрытия секретов в `/api/state` и логах) в виде SVG с коррекцией ошибок M (≤ 400 байт) / L (> 400 байт), синтезом актуальной ссылки при ручном редактировании полей VLESS и предупреждением для VLESS без XHTTP+Reality/TLS или `http://`-подписок.
+- **Исправления по итогам аудита:** в `go-webview2` исправлены передача `&token` → `token` в `AddAcceleratorKeyPressed`/`AddNavigationCompleted` и возврат `E_NOINTERFACE` в `QueryInterface`; в `engine/tcp.go` закрыт `upstream` при `RST`/ошибке записи от приложения; в `vless/inproc.go` добавлена проверка `passed(c.wdl)` в `interruptWriteLocked`; в `process/resolver` исправлены очистка IPv4-записей для dual-stack `[::]:port` и проверка жизни защищённых процессов без `SYNCHRONIZE`; `update.Check` переведён на выделенный `http.Client` с `bootstrap.Dial` и проверкой хоста `github.com`; `ashgate cleanup` удаляет службу через `service.RemoveLegacy()`; в UI `deleteProxy` удаляет по имени и откатывается через `refresh()`, а `appsSubmit` и `proxyDialog`→QR защищены от устаревших индексов и потери черновика.
+
 ## 0.9.9
 
 - **VLESS XHTTP `extra`:** в белом списке `sanitizeExtra` разрешён ключ `mode` (с валидацией по допустимым режимам XHTTP: `auto`, `packet-up`, `stream-up`, `stream-one`, а также пустое значение/`null`), который 3x-ui включает в `?extra={...}`.

@@ -1,5 +1,5 @@
 {
-  "version": "0.9.9",
+  "version": "0.9.10",
   "download_url": "https://github.com/jdmboy228/Ashgatev2/releases/latest",
-  "release_notes": "Разрешён параметр mode внутри ?extra={...} в ссылках VLESS XHTTP (с проверкой допустимых режимов XHTTP: auto, packet-up, stream-up, stream-one) для совместимости с экспортом 3x-ui."
+  "release_notes": "Добавлен офлайн-показ QR-кода для прокси-профилей (VLESS, SOCKS5, HTTP и подписок 3x-ui с переключением «Подписка / Активный сервер») для переноса на Ashgate для Android."
 }

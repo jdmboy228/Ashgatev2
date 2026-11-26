@@ -14,6 +14,8 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"ashgate/internal/bootstrap"
 )
 
 // URL is version.json on the main branch.
@@ -46,7 +48,7 @@ const (
 // client may be nil.
 func Check(ctx context.Context, client *http.Client, src, current string) (Result, error) {
 	if client == nil {
-		client = http.DefaultClient
+		client = defaultClient()
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -88,14 +90,37 @@ func compare(m Manifest, current string) (Result, error) {
 	return res, nil
 }
 
-// safeURL accepts only an https link. The window opens it in the browser
-// from an elevated process; any other scheme could start a local program.
+// safeURL accepts only an https link on github.com. The window opens it in
+// the browser from an elevated process; any other scheme or host is refused.
 func safeURL(raw string) (string, error) {
 	u, err := url.Parse(strings.TrimSpace(raw))
-	if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil {
+	if err != nil || u.Scheme != "https" || !strings.EqualFold(u.Hostname(), "github.com") || u.User != nil {
 		return "", errors.New("в version.json неверная ссылка на загрузку")
 	}
 	return u.String(), nil
+}
+
+func allowedUpdateHost(host string) bool {
+	return strings.EqualFold(host, "raw.githubusercontent.com") || strings.EqualFold(host, "github.com")
+}
+
+func defaultClient() *http.Client {
+	return &http.Client{
+		Transport: &http.Transport{
+			Proxy:             nil,
+			DialContext:       bootstrap.Dial,
+			ForceAttemptHTTP2: true,
+		},
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 5 {
+				return errors.New("слишком много перенаправлений")
+			}
+			if req.URL.Scheme != "https" || !allowedUpdateHost(req.URL.Hostname()) {
+				return errors.New("недопустимое перенаправление")
+			}
+			return nil
+		},
+	}
 }
 
 // Compare orders two versions such as "0.7.3" or "v0.8.0-beta.1": it is

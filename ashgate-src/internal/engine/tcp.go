@@ -299,10 +299,11 @@ func (s *source) Read(p []byte) (int, error) {
 	return n, err
 }
 
-func relay(dst countWriter, src *source) {
+func relay(dst countWriter, src *source) error {
 	bp := relayBufs.Get().(*[]byte)
-	_, _ = io.CopyBuffer(dst, src, *bp)
+	_, err := io.CopyBuffer(dst, src, *bp)
 	relayBufs.Put(bp)
+	return err
 }
 
 // noReplyGrace is how long an upstream that has sent nothing at all may
@@ -326,7 +327,14 @@ func splice(app, upstream net.Conn, up, down counter) error {
 	var grace atomic.Pointer[time.Timer]
 	go func() {
 		defer wg.Done()
-		relay(countWriter{upstream, up}, &source{r: app})
+		appSrc := &source{r: app}
+		werr := relay(countWriter{upstream, up}, appSrc)
+		if (appSrc.err != nil && appSrc.err != io.EOF) || (werr != nil && appSrc.err == nil) {
+			// App aborted (RST/Close) or upstream write failed: abort upstream
+			// immediately instead of letting the downlink read block forever.
+			_ = upstream.Close()
+			return
+		}
 		closeWrite(upstream)
 		// The app is gone or finished sending. If the upstream has not
 		// said a single byte, give it noReplyGrace, then close it fully.
@@ -337,16 +345,17 @@ func splice(app, upstream net.Conn, up, down counter) error {
 		}))
 	}()
 	from := &source{r: upstream}
-	relay(countWriter{app, down}, from)
+	downErr := relay(countWriter{app, down}, from)
 	var (
 		appMu    sync.Mutex
 		appTimer *time.Timer
 		appDone  bool
 	)
-	if from.err != nil && from.err != io.EOF {
-		// Upstream broke or was closed (e.g. failover/reset): abort app side
-		// immediately so wg.Wait() cannot hang and RelayHealth.Dead records promptly.
+	if (from.err != nil && from.err != io.EOF) || (downErr != nil && from.err == nil) {
+		// Upstream broke, was closed (e.g. failover/reset), or app write failed:
+		// abort both sides immediately so wg.Wait() cannot hang.
 		_ = app.Close()
+		_ = upstream.Close()
 	} else {
 		closeWrite(app)
 		// Allow legitimate half-closed uploads, but reap silent CLOSE_WAIT sockets.

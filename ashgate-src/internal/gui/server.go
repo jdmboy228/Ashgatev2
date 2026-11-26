@@ -317,6 +317,17 @@ func (c *controller) api(w http.ResponseWriter, r *http.Request) {
 			}
 			return parsed, nil
 		})
+	case "/api/proxy/qr":
+		c.post(w, r, func() (any, error) {
+			var body struct {
+				Name string `json:"name"`
+				Mode string `json:"mode,omitempty"`
+			}
+			if err := readJSON(r, &body); err != nil {
+				return nil, err
+			}
+			return c.proxyQR(body.Name, body.Mode)
+		})
 	case "/api/probe":
 		c.post(w, r, func() (any, error) {
 			var body struct {

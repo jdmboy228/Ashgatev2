@@ -53,7 +53,7 @@ func TestCheck(t *testing.T) {
 }
 
 func TestRejectsUnsafeLink(t *testing.T) {
-	for _, link := range []string{"", "http://example.com/x", "file:///C:/Windows/System32/calc.exe", "ms-settings:", "https://user:pw@example.com/"} {
+	for _, link := range []string{"", "http://example.com/x", "https://evil.example/x", "file:///C:/Windows/System32/calc.exe", "ms-settings:", "https://user:pw@github.com/"} {
 		if _, err := compare(Manifest{Version: "1.0.0", DownloadURL: link}, "0.1.0"); err == nil {
 			t.Errorf("accepted %q", link)
 		}

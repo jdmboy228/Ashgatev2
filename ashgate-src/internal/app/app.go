@@ -154,6 +154,9 @@ func cmdCleanup(args []string) int {
 	default:
 		code = 1
 	}
+	if _, _, err := service.RemoveLegacy(); err != nil {
+		code = 1
+	}
 	if err := killswitch.New(killswitch.StatePath(path)).Unblock(); err != nil && !errors.Is(err, killswitch.ErrUnsupported) {
 		code = 1
 	}

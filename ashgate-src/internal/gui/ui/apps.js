@@ -897,7 +897,8 @@ function appsSubmit() {
     const v = String(m.value || "").trim().replace(/^"+|"+$/g, "");
     if (!v) { showToast("Укажите имя файла, путь или маску"); return; }
     if (/^svchost\.exe$/i.test(baseName(v))) { showToast("Не указывайте svchost.exe"); return; }
-    const r = cfg().rules[m.index];
+    const r = (cfg().rules || [])[m.index];
+    if (!r) { modal = null; renderModal(); showToast("Правило не найдено"); return; }
     r.process = v;
     modal = null;
     renderModal();
@@ -908,17 +909,18 @@ function appsSubmit() {
     const name = String(m.name || "").trim();
     if (!name) { showToast("Введите название группы"); return; }
     if (apGroup(name)) { showToast("Группа с таким названием уже есть"); return; }
-    if (!m.members.length) return;
-    const rules = cfg().rules;
-    const picked = new Set(m.members);
+    const rules = cfg().rules || [];
+    const members = (m.members || []).filter((j) => j >= 0 && j < rules.length && rules[j]);
+    if (!members.length) { modal = null; renderModal(); showToast("Правила не найдены"); return; }
+    const picked = new Set(members);
     picked.forEach((j) => {
       rules[j].group = name;
       rules[j].action = m.action;
       if (m.proxy) rules[j].proxy = m.proxy; else delete rules[j].proxy;
     });
     // Gather the members where the first of them stood.
-    const first = Math.min(...m.members);
-    const moved = m.members.map((j) => rules[j]);
+    const first = Math.min(...members);
+    const moved = members.map((j) => rules[j]);
     const rest = rules.filter((_, j) => !picked.has(j));
     const at = rest.indexOf(rules.slice(0, first).filter((_, j) => !picked.has(j)).pop());
     rest.splice(at + 1, 0, ...moved);

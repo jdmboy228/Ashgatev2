@@ -338,7 +338,7 @@ func (c *tcpConn) SetWriteDeadline(t time.Time) error {
 // interruptWriteLocked breaks a Write blocked in the pipe; with none in
 // progress it does nothing.
 func (c *tcpConn) interruptWriteLocked() {
-	if c.writing && !c.closed {
+	if c.writing && !c.closed && passed(c.wdl) {
 		c.wlate = true
 		common.Interrupt(c.w)
 	}

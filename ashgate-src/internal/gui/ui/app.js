@@ -414,14 +414,14 @@ function fillProxies() {
     setHTML(host, `<div class="empty-card"><h3>Прокси ещё нет</h3><p>Добавьте SOCKS5, HTTP, ссылку vless:// или подписку 3x-ui.</p><button class="btn pri" type="button" data-act="proxy-add">${icon("plus")}Добавить прокси</button></div>`);
     return;
   }
-  // One card per proxy. The selected card shows edit and delete; the
+  // One card per proxy. The selected card shows QR, edit and delete; the
   // actions column keeps its width so the other columns stay aligned.
   const rows = list.map((p, i) => {
     const view = probeView(p);
     const why = view.detail ? `<div class="why">${esc(view.detail)}</div>` : "";
     const selected = sel.proxy === i;
     const acts = selected
-      ? `<button class="iconbtn" data-act="proxy-edit" data-i="${i}" type="button" aria-label="Изменить" title="Изменить">${icon("edit")}</button><button class="iconbtn danger" data-act="proxy-del" data-i="${i}" type="button" aria-label="Удалить" title="Удалить">${icon("trash")}</button>`
+      ? `<button class="iconbtn row-act" data-act="proxy-qr" data-i="${i}" type="button" aria-label="QR-код" title="QR-код">${icon("qr")}</button><button class="iconbtn row-act" data-act="proxy-edit" data-i="${i}" type="button" aria-label="Изменить" title="Изменить">${icon("edit")}</button><button class="iconbtn danger row-act" data-act="proxy-del" data-i="${i}" type="button" aria-label="Удалить" title="Удалить">${icon("trash")}</button>`
       : "";
     return `<div class="prow${selected ? " sel" : ""}" data-act="sel-proxy" data-i="${i}">
       <span class="ptype k-${esc(p.type || "socks5")}" title="${esc(p.subscription ? "Подписка" : proxyTypeLabel(p.type))}">${icon(p.subscription ? "link" : typeIconName(p.type), 16)}</span>
@@ -670,6 +670,7 @@ function renderModal() {
   const oldBody = again ? root.querySelector(".dialog .body") : null;
   const scroll = oldBody ? oldBody.scrollTop : 0;
   if (modal.kind === "proxy") root.innerHTML = proxyDialog();
+  else if (modal.kind === "qr") root.innerHTML = qrDialog();
   else if (AP_MODALS[modal.kind]) root.innerHTML = AP_MODALS[modal.kind]();
   else if (modal.kind === "confirm" || modal.kind === "alert") root.innerHTML = confirmDialog();
   const dlgEl = root.querySelector("#dlg");
@@ -703,6 +704,200 @@ function confirmDialog() {
     <div class="body"><p class="confirm-text selectable">${esc(modal.text || "")}</p></div>
     <div class="footer">${buttons}</div></form></div>`;
 }
+function qrDialog() {
+  const m = modal;
+  const modeLabels = { subscription: "Подписка", active: "Активный сервер" };
+  const seg = m.modes && m.modes.length > 1
+    ? `<div class="seg qr-seg">${m.modes.map((v) => `<button type="button" data-act="qr-mode" data-value="${esc(v)}" class="${m.mode === v ? "on" : ""}">${esc(modeLabels[v] || v)}</button>`).join("")}</div>`
+    : "";
+  const safeImg = /^data:image\//i.test(m.image || "") ? m.image : "";
+  let stage = "";
+  if (m.loading) {
+    stage = `<div class="qr-card qr-loading"><div class="qr-placeholder"><span>Загрузка…</span></div></div>`;
+  } else if (m.error) {
+    stage = `<div class="qr-err">${icon("alert", 16)}<span>${esc(m.error)}</span></div>`;
+  } else if (safeImg) {
+    stage = `<div class="qr-card"><img class="qr-img" src="${esc(safeImg)}" alt="QR-код профиля" draggable="false"></div>`;
+  }
+  const warn = !m.loading && !m.error && m.warning
+    ? `<div class="qr-warn">${icon("alert", 16)}<span>${esc(m.warning)}</span></div>`
+    : "";
+  const note = !m.error
+    ? `<div class="qr-note">${icon("shield", 14)}<span>QR-код содержит ключи или пароль профиля</span></div>`
+    : "";
+  return `<div class="scrim"><form class="dialog narrow qr-dlg" id="dlg">
+    <h2>${esc(m.name || "")}</h2>
+    <div class="dsub">${esc(m.subtitle || "")}</div>
+    <div class="body">
+      ${seg}
+      <div class="qr-stage">${stage}</div>
+      ${warn}
+      ${note}
+    </div>
+    <div class="footer"><button class="btn pri" type="submit" autofocus>Закрыть</button></div>
+  </form></div>`;
+}
+function qrBaseSubtitle(name) {
+  const p = (cfg().proxies || []).find((x) => x.name === name);
+  if (!p) return "";
+  return p.subscription ? "Подписка" : proxyTypeLabel(p.type);
+}
+function openProxyQR(name, returnModal) {
+  if (!name) return;
+  const base = qrBaseSubtitle(name);
+  const m = {
+    kind: "qr",
+    proxyName: name,
+    name,
+    subtitle: base ? base + " · Загрузка…" : "Загрузка…",
+    image: "",
+    warning: "",
+    mode: "",
+    modes: [],
+    loading: true,
+    error: "",
+    reqId: 0,
+    returnModal: returnModal || null,
+  };
+  modal = m;
+  loadProxyQR(m, "");
+}
+function loadProxyQR(m, mode) {
+  const id = ++m.reqId;
+  m.loading = true;
+  m.error = "";
+  if (mode) m.mode = mode;
+  if (DEMO) {
+    const res = demoProxyQR(m.proxyName, mode);
+    if (modal !== m || m.reqId !== id) return;
+    m.loading = false;
+    if (res.error) {
+      m.subtitle = qrBaseSubtitle(m.proxyName);
+      m.error = res.error;
+      m.image = "";
+      m.warning = "";
+    } else {
+      m.name = res.name || m.proxyName;
+      m.subtitle = res.subtitle || "";
+      m.image = res.image || "";
+      m.warning = res.warning || "";
+      m.mode = res.mode || "";
+      m.modes = Array.isArray(res.modes) ? res.modes : [];
+    }
+    renderModal();
+    return;
+  }
+  renderModal();
+  const body = mode ? { name: m.proxyName, mode } : { name: m.proxyName };
+  post("/api/proxy/qr", body).then((res) => {
+    if (modal !== m || m.reqId !== id) return;
+    m.loading = false;
+    m.error = "";
+    m.name = (res && res.name) || m.proxyName;
+    m.subtitle = (res && res.subtitle) || "";
+    m.image = (res && res.image) || "";
+    m.warning = (res && res.warning) || "";
+    m.mode = (res && res.mode) || "";
+    m.modes = res && Array.isArray(res.modes) ? res.modes : [];
+    renderModal();
+  }).catch((err) => {
+    if (modal !== m || m.reqId !== id) return;
+    m.loading = false;
+    m.subtitle = qrBaseSubtitle(m.proxyName);
+    m.image = "";
+    m.warning = "";
+    m.error = (err && err.message) || "Не удалось создать QR-код";
+    renderModal();
+  });
+}
+function demoQRHost(addr) {
+  const s = String(addr || "").trim();
+  if (s.startsWith("[")) {
+    const end = s.indexOf("]");
+    return end > 1 ? s.slice(1, end) : s;
+  }
+  return s.replace(/:\d+$/, "");
+}
+// demoQRImage builds a deterministic QR-like SVG placeholder for DEMO mode.
+function demoQRImage(seed) {
+  const n = 21;
+  const pad = 2;
+  const cells = Array.from({ length: n }, () => new Uint8Array(n));
+  const finder = (ox, oy) => {
+    for (let y = 0; y < 7; y++) {
+      for (let x = 0; x < 7; x++) {
+        const edge = x === 0 || x === 6 || y === 0 || y === 6;
+        const inner = x >= 2 && x <= 4 && y >= 2 && y <= 4;
+        cells[oy + y][ox + x] = edge || inner ? 1 : 0;
+      }
+    }
+  };
+  finder(0, 0);
+  finder(n - 7, 0);
+  finder(0, n - 7);
+  for (let i = 8; i < n - 8; i++) {
+    cells[6][i] = i % 2 === 0 ? 1 : 0;
+    cells[i][6] = i % 2 === 0 ? 1 : 0;
+  }
+  let h = 2166136261;
+  for (const ch of String(seed || "ashgate")) {
+    h ^= ch.charCodeAt(0);
+    h = Math.imul(h, 16777619) >>> 0;
+  }
+  for (let y = 0; y < n; y++) {
+    for (let x = 0; x < n; x++) {
+      const inFinder = (x < 8 && y < 8) || (x >= n - 8 && y < 8) || (x < 8 && y >= n - 8);
+      if (inFinder || x === 6 || y === 6) continue;
+      h = (Math.imul(h, 1664525) + 1013904223) >>> 0;
+      cells[y][x] = (h >>> 31) & 1;
+    }
+  }
+  let d = "";
+  for (let y = 0; y < n; y++) {
+    for (let x = 0; x < n; x++) {
+      if (cells[y][x]) d += `M${x + pad} ${y + pad}h1v1h-1z`;
+    }
+  }
+  const size = n + pad * 2;
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${size} ${size}" shape-rendering="crispEdges"><rect width="${size}" height="${size}" fill="#fff"/><path fill="#000" d="${d}"/></svg>`;
+  return "data:image/svg+xml;base64," + btoa(svg);
+}
+function demoProxyQR(name, mode) {
+  const p = (cfg().proxies || []).find((x) => x.name === name);
+  if (!p) return { error: "прокси не найден" };
+  const host = demoQRHost(p.address);
+  if (p.subscription) {
+    const activeMode = mode || "subscription";
+    const subInfo = (state && state.subs && state.subs[p.name]) || {};
+    const hasActive = !!subInfo.active;
+    const modes = hasActive ? ["subscription", "active"] : ["subscription"];
+    const subHost = p.subscription.host || host || "example.com";
+    return {
+      name: p.name,
+      subtitle: activeMode === "active" ? "VLESS · " + subHost : "Подписка · " + subHost,
+      image: demoQRImage(p.name + ":" + activeMode),
+      warning: "",
+      mode: activeMode,
+      modes,
+    };
+  }
+  if (p.type === "vless") {
+    const v = p.vless || {};
+    const ok = v.network === "xhttp" && (v.security === "reality" || v.security === "tls");
+    return {
+      name: p.name,
+      subtitle: "VLESS · " + host,
+      image: demoQRImage(p.name),
+      warning: ok ? "" : "Ashgate для Android поддерживает только VLESS XHTTP с Reality или TLS. Этот QR подойдёт для других клиентов.",
+    };
+  }
+  return {
+    name: p.name,
+    subtitle: proxyTypeLabel(p.type) + " · " + (p.address || host),
+    image: demoQRImage(p.name),
+    warning: "",
+  };
+}
 
 function proxyTypeLabel(t) {
   if (t === "http") return "HTTP";
@@ -721,10 +916,13 @@ function proxyDialog() {
       : [["socks5", "SOCKS5"], ["http", "HTTP"], ["vless", "VLESS"]];
   const vless = type === "vless";
   const sub = type === "sub";
+  const qrBtn = modal.index >= 0
+    ? `<button class="btn sm" type="button" data-act="proxy-dlg-qr">${icon("qr", 14)}QR-код</button>`
+    : "";
   // autocomplete="off": WebView2 must not keep typed links, UUIDs, keys,
   // logins or subscription URLs in its form history on disk.
   return `<div class="scrim"><form class="dialog${vless ? "" : " narrow"}" id="dlg" autocomplete="off">
-    <h2>Прокси</h2><div class="dsub">${modal.index < 0 ? "Новый прокси" : "Изменение · " + esc(p.name || "")}</div>
+    <div class="dlg-head"><div><h2>Прокси</h2><div class="dsub">${modal.index < 0 ? "Новый прокси" : "Изменение · " + esc(p.name || "")}</div></div>${qrBtn}</div>
     <div class="body">
       <label class="lbl">Имя</label><div class="field${modal.nameError ? " bad" : ""}"><input id="p-name" value="${esc(p.name || "")}" placeholder="Задаётся само, если оставить пустым" autofocus></div>
       ${modal.nameError ? `<div class="field-err">${esc(modal.nameError)}</div>` : ""}
@@ -1603,16 +1801,35 @@ function onClick(e) {
   }
   if (id === "proxy-add") return openProxy(-1);
   if (id === "sub-refresh") return refreshSub(act.dataset.name || "");
+  if (id === "proxy-qr") {
+    const p = (cfg().proxies || [])[i];
+    if (p) openProxyQR(p.name);
+    return;
+  }
+  if (id === "proxy-dlg-qr") {
+    if (modal && modal.kind === "proxy" && modal.index >= 0) {
+      readProxyDraft();
+      const p = (cfg().proxies || [])[modal.index];
+      if (p) openProxyQR(p.name, modal);
+    }
+    return;
+  }
+  if (id === "qr-mode") {
+    const mode = act.dataset.value || "";
+    if (modal && modal.kind === "qr" && mode && mode !== modal.mode) loadProxyQR(modal, mode);
+    return;
+  }
   if (id === "proxy-edit") return openProxy(i);
   if (id === "proxy-del") return deleteProxy(i);
   if (id === "menu-proxy") {
     const name = cfg().proxies[i].name;
     const items = [
       { id: "edit", label: "Изменить", run: () => openProxy(i) },
+      { id: "qr", label: "QR-код", run: () => openProxyQR(name) },
       { id: "probe", label: "Проверить", run: () => probeNamed(name) },
       { id: "del", label: "Удалить", danger: true, run: () => deleteProxy(i) },
     ];
-    if (cfg().proxies[i].subscription) items.splice(1, 0, { id: "sub-refresh", label: "Обновить подписку", run: () => refreshSub(name) });
+    if (cfg().proxies[i].subscription) items.splice(2, 0, { id: "sub-refresh", label: "Обновить подписку", run: () => refreshSub(name) });
     openMenu(act, items, e.detail === 0);
     return;
   }
@@ -1851,15 +2068,20 @@ function realityFail(draft, rep) {
   return "Проверка REALITY не прошла" + (rep.detail ? ". " + rep.detail : "");
 }
 function deleteProxy(i) {
-  const name = cfg().proxies[i].name;
+  const p = (cfg().proxies || [])[i];
+  if (!p) return;
+  const name = p.name;
   if (proxyInUse(name)) {
     showAlert("Прокси используется", "«" + name + "» указан в приложении, группе или системном резолвере. Сначала смените их, потом удаляйте прокси.");
     return;
   }
   askConfirm("Удалить прокси?", "«" + name + "» исчезнет из списка. Это нельзя отменить.", "Удалить", true, () => {
-    cfg().proxies.splice(i, 1);
-    if (sel.proxy >= cfg().proxies.length) sel.proxy = cfg().proxies.length - 1;
-    saveConfig().catch((err) => showToast(err.message));
+    const list = cfg().proxies || [];
+    const idx = list.findIndex((x) => x.name === name);
+    if (idx < 0) return;
+    list.splice(idx, 1);
+    if (sel.proxy >= list.length) sel.proxy = list.length - 1;
+    saveConfig().catch((err) => { showToast(err.message); refresh(); });
   });
 }
 function onSubmit(e) {
@@ -1873,8 +2095,8 @@ function onSubmit(e) {
     modal = null;
     renderModal();
     if (run) run();
-  } else if (modal && modal.kind === "alert") {
-    modal = null;
+  } else if (modal && (modal.kind === "alert" || modal.kind === "qr")) {
+    modal = (modal.kind === "qr" && modal.returnModal) ? modal.returnModal : null;
     renderModal();
   }
 }
@@ -1947,7 +2169,7 @@ function bootChrome() {
       const menu = document.getElementById("menu");
       if (menu && !menu.hidden) { closeMenu(); return; }
       if (apOpen) { apOpen = ""; if (page === "rules") fillApps(); return; }
-      if (modal) { modal = null; renderModal(); }
+      if (modal) { modal = (modal.kind === "qr" && modal.returnModal) ? modal.returnModal : null; renderModal(); }
     }
   });
   document.addEventListener("click", (e) => {
@@ -1972,7 +2194,7 @@ function applyRoute() {
       state.active = 0;
     }
   } else if (h === "start-error") page = "rules";
-  else if (h === "proxy-dialog" || h === "vless-dialog") { page = "proxies"; }
+  else if (h === "proxy-dialog" || h === "vless-dialog" || h === "qr-dialog") { page = "proxies"; }
   else if (h === "rule-dialog") { page = "rules"; }
   else if (["proxies", "rules", "log", "settings"].includes(h)) page = h;
   built = "";
@@ -1986,12 +2208,20 @@ async function main() {
     render();
     if (location.hash === "#proxy-dialog") openProxy(0);
     if (location.hash === "#vless-dialog") openProxy(cfg().proxies.findIndex((p) => p.type === "vless"));
+    if (location.hash === "#qr-dialog") {
+      const p = cfg().proxies.find((x) => x.type === "vless") || cfg().proxies[0];
+      if (p) openProxyQR(p.name);
+    }
     if (location.hash === "#rule-dialog") apOpenAdd();
     if (location.hash === "#start-error") showStartError("доступ запрещён; запустите Ashgate от имени администратора (код 5)");
     window.addEventListener("hashchange", () => {
       modal = null; applyRoute(); render();
       if (location.hash === "#proxy-dialog") openProxy(0);
       if (location.hash === "#vless-dialog") openProxy(cfg().proxies.findIndex((p) => p.type === "vless"));
+      if (location.hash === "#qr-dialog") {
+        const p = cfg().proxies.find((x) => x.type === "vless") || cfg().proxies[0];
+        if (p) openProxyQR(p.name);
+      }
       if (location.hash === "#rule-dialog") apOpenAdd();
     });
     return;

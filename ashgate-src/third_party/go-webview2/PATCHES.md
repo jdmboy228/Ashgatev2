@@ -29,3 +29,7 @@ Changes:
   `PutAreDefaultContextMenusEnabled`.
 - `webview.go`: return `nil` (after `w.Destroy()`) instead of calling `log.Fatal` if applying
   WebView2 settings fails in `NewWithOptions`.
+- `pkg/edge/ICoreWebView2Controller.go`, `pkg/edge/corewebview2.go`, `pkg/edge/chromium.go`:
+  pass `token` (not `&token`) and check `int32(hr) < 0` in `AddAcceleratorKeyPressed` and
+  `AddNavigationCompleted` (avoiding stack pointer overwrite), and zero `*ppvObject` + return
+  `E_NOINTERFACE` (`0x80004002`) in `Chromium.QueryInterface`.

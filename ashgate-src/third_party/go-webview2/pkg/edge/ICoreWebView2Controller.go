@@ -70,14 +70,13 @@ func (i *ICoreWebView2Controller) PutBounds(bounds w32.Rect) error {
 }
 
 func (i *ICoreWebView2Controller) AddAcceleratorKeyPressed(eventHandler *ICoreWebView2AcceleratorKeyPressedEventHandler, token *_EventRegistrationToken) error {
-	var err error
-	_, _, err = i.vtbl.AddAcceleratorKeyPressed.Call(
+	r, _, _ := i.vtbl.AddAcceleratorKeyPressed.Call(
 		uintptr(unsafe.Pointer(i)),
 		uintptr(unsafe.Pointer(eventHandler)),
-		uintptr(unsafe.Pointer(&token)),
+		uintptr(unsafe.Pointer(token)),
 	)
-	if err != windows.ERROR_SUCCESS {
-		return err
+	if int32(r) < 0 {
+		return windows.Errno(r)
 	}
 	return nil
 }

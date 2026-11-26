@@ -3,6 +3,7 @@
 package process
 
 import (
+	"errors"
 	"sync"
 	"syscall"
 	"unsafe"
@@ -75,23 +76,50 @@ func (t *handleTable) query(pid uint32) rules.Process {
 	return p
 }
 
-// exited reports whether the process cached for pid is gone. Without a
-// held handle (or if the held handle belongs to a newer process with a
-// different creation time) it reports true and the name is re-read.
+// exited reports whether the process cached for pid is gone. For protected
+// processes where SYNCHRONIZE was denied (no held handle), it falls back to a
+// PROCESS_QUERY_LIMITED_INFORMATION liveness check so live sockets are not
+// wiped on prune.
 func (t *handleTable) exited(pid uint32, started int64) bool {
 	t.mu.Lock()
-	defer t.mu.Unlock()
 	hp, ok := t.m[pid]
-	if !ok || (started != 0 && hp.started != started) {
+	if ok {
+		if started != 0 && hp.started != started {
+			t.mu.Unlock()
+			return true
+		}
+		ev, err := windows.WaitForSingleObject(hp.h, 0)
+		if err == nil && ev == uint32(windows.WAIT_TIMEOUT) {
+			t.mu.Unlock()
+			return false
+		}
+		windows.CloseHandle(hp.h)
+		delete(t.m, pid)
+		t.mu.Unlock()
 		return true
 	}
-	ev, err := windows.WaitForSingleObject(hp.h, 0)
-	if err == nil && ev == uint32(windows.WAIT_TIMEOUT) {
-		return false
+	t.mu.Unlock()
+
+	h, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+	if err != nil {
+		// ACCESS_DENIED means the PID is still alive (protected process).
+		return !errors.Is(err, windows.ERROR_ACCESS_DENIED)
 	}
-	windows.CloseHandle(hp.h)
-	delete(t.m, pid)
-	return true
+	defer windows.CloseHandle(h)
+	const stillActive = 259
+	var code uint32
+	if err := windows.GetExitCodeProcess(h, &code); err == nil && code != stillActive {
+		return true
+	}
+	if started != 0 {
+		var create, exit, kernel, user windows.Filetime
+		if err := windows.GetProcessTimes(h, &create, &exit, &kernel, &user); err == nil {
+			if ct := create.Nanoseconds(); ct != 0 && ct != started {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (t *handleTable) closeAll() {

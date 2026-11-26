@@ -344,7 +344,7 @@ table.table { min-width: 560px; }
 #proxy-table { margin-top: 20px; }
 .plist { display: flex; flex-direction: column; gap: 4px; }
 .prow {
-  display: grid; grid-template-columns: 32px minmax(0, 1fr) minmax(0, 240px) 128px 104px; gap: 16px; align-items: center;
+  display: grid; grid-template-columns: 32px minmax(0, 1fr) minmax(0, 240px) 128px 132px; gap: 16px; align-items: center;
   min-height: 64px; padding: 8px 8px 8px 16px; border-radius: 14px; background: var(--card); border: 1px solid var(--stroke); cursor: default;
 }
 .prow:hover { background: var(--card-h); }
@@ -370,14 +370,18 @@ table.table { min-width: 560px; }
 .prow .stack .sub.warn { color: var(--warn); }
 .prow .only-narrow { display: none; }
 @container page (max-width: 759.98px) {
-  .prow { grid-template-columns: 32px minmax(0, 1fr) 128px 72px; }
+  .prow { grid-template-columns: 32px minmax(0, 1fr) 128px 132px; }
   .paddr { display: none; }
   /* The subscription's active server or update error, under its name. */
   .prow .only-narrow { display: block; }
 }
 @container page (max-width: 519.98px) {
-  .prow { grid-template-columns: 32px minmax(0, 1fr) 72px; }
+  .prow { grid-template-columns: 32px minmax(0, 1fr) 132px; }
   .checkcell { display: none; }
+}
+@container page (max-width: 419.98px) {
+  .prow { grid-template-columns: 32px minmax(0, 1fr) 36px; }
+  .prow .row-actions .row-act { display: none; }
 }
 .empty-card { padding: 36px 20px; text-align: center; background: var(--card); border: 1px solid var(--stroke); border-radius: 14px; }
 .empty-card h3 { margin: 0 0 4px; font-size: 20px; line-height: 28px; font-weight: 600; }
@@ -618,6 +622,11 @@ table.table { min-width: 560px; }
 .dialog.narrow { width: min(448px, 100%); }
 .dialog h2 { margin: 24px 24px 0; font-size: 20px; line-height: 28px; font-weight: 600; flex: none; }
 .dialog .dsub { margin: 2px 24px 0; color: var(--tx2); flex: none; }
+.dlg-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin: 24px 24px 0; flex: none; }
+.dlg-head > div { min-width: 0; flex: 1; }
+.dlg-head h2 { margin: 0; }
+.dlg-head .dsub { margin: 2px 0 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dlg-head > .btn { flex: none; }
 .dialog .body { display: flex; flex-direction: column; align-items: stretch; flex: 1 1 auto; min-width: 0; min-height: 0; overflow: auto; padding: 16px 24px 24px; overscroll-behavior: contain; }
 .dialog .body > * { flex-shrink: 0; }
 .dialog .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; min-width: 0; }
@@ -641,6 +650,44 @@ table.table { min-width: 560px; }
 .proc-line { display: flex; gap: 8px; align-items: center; min-width: 0; }
 .proc-line .field { flex: 1 1 auto; min-width: 0; }
 .proc-line .btn { flex: none; }
+/* QR dialog */
+.qr-dlg h2, .qr-dlg .dsub { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dialog.qr-dlg .body { align-items: center; gap: 14px; }
+.qr-seg { width: 100%; }
+.qr-stage { display: flex; justify-content: center; width: 100%; }
+.qr-card {
+  max-width: 100%; background: #ffffff; border-radius: 14px; padding: 16px;
+  border: 1px solid rgba(0, 0, 0, 0.1);
+  display: flex; align-items: center; justify-content: center;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.22);
+}
+.qr-img, .qr-placeholder {
+  width: 240px; height: 240px; max-width: 100%; aspect-ratio: 1 / 1;
+}
+.qr-img { display: block; image-rendering: pixelated; }
+.qr-placeholder {
+  display: grid; place-items: center; color: #555555; font-size: 13px;
+  border-radius: 8px; background: #f3f3f3;
+}
+.qr-warn {
+  width: 100%; display: flex; align-items: flex-start; gap: 10px;
+  padding: 10px 12px; border-radius: 8px;
+  background: var(--warn-bg); color: var(--tx); border: 1px solid var(--stroke);
+  font-size: 12px; line-height: 17px; user-select: text; overflow-wrap: anywhere;
+}
+.qr-warn > svg { flex: none; color: var(--warn); margin-top: 1px; }
+.qr-err {
+  width: 100%; display: flex; align-items: flex-start; gap: 10px;
+  padding: 12px 14px; border-radius: 10px;
+  background: var(--err-bg); color: var(--err); border: 1px solid var(--stroke);
+  font-size: 13px; line-height: 18px; user-select: text; overflow-wrap: anywhere;
+}
+.qr-err > svg { flex: none; margin-top: 1px; }
+.qr-note {
+  display: flex; align-items: center; justify-content: center; gap: 6px;
+  color: var(--tx3); font-size: 12px; line-height: 16px; text-align: center;
+}
+.qr-note > svg { flex: none; }
 @container dlg (max-width: 479.98px) {
   .dialog .grid, .vless-grid { grid-template-columns: 1fr; }
   .vless-grid .span2 { grid-column: auto; }
@@ -713,10 +760,16 @@ table.table { min-width: 560px; }
   .dialog { max-height: calc(100vh - 16px); max-height: calc(100dvh - 16px); }
   .dialog h2 { margin: 16px 20px 0; font-size: 18px; }
   .dialog .dsub { margin: 2px 20px 0; }
+  .dlg-head { margin: 16px 20px 0; }
+  .dlg-head h2 { margin: 0; }
+  .dlg-head .dsub { margin: 2px 0 0; }
   .ap-dlg-h { margin: 16px 20px 0; }
   .dialog .body { padding: 12px 20px 16px; }
   .dialog .footer { padding: 16px 20px; }
   .field textarea { min-height: 56px; }
+  .dialog.qr-dlg .body { gap: 10px; }
+  .qr-card { padding: 12px; }
+  .qr-img, .qr-placeholder { width: 184px; height: 184px; }
 }
 @media (prefers-reduced-motion: reduce) {
   .ap-pop, .dialog { animation: none; }

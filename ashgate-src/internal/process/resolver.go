@@ -164,10 +164,20 @@ func (r *Resolver) observe(proto uint8, local packet.Addr, pid uint32, closing, 
 			}
 			// Retire exact entries created by LayerFlow ESTABLISHED for this closing
 			// wildcard socket so they cannot stay open forever and shadow reuse.
+			// A dual-stack [::]:port socket also carries IPv4 flows.
 			for ek := range r.exactPorts[wk] {
 				cur := r.exact[ek]
 				if cur.proc.PID == pid || !alive(cur, now) {
 					r.delExactLocked(ek)
+				}
+			}
+			if local.Len == 16 {
+				wk4 := wildKey{proto, 4, local.Port}
+				for ek := range r.exactPorts[wk4] {
+					cur := r.exact[ek]
+					if cur.proc.PID == pid || !alive(cur, now) {
+						r.delExactLocked(ek)
+					}
 				}
 			}
 		} else {
@@ -175,6 +185,14 @@ func (r *Resolver) observe(proto uint8, local packet.Addr, pid uint32, closing, 
 			// on that port and family (e.g. from a previous owner whose CLOSE was missed or late).
 			for ek := range r.exactPorts[wk] {
 				r.delExactLocked(ek)
+			}
+			if local.Len == 16 {
+				wk4 := wildKey{proto, 4, local.Port}
+				if w4, ok := r.wild[wk4]; !ok || !w4.until.IsZero() {
+					for ek := range r.exactPorts[wk4] {
+						r.delExactLocked(ek)
+					}
+				}
 			}
 			r.wild[wk] = e
 		}

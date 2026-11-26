@@ -175,8 +175,11 @@ func (e *Chromium) Hide() error {
 	return e.controller.PutIsVisible(false)
 }
 
-func (e *Chromium) QueryInterface(_, _ uintptr) uintptr {
-	return 0
+func (e *Chromium) QueryInterface(_, object uintptr) uintptr {
+	if object != 0 {
+		*(*uintptr)(unsafe.Pointer(object)) = 0
+	}
+	return 0x80004002 // E_NOINTERFACE
 }
 
 func (e *Chromium) AddRef() uintptr {
