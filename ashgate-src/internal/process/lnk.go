@@ -93,7 +93,7 @@ func ParseLNK(b []byte) (string, error) {
 			if t := expandEnv(wstr(b[off:off+size], 8+260)); t != "" {
 				return t, nil
 			}
-			if t := expandEnv(cstr(b[off:off+size], 8)); t != "" && isASCII(t) {
+			if t := expandEnv(cstr(b[off:off+8+260], 8)); t != "" && isASCII(t) {
 				return t, nil
 			}
 		}
@@ -171,9 +171,10 @@ func expandEnv(s string) string {
 		out.WriteString(s[:i])
 		if v, ok := os.LookupEnv(name); ok && name != "" {
 			out.WriteString(v)
+			s = s[i+2+j:]
 		} else {
-			out.WriteString(s[i : i+2+j])
+			out.WriteByte('%')
+			s = s[i+1:]
 		}
-		s = s[i+2+j:]
 	}
 }

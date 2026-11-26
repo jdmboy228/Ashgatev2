@@ -1,5 +1,14 @@
 # История изменений
 
+## 0.9.8
+
+Исправление всех оставшихся Medium и Low замечаний аудита:
+
+- **Сетевое ядро и WinDivert:** таблицы TCP NAT переведены на ключ `(Src, Dst)`, добавлены IPv6 DoH AdGuard/Яндекс и DoQ (UDP/853), `ForgetUDPPort` переводит закрытые потоки в `draining`, `DialUDP` ограничен таймаутом 10 с, добавлена поддержка IPv4 LSO (`total == 0`) и проверка `udpLen`, исправлен `uint8`-overflow в `ipv6Proto` и `runtime.KeepAlive` во всех обёртках WinDivert, при остановке сначала вызывается `ShutdownRecv`, сняты блокировки на горячем пути (`prune`, `reset`, zero-alloc `endpointAt`, пул буферов `netBatch`), в `Resolver` добавлены IP-версия в `wildKey`, проверка времени старта PID при переиспользовании, `r.release()` при превышении `maxImages` и прямой разбор кода возврата `readTable`, в `rules` исправлены UTF-8 `?`, наследование системных процессов и голый `svchost`.
+- **Прокси, failover и подписки:** в `bootstrap` сериализована запись `dnscache.json`, IPv4 приоритетнее IPv6 и возвращается копия среза; в `httpproxy` проверяется `\r\n\r\n`; в `socks5` отклоняется `bnd.Port == 0`, отменяется `Assoc.Recv` и валидируется `EncodeUDP`; в `vless/inproc` синхронизирован таймер записи и учтён сброс рукопожатия в `gatedConn`; в `gui/subs` отключены висящие keep-alive транспорты, проброшен контекст `shutdown()`, `hasRoute` использует разрешённый IP/fallback и оптимизирован `ruleBytes`; исправлены `vless/explain`, `rulestats`, порт `:0` в `ParseLink` и UTF-8 BOM в подписках.
+- **Безопасность, Windows-слой и `go-webview2`:** `ownerReadACE()` больше не наследует чтение на `config.json` и `subscription.sealed` (оставляя доступ только к листингу папки и `ashgate.log*`); `atomicfile.Write` использует `os.CreateTemp`, `f.Sync()` и retry переименования; валидируется `Log.File` (и защищён от смены через `/api/config`) и `DNS.Servers` в режиме `original`; `autostart` декодирует CP866 и проверяет `Enabled()`; `killswitch` нормализует слеши и не теряет правила при ошибке `netsh`; `ksLoop` корректно завершается по `c.done`, `hostQuit` работает при открытом модальном диалоге `Browse`, системные пути резолвятся через Win32 API; в `go-webview2` исправлены проверки COM `HRESULT` (`int32(hr) < 0`) и убраны падения `log.Fatal`.
+- **Интерфейс WebView2 и инфраструктура:** инкрементальное обновление строк таблицы журнала без перестройки `<table>`, кэш иконок в памяти через `fetch` + `X-Ashgate-Token` (без `?t=` в URL), проверки границ в `apps.js`, исправления `commitProxy`, запрет смены типа существующего прокси на подписку, исправлен `inactiveCount`, inline-ошибки, a11y/`Escape`, чистка мёртвого CSS/JS и единый `plural()`; усилены `update.bat`, `package.ps1`, проверка версий в `windows-e2e.yml`, `e2e/harness/app.go`, `e2e/report/report.py` и `testkit/socks.go`.
+
 ## 0.9.7
 
 Усиление безопасности и устранение утечек (повторный аудит):

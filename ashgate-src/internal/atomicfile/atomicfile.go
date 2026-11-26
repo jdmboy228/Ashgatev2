@@ -2,29 +2,36 @@
 package atomicfile
 
 import (
-	"errors"
 	"os"
+	"path/filepath"
+	"runtime"
+	"time"
 )
 
-// Write replaces path with data, mode 0600, through path+".tmp". A
-// leftover or planted temp file would keep its own owner and access list
-// through the rename, so it is removed first and the new one must not
-// exist when it is created.
+// Write replaces path with data, mode 0600, through a unique temporary file
+// in the same directory so concurrent writers cannot collide on a fixed temp
+// name and a leftover file cannot survive the rename.
 func Write(path string, data []byte) error {
-	tmp := path + ".tmp"
-	if err := os.Remove(tmp); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	dir, base := filepath.Dir(path), filepath.Base(path)
+	f, err := os.CreateTemp(dir, base+".*.tmp")
 	if err != nil {
 		return err
 	}
-	_, err = f.Write(data)
+	tmp := f.Name()
+	if _, err = f.Write(data); err == nil {
+		err = f.Sync()
+	}
 	if cerr := f.Close(); err == nil {
 		err = cerr
 	}
 	if err == nil {
-		err = os.Rename(tmp, path)
+		for i := 0; i < 5; i++ {
+			err = os.Rename(tmp, path)
+			if err == nil || runtime.GOOS != "windows" {
+				break
+			}
+			time.Sleep(time.Duration(i+1) * 10 * time.Millisecond)
+		}
 	}
 	if err != nil {
 		_ = os.Remove(tmp)

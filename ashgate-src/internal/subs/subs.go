@@ -74,14 +74,14 @@ func Parse(body []byte) (entries []Entry, skipped int) {
 }
 
 func decode(body []byte) string {
-	text := strings.TrimSpace(string(body))
+	text := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(string(body)), "\ufeff"))
 	if strings.Contains(text, "://") {
 		return text
 	}
 	compact := strings.Join(strings.Fields(text), "")
 	for _, enc := range []*base64.Encoding{base64.StdEncoding, base64.RawStdEncoding, base64.URLEncoding, base64.RawURLEncoding} {
 		if raw, err := enc.DecodeString(compact); err == nil && bytes.Contains(raw, []byte("://")) {
-			return string(raw)
+			return strings.TrimPrefix(string(raw), "\ufeff")
 		}
 	}
 	return text

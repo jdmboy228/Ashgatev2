@@ -101,6 +101,8 @@ func (h Handle) Recv(buf []byte, addr *Address) (int, error) {
 		pbuf = uintptr(unsafe.Pointer(&buf[0]))
 	}
 	r, _, err := procRecv.Call(uintptr(h), pbuf, uintptr(len(buf)), uintptr(unsafe.Pointer(&n)), uintptr(unsafe.Pointer(addr)))
+	runtime.KeepAlive(buf)
+	runtime.KeepAlive(addr)
 	if r == 0 {
 		if err == nil || err == windows.ERROR_SUCCESS {
 			err = windows.ERROR_INVALID_HANDLE
@@ -126,6 +128,9 @@ func (h Handle) Send(buf []byte, addr *Address) error {
 		uintptr(unsafe.Pointer(&n)),
 		uintptr(unsafe.Pointer(addr)),
 	)
+	runtime.KeepAlive(buf)
+	runtime.KeepAlive(addr)
+	runtime.KeepAlive(&n)
 	if r == 0 {
 		if err == nil || err == windows.ERROR_SUCCESS {
 			err = windows.ERROR_INVALID_HANDLE
@@ -162,6 +167,8 @@ func (h Handle) RecvBatch(buf []byte, addrs []Address) (n, count int, err error)
 		uintptr(unsafe.Pointer(&addrLen)),
 		0,
 	)
+	runtime.KeepAlive(buf)
+	runtime.KeepAlive(addrs)
 	if r == 0 {
 		if err == nil || err == windows.ERROR_SUCCESS {
 			err = windows.ERROR_INVALID_HANDLE
@@ -194,6 +201,8 @@ func (h Handle) SendBatch(buf []byte, addrs []Address) (int, error) {
 		uintptr(len(addrs)*AddressSize),
 		0,
 	)
+	runtime.KeepAlive(buf)
+	runtime.KeepAlive(addrs)
 	if r == 0 {
 		if err == nil || err == windows.ERROR_SUCCESS {
 			err = windows.ERROR_INVALID_HANDLE

@@ -57,3 +57,9 @@ func IsNoData(err error) bool {
 	var n syscall.Errno
 	return errors.As(err, &n) && n == 232
 }
+
+// IsInvalidHandle reports ERROR_INVALID_HANDLE (6).
+func IsInvalidHandle(err error) bool {
+	var n syscall.Errno
+	return errors.As(err, &n) && n == 6
+}

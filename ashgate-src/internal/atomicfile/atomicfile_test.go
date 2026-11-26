@@ -23,8 +23,8 @@ func TestWriteReplacesAndDropsLeftoverTemp(t *testing.T) {
 	if err != nil || string(got) != "two" {
 		t.Fatalf("%q %v", got, err)
 	}
-	if _, err := os.Stat(path + ".tmp"); !os.IsNotExist(err) {
-		t.Fatalf("temp file left: %v", err)
+	if leftover, err := filepath.Glob(path + ".*.tmp"); err != nil || len(leftover) != 0 {
+		t.Fatalf("temp files left: %v %v", leftover, err)
 	}
 	if runtime.GOOS != "windows" {
 		if st, _ := os.Stat(path); st.Mode().Perm() != 0o600 {

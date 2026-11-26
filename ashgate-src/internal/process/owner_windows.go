@@ -14,9 +14,10 @@ func TCPOwner(port int) (name string, pid uint32, ok bool) {
 	if err != nil {
 		return "", 0, false
 	}
+	const tcpStateListen = 2 // MIB_TCP_STATE_LISTEN
 	var fallback uint32
 	for _, ep := range eps {
-		if ep.Proto != packet.ProtoTCP || int(ep.Addr.Port) != port || ep.PID == 0 {
+		if ep.Proto != packet.ProtoTCP || ep.State != tcpStateListen || int(ep.Addr.Port) != port || ep.PID == 0 {
 			continue
 		}
 		if fallback == 0 {

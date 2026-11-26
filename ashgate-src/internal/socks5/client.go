@@ -103,6 +103,9 @@ func Associate(ctx context.Context, p config.Proxy) (*Assoc, error) {
 	if err != nil {
 		return nil, err
 	}
+	if bnd.Port == 0 {
+		return nil, errors.New("socks5: proxy returned UDP relay port 0")
+	}
 	if bnd.IP.IsUnspecified() {
 		tcpAddr, _ := conn.RemoteAddr().(*net.TCPAddr)
 		if tcpAddr == nil {
@@ -150,9 +153,16 @@ func (a *Assoc) Recv(ctx context.Context) (*net.UDPAddr, []byte, error) {
 	if err := a.udp.SetReadDeadline(deadline(ctx, 2*time.Minute)); err != nil {
 		return nil, nil, err
 	}
+	if ctx != nil {
+		stop := context.AfterFunc(ctx, func() { _ = a.udp.SetReadDeadline(time.Unix(1, 0)) })
+		defer stop()
+	}
 	for {
 		n, from, err := a.udp.ReadFrom(buf)
 		if err != nil {
+			if ctx != nil && ctx.Err() != nil {
+				return nil, nil, ctx.Err()
+			}
 			return nil, nil, err
 		}
 		if !sameUDP(from, a.relay) {
@@ -182,8 +192,8 @@ func (a *Assoc) RelayAddr() *net.UDPAddr { return a.relay }
 
 // EncodeUDP builds a SOCKS5 UDP request header in front of payload.
 func EncodeUDP(dst *net.UDPAddr, payload []byte) ([]byte, error) {
-	if dst == nil {
-		return nil, errors.New("socks5: nil destination")
+	if dst == nil || dst.IP == nil || dst.Port < 0 || dst.Port > 65535 {
+		return nil, errors.New("socks5: invalid destination")
 	}
 	head, err := addrBytes(dst.IP.String(), uint16(dst.Port))
 	if err != nil {

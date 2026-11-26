@@ -52,6 +52,7 @@ type Result struct {
 	IfIdx    uint32
 	SubIfIdx uint32
 	UDP      *UDPDatagram
+	sendRST  bool
 }
 
 // UDPDatagram is a proxied UDP payload. The capture loop passes it to ForwardUDP.
@@ -66,6 +67,12 @@ type UDPDatagram struct {
 	ProxyName string
 	Process   string
 	PID       uint32
+	flow      *udpFlow
+}
+
+type tcpKey struct {
+	Src packet.Addr
+	Dst packet.Addr
 }
 
 type udpKey struct {
@@ -134,20 +141,20 @@ type Engine struct {
 	relay6Logged atomic.Bool
 
 	mu        sync.Mutex
-	byClient  map[packet.Addr]*tcpFlow
+	byClient  map[tcpKey]*tcpFlow
 	byAlloc   map[allocKey]*tcpFlow
-	directTCP ageSet[packet.Addr]
+	directTCP ageSet[tcpKey]
 	directUDP ageSet[udpKey]
 	// directPorts indexes directUDP by source port; see udpport.go.
 	directPorts map[uint16]map[udpKey]struct{}
-	blockTCP    ageSet[packet.Addr]
+	blockTCP    ageSet[tcpKey]
 	blockUDP    ageSet[udpKey]
 	// closedTCP holds the app side of proxied TCP flows that ended. Their
 	// last packets (FIN, ACK, keepalives, retransmits) often come after the
 	// relay closed and after the app exited, when the owner can no longer
 	// be found; passing them would send the app's own address to the
 	// server directly. Apply keeps it; a new SYN from the address clears it.
-	closedTCP ageSet[packet.Addr]
+	closedTCP ageSet[tcpKey]
 	// fragDrop remembers datagrams whose first fragment was dropped, so
 	// their later fragments (which carry no ports) are dropped too instead
 	// of reaching the destination directly.
@@ -156,6 +163,10 @@ type Engine struct {
 	// owner lookup: their later fragments wait for its decision.
 	fragHeld ageSet[fragKey]
 	udp      map[udpKey]*udpFlow
+	// draining holds detached UDP flows whose source port was closed; already
+	// queued datagrams finish forwarding while new packets on the port are
+	// re-decided. sweep and closeAll retire them.
+	draining []*udpFlow
 	// unknownUDP remembers UDP flows dropped for want of a program. Their
 	// next packets skip the hold (a stream of them would fill the capture
 	// loop's queue) but are still looked up, so once the owner is known
@@ -245,13 +256,13 @@ func New(cfg *config.Config, opt Options) (*Engine, error) {
 		dial:       opt.Dialer,
 		resolver:   opt.Resolver,
 		now:        opt.Now,
-		byClient:   map[packet.Addr]*tcpFlow{},
+		byClient:   map[tcpKey]*tcpFlow{},
 		byAlloc:    map[allocKey]*tcpFlow{},
-		directTCP:  newAgeSet[packet.Addr](),
+		directTCP:  newAgeSet[tcpKey](),
 		directUDP:  newAgeSet[udpKey](),
-		blockTCP:   newAgeSet[packet.Addr](),
+		blockTCP:   newAgeSet[tcpKey](),
 		blockUDP:   newAgeSet[udpKey](),
-		closedTCP:  newAgeSet[packet.Addr](),
+		closedTCP:  newAgeSet[tcpKey](),
 		fragDrop:   newAgeSet[fragKey](),
 		fragHeld:   newAgeSet[fragKey](),
 		unknownUDP: newAgeSet[udpKey](),
@@ -318,10 +329,10 @@ func (e *Engine) Apply(cfg *config.Config) error {
 	e.snap.Store(snap)
 	e.verbose.Store(strings.EqualFold(cfg.Log.Level, "debug"))
 	e.mu.Lock()
-	e.directTCP = newAgeSet[packet.Addr]()
+	e.directTCP = newAgeSet[tcpKey]()
 	e.directUDP = newAgeSet[udpKey]()
 	e.directPorts = nil
-	e.blockTCP = newAgeSet[packet.Addr]()
+	e.blockTCP = newAgeSet[tcpKey]()
 	e.blockUDP = newAgeSet[udpKey]()
 	e.unknownUDP = newAgeSet[udpKey]()
 	var stale []*udpFlow
@@ -357,6 +368,11 @@ func (e *Engine) FlowCounts() (tcp, udp int) {
 		}
 	}
 	for _, f := range e.udp {
+		if f.live {
+			udp++
+		}
+	}
+	for _, f := range e.draining {
 		if f.live {
 			udp++
 		}
@@ -550,12 +566,20 @@ func (e *Engine) HandlePacket(pkt []byte, meta Meta, final bool) Result {
 	}
 
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	res, done := e.fastPath(pkt, &h)
 	if !done {
 		res = e.decide(pkt, &h, meta, proc, found, final || again)
 	}
 	e.firstFragmentLocked(&h, res.Action)
+	e.mu.Unlock()
+	if res.sendRST {
+		res.sendRST = false
+		if inj := e.injector(); inj != nil {
+			if rst, err := packet.BuildRST(h.Dst, h.Src, h.Ack); err == nil {
+				_ = inj.InjectInbound(rst, meta.IfIdx, meta.SubIfIdx)
+			}
+		}
+	}
 	return res
 }
 
@@ -635,23 +659,24 @@ func (e *Engine) fastPath(pkt []byte, h *packet.Header) (Result, bool) {
 		if res, ok := e.tcpReturn(pkt, h, snap); ok {
 			return res, true
 		}
+		key := tcpKey{Src: h.Src, Dst: h.Dst}
 		if h.SYN && !h.ACK {
-			if flow := e.byClient[h.Src]; flow != nil && flow.orig.Equal(h.Dst) && flow.closedAt.IsZero() {
+			if flow := e.byClient[key]; flow != nil && flow.closedAt.IsZero() {
 				return e.rewriteForward(pkt, h, flow, snap), true
 			}
-			if flow := e.byClient[h.Src]; flow != nil {
+			if flow := e.byClient[key]; flow != nil {
 				e.dropFlowLocked(flow)
 			}
-			e.directTCP.del(h.Src)
-			e.blockTCP.del(h.Src)
-			e.closedTCP.del(h.Src)
-		} else if flow := e.byClient[h.Src]; flow != nil {
+			e.directTCP.del(key)
+			e.blockTCP.del(key)
+			e.closedTCP.del(key)
+		} else if flow := e.byClient[key]; flow != nil {
 			return e.rewriteForward(pkt, h, flow, snap), true
-		} else if e.closedTCP.has(h.Src) {
+		} else if e.closedTCP.has(key) {
 			return Result{Action: ActionDrop}, true
-		} else if e.directTCP.has(h.Src) {
+		} else if e.directTCP.has(key) {
 			return Result{Action: ActionPass}, true
-		} else if e.blockTCP.has(h.Src) {
+		} else if e.blockTCP.has(key) {
 			return Result{Action: ActionDrop}, true
 		}
 	}
@@ -873,7 +898,7 @@ func (e *Engine) startTCP(pkt []byte, h *packet.Header, meta Meta, proc rules.Pr
 	if stat != nil {
 		stat.flows.Add(1)
 	}
-	e.byClient[h.Src] = flow
+	e.byClient[tcpKey{Src: h.Src, Dst: h.Dst}] = flow
 	e.byAlloc[allocKey{ver: h.Ver, port: port}] = flow
 	e.active.Add(1)
 	return e.rewriteForward(pkt, h, flow, snap)
@@ -883,22 +908,18 @@ func (e *Engine) startTCP(pkt []byte, h *packet.Header, meta Meta, proc rules.Pr
 // open before capture started. It cannot be moved to the proxy, so with the
 // kill switch it is dropped and the application gets a reset, which makes
 // it reconnect through the proxy instead of staying direct.
-func (e *Engine) resetExisting(h *packet.Header, meta Meta, proc rules.Process, p config.Proxy, parent string) Result {
-	e.reset(h, meta)
+func (e *Engine) resetExisting(h *packet.Header, _ Meta, proc rules.Process, p config.Proxy, parent string) Result {
+	res := e.reset(h)
 	e.log(logbuf.Event{Process: display(proc), PID: proc.PID, Proto: "TCP", Dest: h.Dst.String(), Via: p.Name, Status: "blocked",
 		Error: "kill switch: соединение открыто до запуска перехвата, сброшено", Parent: parent})
-	return Result{Action: ActionDrop}
+	return res
 }
 
-// reset drops a connection that cannot be moved to the proxy and sends the
-// program a reset, so it reconnects (through the proxy) at once.
-func (e *Engine) reset(h *packet.Header, meta Meta) {
+// reset drops a connection that cannot be moved to the proxy and marks the
+// result so HandlePacket sends the program a reset outside e.mu.
+func (e *Engine) reset(h *packet.Header) Result {
 	e.rememberBlock(h)
-	if inj := e.injector(); inj != nil && !h.RST {
-		if rst, err := packet.BuildRST(h.Dst, h.Src, h.Ack); err == nil {
-			_ = inj.InjectInbound(rst, meta.IfIdx, meta.SubIfIdx)
-		}
-	}
+	return Result{Action: ActionDrop, sendRST: !h.RST}
 }
 
 const (
@@ -1018,6 +1039,7 @@ func datagram(pkt []byte, h *packet.Header, f *udpFlow) *UDPDatagram {
 		ProxyName: f.proxy.Name,
 		Process:   display(f.proc),
 		PID:       f.proc.PID,
+		flow:      f,
 	}
 }
 
@@ -1069,7 +1091,7 @@ func (e *Engine) rewriteForward(pkt []byte, h *packet.Header, flow *tcpFlow, sna
 
 func (e *Engine) rememberDirect(h *packet.Header) {
 	if h.Proto == packet.ProtoTCP {
-		e.directTCP.add(h.Src)
+		e.directTCP.add(tcpKey{Src: h.Src, Dst: h.Dst})
 		return
 	}
 	e.addDirectUDP(udpKey{Src: h.Src, Dst: h.Dst})
@@ -1086,7 +1108,7 @@ func (e *Engine) rememberDirectExceptDNS(h *packet.Header) {
 
 func (e *Engine) rememberBlock(h *packet.Header) {
 	if h.Proto == packet.ProtoTCP {
-		e.blockTCP.add(h.Src)
+		e.blockTCP.add(tcpKey{Src: h.Src, Dst: h.Dst})
 		return
 	}
 	e.blockUDP.add(udpKey{Src: h.Src, Dst: h.Dst})

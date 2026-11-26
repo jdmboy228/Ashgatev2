@@ -173,11 +173,30 @@ func (g *subGroup) evidence(now time.Time, h engine.RelayHealth, up, down int64)
 // ruleBytes sums the bytes of the enabled rules that send programs through
 // the proxy named name.
 func ruleBytes(cfg *config.Config, name string, stats map[string]engine.RuleStat) (up, down int64) {
-	for _, r := range cfg.EffectiveRules() {
-		if !r.IsEnabled() || r.Action != "proxy" || r.Proxy != name {
+	var seen map[string]bool
+	for _, r := range cfg.Rules {
+		on, action, proxy := r.IsEnabled(), r.Action, r.Proxy
+		if r.Group != "" {
+			for i := range cfg.Groups {
+				if g := &cfg.Groups[i]; g.Name == r.Group {
+					on = on && g.IsEnabled()
+					action, proxy = g.Action, g.Proxy
+					break
+				}
+			}
+		}
+		if !on || action != "proxy" || proxy != name {
 			continue
 		}
-		s := stats[engine.RuleKey(r.Process)]
+		key := engine.RuleKey(r.Process)
+		if seen[key] {
+			continue
+		}
+		if seen == nil {
+			seen = map[string]bool{}
+		}
+		seen[key] = true
+		s := stats[key]
 		up += s.Up
 		down += s.Down
 	}
@@ -420,7 +439,8 @@ func (c *controller) fetchSub(name string) error {
 	if viaTunnel {
 		client, timeout = tunnelClient(st), subTunnelTimeout
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer client.CloseIdleConnections()
+	ctx, cancel := context.WithTimeout(c.baseCtx(), timeout)
 	defer cancel()
 	entries, err := subs.Fetch(ctx, client, url)
 	now := time.Now()
@@ -439,6 +459,11 @@ func (c *controller) provenTunnel(name string, g *subGroup) (vless.Status, bool)
 	deadline := time.Now().Add(2*checkTimeout + 2*time.Second)
 	checked := false
 	for {
+		select {
+		case <-c.done:
+			return vless.Status{}, false
+		default:
+		}
 		c.mu.Lock()
 		st := c.bridgeSt[name]
 		running := c.sess != nil && c.sess.Running()
@@ -474,7 +499,7 @@ func (c *controller) provenTunnel(name string, g *subGroup) (vless.Status, bool)
 // directClient is the one direct try. The host is looked up with DoH, not
 // the provider's DNS (the TLS name still shows it; the tunnel hides both).
 func directClient() *http.Client {
-	return &http.Client{Transport: &http.Transport{Proxy: nil, ForceAttemptHTTP2: true, DialContext: bootstrap.Dial}}
+	return &http.Client{Transport: &http.Transport{Proxy: nil, ForceAttemptHTTP2: true, DisableKeepAlives: true, DialContext: bootstrap.Dial}}
 }
 
 // tunnelClient sends requests through a bridge's private inbound. Host
@@ -484,6 +509,7 @@ func tunnelClient(st vless.Status) *http.Client {
 	return &http.Client{Transport: &http.Transport{
 		Proxy:             nil,
 		ForceAttemptHTTP2: true,
+		DisableKeepAlives: true,
 		DialContext: func(ctx context.Context, _, addr string) (net.Conn, error) {
 			host, portStr, err := net.SplitHostPort(addr)
 			if err != nil {
@@ -606,12 +632,15 @@ func (c *controller) healthCheck(name string) {
 		}
 	}
 	c.mu.Unlock()
-	check, route := checkBridge, hasRoute
+	check, route := func(st vless.Status) failover.Result { return checkBridgeCtx(c.baseCtx(), st) }, hasRoute
 	if c.fo.check != nil {
 		check = c.fo.check
 	}
 	if c.fo.route != nil {
 		route = c.fo.route
+	}
+	if st.Server != "" {
+		server = st.Server
 	}
 	res := check(st)
 	if res != failover.OK && !route(server) {
@@ -651,10 +680,14 @@ func (c *controller) healthCheck(name string) {
 // checkBridge checks the active server through its bridge; one that is not
 // up has failed.
 func checkBridge(st vless.Status) failover.Result {
+	return checkBridgeCtx(context.Background(), st)
+}
+
+func checkBridgeCtx(ctx context.Context, st vless.Status) failover.Result {
 	if !st.Up || st.SOCKS == "" {
 		return failover.Failed
 	}
-	return checkTunnel(context.Background(), st.SOCKS, st.User, st.Pass)
+	return checkTunnel(ctx, st.SOCKS, st.User, st.Pass)
 }
 
 // hasRoute reports whether this machine has a route to the server at addr
@@ -664,8 +697,12 @@ func checkBridge(st vless.Status) failover.Result {
 // cannot be asked, counts as reachable.
 func hasRoute(addr string) bool {
 	host, _, err := net.SplitHostPort(addr)
-	if err != nil || net.ParseIP(host) == nil {
+	if err != nil {
 		return true
+	}
+	if net.ParseIP(host) == nil {
+		// A name: ask the routing table about a well-known address.
+		addr = "1.1.1.1:443"
 	}
 	c, err := net.Dial("udp", addr)
 	if err != nil {
@@ -677,8 +714,10 @@ func hasRoute(addr string) bool {
 
 // probeServer checks a server that carries no traffic through a tunnel of
 // its own, made for this one check.
-func probeServer(e subs.Entry) bool {
-	ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
+func probeServer(e subs.Entry) bool { return probeServerCtx(context.Background(), e) }
+
+func probeServerCtx(parent context.Context, e subs.Entry) bool {
+	ctx, cancel := context.WithTimeout(parent, probeTimeout)
 	defer cancel()
 	br, err := vless.Listen(ctx, e.Address, e.Params, vless.Inbound{})
 	if err != nil {
@@ -726,7 +765,7 @@ func (c *controller) probePrimary(name string) {
 		}
 	}
 	c.mu.Unlock()
-	probe := probeServer
+	probe := func(e subs.Entry) bool { return probeServerCtx(c.baseCtx(), e) }
 	if c.fo.probe != nil {
 		probe = c.fo.probe
 	}
@@ -791,6 +830,8 @@ func checkTunnel(ctx context.Context, addr, user, pass string) failover.Result {
 		return bad(err)
 	}
 	defer conn.Close()
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stop()
 	if dl, ok := ctx.Deadline(); ok {
 		_ = conn.SetDeadline(dl)
 	}
@@ -837,9 +878,11 @@ func (c *controller) addSub(name, rawURL string) error {
 		c.subFetching = false
 		c.mu.Unlock()
 	}()
-	ctx, cancel := context.WithTimeout(context.Background(), subDirectTimeout)
+	client := directClient()
+	defer client.CloseIdleConnections()
+	ctx, cancel := context.WithTimeout(c.baseCtx(), subDirectTimeout)
 	defer cancel()
-	entries, err := subs.Fetch(ctx, directClient(), rawURL)
+	entries, err := subs.Fetch(ctx, client, rawURL)
 	if err != nil {
 		return errors.New("Подписка не загрузилась: " + err.Error())
 	}

@@ -10,11 +10,20 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"unicode/utf16"
+	"unicode/utf8"
+	"unsafe"
 
 	"ashgate/internal/config"
+	"golang.org/x/sys/windows"
+)
+
+var (
+	kernel32                = windows.NewLazySystemDLL("kernel32.dll")
+	procMultiByteToWideChar = kernel32.NewProc("MultiByteToWideChar")
 )
 
 const taskName = `\Ashgate`
@@ -67,7 +76,7 @@ func Enable(exe, configPath string) error {
 	cmd.SysProcAttr = noWindow()
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		msg := strings.TrimSpace(string(out))
+		msg := strings.TrimSpace(decodeConsole(out))
 		if msg == "" {
 			msg = err.Error()
 		}
@@ -78,17 +87,21 @@ func Enable(exe, configPath string) error {
 
 // Disable removes the logon task. A missing task is not an error.
 func Disable() error {
+	if on, _ := Enabled(); !on {
+		return nil
+	}
 	cmd := exec.Command(schtasks(), "/Delete", "/TN", taskName, "/F")
 	cmd.SysProcAttr = noWindow()
 	out, err := cmd.CombinedOutput()
 	if err == nil {
 		return nil
 	}
-	msg := strings.ToLower(string(out))
+	decoded := decodeConsole(out)
+	msg := strings.ToLower(decoded)
 	if strings.Contains(msg, "cannot find") || strings.Contains(msg, "не удается найти") || strings.Contains(msg, "не удаётся найти") {
 		return nil
 	}
-	text := strings.TrimSpace(string(out))
+	text := strings.TrimSpace(decoded)
 	if text == "" {
 		text = err.Error()
 	}
@@ -192,13 +205,47 @@ func encodeUTF16(s string) []byte {
 }
 
 // schtasks is the absolute path of schtasks.exe. This process is elevated,
-// so it must not pick up a schtasks.exe from a directory on PATH.
+// so it must not pick up a schtasks.exe from a directory on PATH or an
+// untrusted SystemRoot environment variable.
 func schtasks() string {
-	root := os.Getenv("SystemRoot")
-	if root == "" {
-		root = `C:\Windows`
+	dir, err := windows.GetSystemDirectory()
+	if err != nil || dir == "" {
+		dir = `C:\Windows\System32`
 	}
-	return filepath.Join(root, "System32", "schtasks.exe")
+	return filepath.Join(dir, "schtasks.exe")
+}
+
+// decodeConsole converts OEM codepage output (e.g. Russian CP866) to UTF-8.
+func decodeConsole(b []byte) string {
+	if len(b) == 0 {
+		return ""
+	}
+	if utf8.Valid(b) {
+		return string(b)
+	}
+	const cpOEM = 1
+	n, _, _ := procMultiByteToWideChar.Call(
+		cpOEM, 0,
+		uintptr(unsafe.Pointer(&b[0])), uintptr(len(b)),
+		0, 0,
+	)
+	if n == 0 {
+		runtime.KeepAlive(b)
+		return string(b)
+	}
+	w := make([]uint16, n)
+	m, _, _ := procMultiByteToWideChar.Call(
+		cpOEM, 0,
+		uintptr(unsafe.Pointer(&b[0])), uintptr(len(b)),
+		uintptr(unsafe.Pointer(&w[0])), n,
+	)
+	runtime.KeepAlive(b)
+	if m == 0 {
+		return string(b)
+	}
+	s := windows.UTF16ToString(w[:m])
+	runtime.KeepAlive(w)
+	return s
 }
 
 func noWindow() *syscall.SysProcAttr {

@@ -467,7 +467,7 @@ func TestFlowDeletedAllowsPruneWhileWildcardStaysOpen(t *testing.T) {
 	r.Observe(packet.ProtoUDP, packet.V4(10, 0, 0, 1, 12345), 11, false)
 	r.mu.Lock()
 	_, exactExists := r.exact[exactKey{packet.ProtoUDP, exact}]
-	_, wildExists := r.wild[wildKey{packet.ProtoUDP, 54323}]
+	_, wildExists := r.wild[wildKey{packet.ProtoUDP, 4, 54323}]
 	r.mu.Unlock()
 	if exactExists {
 		t.Fatal("deleted exact flow entry was not pruned")
@@ -580,5 +580,64 @@ func TestObserveFlowDoesNotResurrectClosedSocket(t *testing.T) {
 	r.ObserveFlow(packet.ProtoTCP, exact2, 10, false)
 	if p, ok := r.Owner(packet.ProtoTCP, exact2, NewFlow, false); ok {
 		t.Fatalf("delayed ObserveFlow resurrected closed exact socket: %+v", p)
+	}
+}
+
+func TestWildcardIPFamilySeparationAndDualStack(t *testing.T) {
+	r, _ := testResolver(time.Unix(1000, 0))
+	v4Wild := packet.V4(0, 0, 0, 0, 60000)
+	v6Wild := packet.Addr{Len: 16, Port: 60000}
+	v4Src := packet.V4(192, 168, 1, 5, 60000)
+	v6Src := packet.Addr{IP: [16]byte{0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}, Len: 16, Port: 60000}
+
+	// IPv4 wildcard must not match IPv6 lookups.
+	r.Observe(packet.ProtoUDP, v4Wild, 10, false)
+	if p, ok := r.Lookup(packet.ProtoUDP, v4Src); !ok || p.PID != 10 {
+		t.Fatalf("v4 lookup: %+v %v", p, ok)
+	}
+	if p, ok := r.Lookup(packet.ProtoUDP, v6Src); ok {
+		t.Fatalf("v4 wildcard matched v6 src: %+v", p)
+	}
+
+	// IPv6 wildcard does not overwrite IPv4 wildcard; each family keeps its own owner.
+	r.Observe(packet.ProtoUDP, v6Wild, 20, false)
+	if p, ok := r.Lookup(packet.ProtoUDP, v4Src); !ok || p.PID != 10 {
+		t.Fatalf("v4 lookup after v6 bind: %+v %v, want PID 10", p, ok)
+	}
+	if p, ok := r.Lookup(packet.ProtoUDP, v6Src); !ok || p.PID != 20 {
+		t.Fatalf("v6 lookup: %+v %v, want PID 20", p, ok)
+	}
+
+	// Dual-stack: IPv6 wildcard on a port with no IPv4 wildcard matches IPv4.
+	v6Dual := packet.Addr{Len: 16, Port: 60001}
+	v4DualSrc := packet.V4(192, 168, 1, 5, 60001)
+	r.Observe(packet.ProtoUDP, v6Dual, 30, false)
+	if p, ok := r.Lookup(packet.ProtoUDP, v4DualSrc); !ok || p.PID != 30 {
+		t.Fatalf("dual-stack v4->v6 fallback: %+v %v, want PID 30", p, ok)
+	}
+}
+
+func TestPruneMaxImagesCallsRelease(t *testing.T) {
+	start := time.Unix(1000, 0)
+	r, clock := testResolver(start)
+	released := 0
+	r.release = func() { released++ }
+	r.mu.Lock()
+	for i := uint32(1); i <= maxImages+5; i++ {
+		r.images[i] = rules.Process{PID: i, Name: "a.exe"}
+	}
+	r.pruneAt = start
+	r.mu.Unlock()
+	*clock = start.Add(pruneEvery)
+	r.Observe(packet.ProtoTCP, packet.V4(10, 0, 0, 1, 1234), 1, false)
+	if released != 1 {
+		t.Fatalf("release called %d times, want 1", released)
+	}
+}
+
+func TestExpandEnvUnmatchedPercentDoesNotSwallowNextVar(t *testing.T) {
+	t.Setenv("ASHGATE_TEST_VAR", "ok")
+	if got := expandEnv("%NO_SUCH_VAR%ASHGATE_TEST_VAR%"); got != "%NO_SUCH_VARok" {
+		t.Fatalf("expandEnv = %q, want %%NO_SUCH_VARok", got)
 	}
 }

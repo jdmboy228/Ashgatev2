@@ -6,6 +6,7 @@ import (
 	"errors"
 	"image"
 	"image/color"
+	"runtime"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -40,11 +41,17 @@ func iconFromImage(img *image.NRGBA) (uintptr, error) {
 	b := img.Bounds()
 	w, h := b.Dx(), b.Dy()
 	hdc, _, _ := pGetDC.Call(0)
-	defer pReleaseDC.Call(0, hdc)
+	if hdc != 0 {
+		defer pReleaseDC.Call(0, hdc)
+	}
 	bi := bitmapInfoHeader{Size: 40, Width: int32(w), Height: -int32(h), Planes: 1, BitCount: 32}
 	var bits unsafe.Pointer
 	colorBmp, _, _ := pCreateDIB.Call(hdc, uintptr(unsafe.Pointer(&bi)), 0, uintptr(unsafe.Pointer(&bits)), 0, 0)
+	runtime.KeepAlive(&bi)
 	if colorBmp == 0 || bits == nil {
+		if colorBmp != 0 {
+			pDeleteObject.Call(colorBmp)
+		}
 		return 0, errors.New("не удалось собрать значок")
 	}
 	pix := unsafe.Slice((*byte)(bits), w*h*4)
@@ -61,6 +68,7 @@ func iconFromImage(img *image.NRGBA) (uintptr, error) {
 	mask, _, _ := pCreateBitmap.Call(uintptr(w), uintptr(h), 1, 1, 0)
 	ii := IconInfo{Icon: 1, Mask: mask, Color: colorBmp}
 	hicon, _, _ := pCreateIcon.Call(uintptr(unsafe.Pointer(&ii)))
+	runtime.KeepAlive(&ii)
 	pDeleteObject.Call(colorBmp)
 	if mask != 0 {
 		pDeleteObject.Call(mask)

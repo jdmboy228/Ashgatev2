@@ -45,25 +45,29 @@ for root, _, files in os.walk(art):
                 elif tc.find("skipped") is not None:
                     j["skipped"] += 1
         elif f == "notes.md":
-            for line in open(p, encoding="utf-8", errors="replace"):
-                m = re.match(r"- \*\*(\w+)\*\* (.*)", line.strip())
-                if m:
-                    notes.setdefault(m.group(1), []).append(f"{job}: {m.group(2)}")
+            with open(p, encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    m = re.match(r"- \*\*(\w+)\*\* (.*)", line.strip())
+                    if m:
+                        notes.setdefault(m.group(1), []).append(f"{job}: {m.group(2)}")
         elif f == "metrics.json":
             try:
-                for k, v in json.load(open(p, encoding="utf-8")).items():
-                    metrics[k] = v
+                with open(p, encoding="utf-8") as fh:
+                    for k, v in json.load(fh).items():
+                        metrics[k] = v
             except (ValueError, OSError):
                 pass
 
 prev = {}
 if prev_path != "-" and os.path.exists(prev_path):
     try:
-        prev = json.load(open(prev_path, encoding="utf-8"))
+        with open(prev_path, encoding="utf-8") as fh:
+            prev = json.load(fh)
     except ValueError:
         prev = {}
 
-json.dump(metrics, open(os.path.join(out, "perf.json"), "w"), indent=2, sort_keys=True)
+with open(os.path.join(out, "perf.json"), "w", encoding="utf-8") as fh:
+    json.dump(metrics, fh, indent=2, sort_keys=True)
 
 # Credential-shaped strings that masking should have removed.
 patterns = [
@@ -78,7 +82,8 @@ for root, _, files in os.walk(art):
             continue
         p = os.path.join(root, f)
         try:
-            data = open(p, "rb").read()
+            with open(p, "rb") as fh:
+                data = fh.read()
         except OSError:
             continue
         for rx, what in patterns:
@@ -110,7 +115,7 @@ if metrics:
         v, unit, better = m.get("value"), m.get("unit", ""), m.get("better", "")
         pv = prev.get(k, {}).get("value") if isinstance(prev.get(k), dict) else None
         change = ""
-        if isinstance(pv, (int, float)) and pv:
+        if isinstance(v, (int, float)) and isinstance(pv, (int, float)) and pv:
             d = (v - pv) / abs(pv) * 100
             worse = (better == "lower" and d > 25) or (better == "higher" and d < -20)
             change = f"{d:+.0f}%" + (" ⚠️" if worse else "")
@@ -126,6 +131,7 @@ if leaks:
     lines += ["## ❌ Credential-shaped strings in artifacts", ""] + [f"- {l}" for l in leaks] + [""]
 
 text = "\n".join(lines) + "\n"
-open(os.path.join(out, "summary.md"), "w", encoding="utf-8").write(text)
+with open(os.path.join(out, "summary.md"), "w", encoding="utf-8") as fh:
+    fh.write(text)
 print(text)
 sys.exit(1 if leaks else 0)

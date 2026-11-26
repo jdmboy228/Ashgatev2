@@ -9,7 +9,6 @@ package windivert
 import (
 	"encoding/binary"
 	"math/bits"
-	"net"
 
 	"ashgate/internal/packet"
 )
@@ -150,30 +149,29 @@ func (a *Address) Local() packet.Addr { return endpointAt(a, 36, 68) }
 // Remote is the SOCKET/FLOW remote endpoint.
 func (a *Address) Remote() packet.Addr { return endpointAt(a, 52, 70) }
 
-func endpointAt(a *Address, ipOff, portOff int) packet.Addr {
-	var w [4]uint32
-	for i := 0; i < 4; i++ {
-		w[i] = binary.LittleEndian.Uint32(a[ipOff+4*i : ipOff+4*i+4])
-	}
-	port := binary.LittleEndian.Uint16(a[portOff : portOff+2])
-	return packet.FromIP(hostToIP(w), port)
-}
-
-// hostToIP converts WinDivert host-order address words to a net.IP.
+// endpointAt converts WinDivert host-order address words directly to packet.Addr.
 // IPv4-mapped 1.2.3.4 is stored as [0x01020304, 0x0000FFFF, 0, 0].
 // 2001:db8::1 is stored as [0x00000001, 0, 0, 0x20010db8].
-func hostToIP(w [4]uint32) net.IP {
+func endpointAt(a *Address, ipOff, portOff int) packet.Addr {
 	var b [16]byte
 	for i := 0; i < 4; i++ {
-		binary.LittleEndian.PutUint32(b[(3-i)*4:], bits.ReverseBytes32(w[i]))
+		w := binary.LittleEndian.Uint32(a[ipOff+4*i : ipOff+4*i+4])
+		binary.LittleEndian.PutUint32(b[(3-i)*4:], bits.ReverseBytes32(w))
 	}
-	ip := net.IP(b[:])
-	if v4 := ip.To4(); v4 != nil {
-		return v4
+	port := binary.LittleEndian.Uint16(a[portOff : portOff+2])
+	if isV4Mapped(b) {
+		return packet.V4(b[12], b[13], b[14], b[15], port)
 	}
-	out := make(net.IP, 16)
-	copy(out, b[:])
-	return out
+	return packet.Addr{IP: b, Len: 16, Port: port}
+}
+
+func isV4Mapped(b [16]byte) bool {
+	for i := 0; i < 10; i++ {
+		if b[i] != 0 {
+			return false
+		}
+	}
+	return b[10] == 0xff && b[11] == 0xff
 }
 
 // MarkValidChecksums sets the checksum-valid bits to match a parsed packet.
@@ -210,7 +208,7 @@ func ipv6Proto(pkt []byte) byte {
 			if off+2 > len(pkt) {
 				return next
 			}
-			hdrLen := int(pkt[off+1]+1) * 8
+			hdrLen := (int(pkt[off+1]) + 1) * 8
 			if hdrLen < 8 || off+hdrLen > len(pkt) {
 				return next
 			}
@@ -226,7 +224,7 @@ func ipv6Proto(pkt []byte) byte {
 			if off+2 > len(pkt) {
 				return next
 			}
-			hdrLen := int(pkt[off+1]+2) * 4
+			hdrLen := (int(pkt[off+1]) + 2) * 4
 			if hdrLen < 8 || off+hdrLen > len(pkt) {
 				return next
 			}

@@ -159,11 +159,13 @@ func trayNotify(msg uint32, icon uintptr, tip string) bool {
 }
 
 func trayShowMenu() {
-	if appHost == nil {
+	hHost := appHost.Load()
+	if hHost == nil {
 		return
 	}
+	hwndMain := hHost.hwnd.Load()
 	ensureTrayClass()
-	dpi := windowDPI(appHost.hwnd)
+	dpi := windowDPI(hwndMain)
 	w, h := menuSize(dpi)
 	var pt Point
 	pGetCursorPos.Call(uintptr(unsafe.Pointer(&pt)))
@@ -195,7 +197,7 @@ func trayShowMenu() {
 			uintptr(unsafe.Pointer(title)),
 			wsPopup,
 			uintptr(x), uintptr(y), uintptr(w), uintptr(h),
-			appHost.hwnd, 0, uintptr(inst), 0,
+			hwndMain, 0, uintptr(inst), 0,
 		)
 		runtime.KeepAlive(title)
 		if hwnd == 0 {
@@ -210,7 +212,10 @@ func trayShowMenu() {
 	pSetWindowPos.Call(tray.menu, ^uintptr(0), uintptr(x), uintptr(y), uintptr(w), uintptr(h), swpShowWindow)
 	rgn, _, _ := pCreateRgn.Call(0, 0, uintptr(w+1), uintptr(h+1), uintptr(dp(16, dpi)), uintptr(dp(16, dpi)))
 	if rgn != 0 {
-		pSetWindowRgn.Call(tray.menu, rgn, 1)
+		ok, _, _ := pSetWindowRgn.Call(tray.menu, rgn, 1)
+		if ok == 0 {
+			pDeleteObject.Call(rgn)
+		}
 	}
 	pSetForeground.Call(tray.menu)
 }
@@ -393,8 +398,12 @@ func fill(hdc, brush uintptr, l, t, r, b int32) {
 }
 
 func drawText(hdc uintptr, s string, r Rect, color, font, flags uintptr) {
+	var oldFont uintptr
 	if font != 0 {
-		pSelectObject.Call(hdc, font)
+		oldFont, _, _ = pSelectObject.Call(hdc, font)
+	}
+	if oldFont != 0 {
+		defer pSelectObject.Call(hdc, oldFont)
 	}
 	pSetTextColor.Call(hdc, color)
 	u, err := windows.UTF16PtrFromString(s)

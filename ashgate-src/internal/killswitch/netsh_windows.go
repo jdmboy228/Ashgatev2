@@ -4,7 +4,6 @@ package killswitch
 
 import (
 	"fmt"
-	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
@@ -25,7 +24,11 @@ var (
 // program="C:\path with spaces\app.exe" exactly, which Go's own argument
 // quoting would not produce.
 func runNetsh(cmdline string) error {
-	exe := filepath.Join(os.Getenv("SystemRoot"), "System32", "netsh.exe")
+	dir, err := windows.GetSystemDirectory()
+	if err != nil || dir == "" {
+		dir = `C:\Windows\System32`
+	}
+	exe := filepath.Join(dir, "netsh.exe")
 	cmd := exec.Command(exe)
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		HideWindow:    true,

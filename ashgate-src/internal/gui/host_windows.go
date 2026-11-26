@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -36,7 +37,7 @@ type host struct {
 	logs      *logbuf.Buffer
 	ctrl      *controller
 	w         webview2.WebView
-	hwnd      uintptr
+	hwnd      atomic.Uintptr
 	orig      uintptr
 	quitting  bool
 	iconBig   uintptr
@@ -62,7 +63,7 @@ type windowState struct {
 	Max bool  `json:"max,omitempty"`
 }
 
-var appHost *host
+var appHost atomic.Pointer[host]
 
 // Run opens the window and blocks until the user exits from the tray menu.
 func Run(configPath string, startCapture bool) error {
@@ -89,7 +90,8 @@ func Run(configPath string, startCapture bool) error {
 	}
 	logs, logErr := openLog(cfg, configPath)
 	h := &host{path: configPath, logs: logs}
-	appHost = h
+	appHost.Store(h)
+	defer appHost.Store(nil)
 	notice := retireService(configPath, logs)
 	h.ctrl = newController(configPath, cfg, logs, hooks{
 		admin:        isAdmin(),
@@ -183,21 +185,22 @@ func Run(configPath string, startCapture bool) error {
 	if err := disableAutofill(w); err != nil && h.logs != nil {
 		h.logs.Add(logbuf.Event{Process: "ashgate", Status: "error", Error: "WebView2: не удалось выключить автозаполнение: " + err.Error()})
 	}
-	h.hwnd = uintptr(w.Window())
-	pShowWindow.Call(h.hwnd, swHide)
+	hwnd := uintptr(w.Window())
+	h.hwnd.Store(hwnd)
+	pShowWindow.Call(hwnd, swHide)
 	// Subclass before the first resize so WM_NCCALCSIZE drops the caption
 	// frame and WM_GETMINMAXINFO already enforces the DIP minimum.
 	h.subclass()
-	styleWindow(h.hwnd)
+	styleWindow(hwnd)
 	h.installIcons()
-	_ = w.Bind("ashgateDrag", func() { pPostMessage.Call(h.hwnd, wmDrag, 0, 0) })
-	_ = w.Bind("ashgateMin", func() { pPostMessage.Call(h.hwnd, wmMin, 0, 0) })
-	_ = w.Bind("ashgateMax", func() { pPostMessage.Call(h.hwnd, wmMax, 0, 0) })
-	_ = w.Bind("ashgateClose", func() { pPostMessage.Call(h.hwnd, wmClose, 0, 0) })
+	_ = w.Bind("ashgateDrag", func() { pPostMessage.Call(hwnd, wmDrag, 0, 0) })
+	_ = w.Bind("ashgateMin", func() { pPostMessage.Call(hwnd, wmMin, 0, 0) })
+	_ = w.Bind("ashgateMax", func() { pPostMessage.Call(hwnd, wmMax, 0, 0) })
+	_ = w.Bind("ashgateClose", func() { pPostMessage.Call(hwnd, wmClose, 0, 0) })
 	// The window has no top frame, so the page's title bar resizes from the top edge.
 	_ = w.Bind("ashgateResize", func(edge string) {
 		if ht := topEdgeHit(edge); ht != 0 {
-			pPostMessage.Call(h.hwnd, wmResize, ht, 0)
+			pPostMessage.Call(hwnd, wmResize, ht, 0)
 		}
 	})
 	// Hand the API token to the page before it loads, and only to it: the
@@ -206,14 +209,14 @@ func Run(configPath string, startCapture bool) error {
 	tok, _ := json.Marshal(h.ctrl.token)
 	origin, _ := json.Marshal("http://" + ln.Addr().String())
 	w.Init("if(location.origin===" + string(origin) + ")window.__ashgateToken=" + string(tok) + ";")
-	if err := trayAdd(h.hwnd); err != nil {
+	if err := trayAdd(hwnd); err != nil {
 		h.ctrl.mu.Lock()
 		if h.ctrl.errText == "" {
 			h.ctrl.errText = err.Error()
 		}
 		h.ctrl.mu.Unlock()
 	}
-	pSetTimer.Call(h.hwnd, 1, 1000, 0)
+	pSetTimer.Call(hwnd, 1, 1000, 0)
 	if startCapture {
 		go func() { _ = h.ctrl.start() }()
 	}
@@ -222,7 +225,7 @@ func Run(configPath string, startCapture bool) error {
 	if startCapture {
 		cmd = swRestore
 	}
-	pShowWindow.Call(h.hwnd, cmd)
+	pShowWindow.Call(hwnd, cmd)
 	w.Run()
 	trayRemove()
 	if h.iconBig != 0 {
@@ -261,8 +264,8 @@ func (h *host) window(op string) {
 	default:
 		return
 	}
-	if h.hwnd != 0 {
-		pPostMessage.Call(h.hwnd, msg, 0, 0)
+	if hwnd := h.hwnd.Load(); hwnd != 0 {
+		pPostMessage.Call(hwnd, msg, 0, 0)
 	}
 }
 
@@ -276,11 +279,19 @@ func (h *host) browse() (string, error) {
 	}
 	ch := make(chan result, 1)
 	h.w.Dispatch(func() {
-		p, err := openExe(h.hwnd)
+		p, err := openExe(h.hwnd.Load())
 		ch <- result{p, err}
 	})
-	res := <-ch
-	return res.path, res.err
+	var done <-chan struct{}
+	if h.ctrl != nil {
+		done = h.ctrl.done
+	}
+	select {
+	case res := <-ch:
+		return res.path, res.err
+	case <-done:
+		return "", errors.New("окно закрывается")
+	}
 }
 
 func (h *host) setAutostart(on bool) error {
@@ -326,25 +337,27 @@ func retireService(configPath string, logs *logbuf.Buffer) string {
 }
 
 func (h *host) subclass() {
-	prev, _, _ := pGetWindowLong.Call(h.hwnd, gwlpWndProc)
+	hwnd := h.hwnd.Load()
+	prev, _, _ := pGetWindowLong.Call(hwnd, gwlpWndProc)
 	h.orig = prev
 	h.cb = windows.NewCallback(hostProc)
-	pSetWindowLong.Call(h.hwnd, gwlpWndProc, h.cb)
+	pSetWindowLong.Call(hwnd, gwlpWndProc, h.cb)
 }
 
 func (h *host) installIcons() {
+	hwnd := h.hwnd.Load()
 	if big, err := iconFromImage(LogoImage(32)); err == nil {
-		pSendMessage.Call(h.hwnd, wmSetIcon, 1, big)
+		pSendMessage.Call(hwnd, wmSetIcon, 1, big)
 		h.iconBig = big
 	}
 	if small, err := iconFromImage(LogoImage(16)); err == nil {
-		pSendMessage.Call(h.hwnd, wmSetIcon, 0, small)
+		pSendMessage.Call(hwnd, wmSetIcon, 0, small)
 		h.iconSmall = small
 	}
 }
 
 func hostProc(hwnd, msg, wp, lp uintptr) uintptr {
-	h := appHost
+	h := appHost.Load()
 	if h == nil || h.orig == 0 {
 		r, _, _ := pDefWindowProc.Call(hwnd, msg, wp, lp)
 		return r
@@ -364,6 +377,12 @@ func hostProc(hwnd, msg, wp, lp uintptr) uintptr {
 			}
 		}
 		hostQuit()
+		return 0
+	case wmQuitDone:
+		if h.w != nil {
+			h.w.Terminate()
+		}
+		pPostMessage.Call(hwnd, wmClose, 0, 0)
 		return 0
 	case wmClose:
 		if !h.quitting {
@@ -465,27 +484,32 @@ func topEdgeHit(edge string) uintptr {
 }
 
 func showMain() {
-	h := appHost
-	if h == nil || h.hwnd == 0 {
+	h := appHost.Load()
+	if h == nil {
 		return
 	}
-	iconic, _, _ := pIsIconic.Call(h.hwnd)
-	if iconic != 0 {
-		pShowWindow.Call(h.hwnd, swRestore)
-	} else {
-		pShowWindow.Call(h.hwnd, swShow)
+	hwnd := h.hwnd.Load()
+	if hwnd == 0 {
+		return
 	}
-	pSetForeground.Call(h.hwnd)
+	iconic, _, _ := pIsIconic.Call(hwnd)
+	if iconic != 0 {
+		pShowWindow.Call(hwnd, swRestore)
+	} else {
+		pShowWindow.Call(hwnd, swShow)
+	}
+	pSetForeground.Call(hwnd)
 	h.wakePage()
 }
 
 // onScreen tells whether the window is visible and not minimized.
 func (h *host) onScreen() bool {
-	if h.hwnd == 0 {
+	hwnd := h.hwnd.Load()
+	if hwnd == 0 {
 		return true
 	}
-	on, _, _ := pIsWindowVisible.Call(h.hwnd)
-	iconic, _, _ := pIsIconic.Call(h.hwnd)
+	on, _, _ := pIsWindowVisible.Call(hwnd)
+	iconic, _, _ := pIsIconic.Call(hwnd)
 	return on != 0 && iconic == 0
 }
 
@@ -500,7 +524,7 @@ func (h *host) wakePage() {
 }
 
 func hostQuit() {
-	h := appHost
+	h := appHost.Load()
 	if h == nil || h.quitting {
 		return
 	}
@@ -511,29 +535,30 @@ func hostQuit() {
 	// the window does not freeze; it exits only after capture stopped and
 	// the kill switch blocked proxied apps.
 	trayRemove()
-	if h.hwnd != 0 {
-		pShowWindow.Call(h.hwnd, swHide)
-	}
-	exit := func() {
-		if h.w != nil {
-			h.w.Terminate()
-		}
-		if h.hwnd != 0 {
-			pPostMessage.Call(h.hwnd, wmClose, 0, 0)
-		}
+	hwnd := h.hwnd.Load()
+	if hwnd != 0 {
+		pShowWindow.Call(hwnd, swHide)
 	}
 	if h.w == nil {
 		if h.ctrl != nil {
 			h.ctrl.shutdown()
 		}
-		exit()
+		if hwnd != 0 {
+			pPostMessage.Call(hwnd, wmClose, 0, 0)
+		}
 		return
 	}
 	go func() {
 		if h.ctrl != nil {
 			h.ctrl.shutdown()
 		}
-		h.w.Dispatch(exit)
+		// PostMessageW to the window itself survives modal loops (such as
+		// GetOpenFileNameW), unlike thread-posted w.Dispatch callbacks.
+		if hwnd != 0 {
+			pPostMessage.Call(hwnd, wmQuitDone, 0, 0)
+		} else {
+			h.w.Dispatch(func() { h.w.Terminate() })
+		}
 	}()
 }
 
@@ -555,8 +580,8 @@ func styleWindow(hwnd uintptr) {
 	var saved *windowState
 	var hasPos bool
 	var maxed bool
-	if appHost != nil {
-		saved = loadWindowState(appHost.windowFile())
+	if cur := appHost.Load(); cur != nil {
+		saved = loadWindowState(cur.windowFile())
 	}
 	if saved != nil {
 		w, h = saved.W, saved.H
@@ -589,11 +614,11 @@ func styleWindow(hwnd uintptr) {
 		}
 	}
 	pSetWindowPos.Call(hwnd, 0, uintptr(x), uintptr(y), uintptr(ow), uintptr(oh), swpNoZOrder|swpFrameChanged)
-	if appHost != nil {
-		appHost.noteNormal()
+	if cur := appHost.Load(); cur != nil {
+		cur.noteNormal()
 		if maxed {
 			pShowWindow.Call(hwnd, swMaximize)
-			appHost.maximized = true
+			cur.maximized = true
 		}
 		logWindowMetrics(hwnd, dpi, w, h)
 	}
@@ -618,16 +643,20 @@ func loadWindowState(path string) *windowState {
 }
 
 func (h *host) noteNormal() {
-	if h == nil || h.hwnd == 0 {
+	if h == nil {
 		return
 	}
-	h.maximized = windowMaximized(h.hwnd)
-	iconic, _, _ := pIsIconic.Call(h.hwnd)
+	hwnd := h.hwnd.Load()
+	if hwnd == 0 {
+		return
+	}
+	h.maximized = windowMaximized(hwnd)
+	iconic, _, _ := pIsIconic.Call(hwnd)
 	if h.maximized || iconic != 0 {
 		return
 	}
 	var wr Rect
-	pGetWindowRect.Call(h.hwnd, uintptr(unsafe.Pointer(&wr)))
+	pGetWindowRect.Call(hwnd, uintptr(unsafe.Pointer(&wr)))
 	runtime.KeepAlive(&wr)
 	w, ht := wr.Right-wr.Left, wr.Bottom-wr.Top
 	if w < 1 || ht < 1 {
@@ -635,7 +664,7 @@ func (h *host) noteNormal() {
 	}
 	h.normalX, h.normalY = wr.Left, wr.Top
 	h.normalW, h.normalH = w, ht
-	h.normalDPI = windowDPI(h.hwnd)
+	h.normalDPI = windowDPI(hwnd)
 }
 
 func (h *host) saveWindow() {
@@ -646,7 +675,7 @@ func (h *host) saveWindow() {
 	if dpi < 96 {
 		dpi = 96
 	}
-	fx, fy := frameSize(h.hwnd)
+	fx, fy := frameSize(h.hwnd.Load())
 	cw, ch := h.normalW-fx, h.normalH-fy
 	if cw < 1 {
 		cw = h.normalW
@@ -714,14 +743,15 @@ func applyMinMax(hwnd, lp uintptr) {
 }
 
 func logWindowMetrics(hwnd uintptr, dpi, dipW, dipH int32) {
-	if appHost == nil || appHost.logs == nil {
+	cur := appHost.Load()
+	if cur == nil || cur.logs == nil {
 		return
 	}
 	fx, fy := frameSize(hwnd)
 	minW := dipToPx(minWindowDIPW, dpi) + fx
 	minH := dipToPx(minWindowDIPH, dpi) + fy
 	_, work := monitorAreas(hwnd)
-	appHost.logs.Add(logbuf.Event{
+	cur.logs.Add(logbuf.Event{
 		Process: "ashgate",
 		Proto:   "UI",
 		Dest: fmt.Sprintf("dpi=%d min=%dx%dDIP (%dx%dpx) maxTrack=none maximize=%dx%dpx size=%dx%dDIP",
@@ -1223,7 +1253,7 @@ func dismissBlankWebView() {
 }
 
 func toggleEngine() {
-	h := appHost
+	h := appHost.Load()
 	if h == nil || h.ctrl == nil {
 		return
 	}
@@ -1239,7 +1269,7 @@ func toggleEngine() {
 		h.ctrl.errText = err.Error()
 		h.ctrl.mu.Unlock()
 	}
-	if h.hwnd != 0 {
-		pPostMessage.Call(h.hwnd, wmTimer, 0, 0)
+	if hwnd := h.hwnd.Load(); hwnd != 0 {
+		pPostMessage.Call(hwnd, wmTimer, 0, 0)
 	}
 }

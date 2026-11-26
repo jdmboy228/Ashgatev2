@@ -3,6 +3,7 @@ package rules
 
 import (
 	"strings"
+	"unicode/utf8"
 
 	"ashgate/internal/config"
 )
@@ -95,6 +96,9 @@ func (s *Set) Match(p Process) Decision {
 	if r, ok := s.first(p); ok {
 		return r.decision("")
 	}
+	if IsShellOrSystem(p) {
+		return Decision{RuleIndex: -1}
+	}
 	for _, a := range p.Parents {
 		if IsShellOrSystem(a) {
 			break
@@ -129,25 +133,39 @@ func (r compiled) matches(name, path string) bool {
 }
 
 // Glob matches s against pattern, where '*' is any run of characters and
-// '?' is one character. Both are already lower-case.
+// '?' is one character (UTF-8 rune). Both are already lower-case.
 func Glob(pattern, s string) bool {
 	px, sx := 0, 0
 	star, mark := -1, 0
 	for sx < len(s) {
-		switch {
-		case px < len(pattern) && (pattern[px] == '?' || pattern[px] == s[sx]):
-			px++
-			sx++
-		case px < len(pattern) && pattern[px] == '*':
+		if px < len(pattern) && pattern[px] == '*' {
 			star, mark = px, sx
 			px++
-		case star >= 0:
-			px = star + 1
-			mark++
-			sx = mark
-		default:
-			return false
+			continue
 		}
+		if px < len(pattern) && pattern[px] == '?' {
+			_, sz := utf8.DecodeRuneInString(s[sx:])
+			px++
+			sx += sz
+			continue
+		}
+		if px < len(pattern) {
+			pr, psz := utf8.DecodeRuneInString(pattern[px:])
+			sr, ssz := utf8.DecodeRuneInString(s[sx:])
+			if pr == sr {
+				px += psz
+				sx += ssz
+				continue
+			}
+		}
+		if star >= 0 {
+			_, sz := utf8.DecodeRuneInString(s[mark:])
+			mark += sz
+			px = star + 1
+			sx = mark
+			continue
+		}
+		return false
 	}
 	for px < len(pattern) && pattern[px] == '*' {
 		px++
@@ -160,13 +178,13 @@ func (s *Set) first(p Process) (compiled, bool) {
 	if name == "" {
 		name = Base(p.Path)
 	}
+	// Never match the Windows service host: svchost carries system traffic
+	// for every program (see dns.systemResolver).
+	if name == "svchost.exe" {
+		return compiled{}, false
+	}
 	path := NormalizePath(p.Path)
 	for _, r := range s.rules {
-		// A mask never takes the Windows service host: svchost carries
-		// system traffic for every program (see dns.systemResolver).
-		if r.glob && name == "svchost.exe" {
-			continue
-		}
 		if r.matches(name, path) {
 			return r, true
 		}

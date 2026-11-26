@@ -143,6 +143,9 @@ type tcpConn struct {
 	reading  bool
 	rdl, wdl time.Time
 	rtimer   *time.Timer
+	writing  bool
+	wlate    bool
+	wtimer   *time.Timer
 	failed   error
 	once     sync.Once
 }
@@ -211,36 +214,35 @@ func (c *tcpConn) Direct() bool { return c.direct.Load() }
 
 func (c *tcpConn) Write(p []byte) (int, error) {
 	c.mu.Lock()
-	closed, wdl := c.closed, c.wdl
-	c.mu.Unlock()
-	if closed {
+	if c.closed {
+		c.mu.Unlock()
 		return 0, net.ErrClosed
 	}
 	if len(p) == 0 {
+		c.mu.Unlock()
 		return 0, nil
 	}
-	if passed(wdl) {
+	if passed(c.wdl) {
+		c.mu.Unlock()
 		return 0, timeout("write")
 	}
-	var late atomic.Bool
-	if !wdl.IsZero() {
-		// The pipe blocks a write only while Xray has a full buffer
-		// queued. Nobody can tell how much of p went, so a deadline then
-		// breaks the upload.
-		t := time.AfterFunc(time.Until(wdl), func() {
-			late.Store(true)
-			common.Interrupt(c.w)
-		})
-		defer t.Stop()
-	}
-	if err := c.w.WriteMultiBuffer(buf.MergeBytes(nil, p)); err != nil {
-		c.mu.Lock()
-		closed := c.closed
-		c.mu.Unlock()
+	// The pipe blocks a write only while Xray has a full buffer queued.
+	// Nobody can tell how much of p went, so a deadline then breaks the
+	// upload. The write timer acts only while writing is set, under mu, so
+	// it cannot interrupt a Write that has finished.
+	c.writing, c.wlate = true, false
+	c.mu.Unlock()
+	err := c.w.WriteMultiBuffer(buf.MergeBytes(nil, p))
+	c.mu.Lock()
+	c.writing = false
+	closed, late := c.closed, c.wlate
+	c.wlate = false
+	c.mu.Unlock()
+	if err != nil {
 		switch {
 		case closed:
 			return 0, net.ErrClosed
-		case late.Load():
+		case late:
 			return 0, timeout("write")
 		}
 		return 0, err
@@ -261,6 +263,9 @@ func (c *tcpConn) Close() error {
 		c.closed = true
 		if c.rtimer != nil {
 			c.rtimer.Stop()
+		}
+		if c.wtimer != nil {
+			c.wtimer.Stop()
 		}
 		c.mu.Unlock()
 		c.cancel()
@@ -312,7 +317,31 @@ func (c *tcpConn) SetWriteDeadline(t time.Time) error {
 		return net.ErrClosed
 	}
 	c.wdl = t
+	if c.wtimer != nil {
+		c.wtimer.Stop()
+		c.wtimer = nil
+	}
+	switch {
+	case t.IsZero():
+	case passed(t):
+		c.interruptWriteLocked()
+	default:
+		c.wtimer = time.AfterFunc(time.Until(t), func() {
+			c.mu.Lock()
+			c.interruptWriteLocked()
+			c.mu.Unlock()
+		})
+	}
 	return nil
+}
+
+// interruptWriteLocked breaks a Write blocked in the pipe; with none in
+// progress it does nothing.
+func (c *tcpConn) interruptWriteLocked() {
+	if c.writing && !c.closed {
+		c.wlate = true
+		common.Interrupt(c.w)
+	}
 }
 
 // wakeLocked makes a Read blocked in the pipe return errWake. Only this
@@ -666,10 +695,10 @@ type gatedConn struct {
 	got   atomic.Bool // the server's first bytes came; set under g.mu
 }
 
-func (c *gatedConn) release() {
+func (c *gatedConn) release(failed bool) {
 	c.once.Do(func() {
 		c.timer.Stop()
-		c.g.release(false)
+		c.g.release(failed)
 	})
 }
 
@@ -678,12 +707,12 @@ func (c *gatedConn) Read(p []byte) (int, error) {
 	if n > 0 && !c.got.Load() {
 		c.g.answered(c)
 	}
-	c.release()
+	c.release(err != nil && !c.got.Load())
 	return n, err
 }
 
 func (c *gatedConn) Close() error {
-	c.release()
+	c.release(false)
 	return c.Conn.Close()
 }
 

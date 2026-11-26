@@ -26,6 +26,8 @@ type Status struct {
 	PubPass string `json:"pass,omitempty"`
 	Err     string `json:"error,omitempty"`
 	Up      bool   `json:"up"`
+	// Server is the VLESS server's host:port the bridge dials.
+	Server string `json:"-"`
 }
 
 // Endpoint is one VLESS proxy the manager should keep running.
@@ -144,7 +146,7 @@ func statusOf(b *Bridge) Status {
 	if b == nil || b.Addr == "" {
 		return Status{}
 	}
-	st := Status{SOCKS: b.Addr, User: b.User, Pass: b.Pass, Published: b.Published, HTTP: b.HTTP, Up: true}
+	st := Status{SOCKS: b.Addr, User: b.User, Pass: b.Pass, Published: b.Published, HTTP: b.HTTP, Up: true, Server: b.server}
 	if b.Generated {
 		st.PubUser, st.PubPass = b.PubUser, b.PubPass
 	}

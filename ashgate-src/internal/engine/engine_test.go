@@ -635,13 +635,15 @@ func TestUDPDialBacksOff(t *testing.T) {
 func TestChildProcessIsProxied(t *testing.T) {
 	child := rules.Process{PID: 77, Name: "helper.exe", Parents: []rules.Process{{PID: 76, Name: "curl.exe"}}}
 	e, _ := newEngine(t, testConfig(), fixedRes{p: child, ok: true}, &fakeDial{}, nil)
-	pkt, _ := packet.BuildTCP(packet.V4(10, 0, 0, 2, 3100), packet.V4(1, 2, 3, 4, 443), 0x02)
+	src := packet.V4(10, 0, 0, 2, 3100)
+	dst := packet.V4(1, 2, 3, 4, 443)
+	pkt, _ := packet.BuildTCP(src, dst, 0x02)
 	res := e.HandlePacket(pkt, Meta{}, true)
 	if res.Action != ActionModified {
 		t.Fatalf("child of a proxied app went %v", res.Action)
 	}
 	e.mu.Lock()
-	flow := e.byClient[packet.V4(10, 0, 0, 2, 3100)]
+	flow := e.byClient[tcpKey{Src: src, Dst: dst}]
 	e.mu.Unlock()
 	if flow == nil || flow.proxy.Name != "socks" || flow.parent != "curl.exe" {
 		t.Fatalf("flow %+v", flow)
@@ -892,7 +894,7 @@ func TestLatePacketsOfClosedFlowAreDropped(t *testing.T) {
 		t.Fatalf("SYN went %v", r.Action)
 	}
 	e.mu.Lock()
-	flow := e.byClient[app]
+	flow := e.byClient[tcpKey{Src: app, Dst: dst}]
 	e.mu.Unlock()
 	if flow == nil {
 		t.Fatal("no flow")

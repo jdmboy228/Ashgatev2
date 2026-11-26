@@ -139,14 +139,13 @@ type ICoreWebView2 struct {
 }
 
 func (i *ICoreWebView2) GetSettings() (*ICoreWebViewSettings, error) {
-	var err error
 	var settings *ICoreWebViewSettings
-	_, _, err = i.vtbl.GetSettings.Call(
+	hr, _, _ := i.vtbl.GetSettings.Call(
 		uintptr(unsafe.Pointer(i)),
 		uintptr(unsafe.Pointer(&settings)),
 	)
-	if err != windows.ERROR_SUCCESS {
-		return nil, err
+	if int32(hr) < 0 {
+		return nil, windows.Errno(hr)
 	}
 	return settings, nil
 }

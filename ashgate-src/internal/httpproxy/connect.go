@@ -136,14 +136,19 @@ func handshake(conn net.Conn, p config.Proxy, host string, port uint16) error {
 func readStatus(r io.Reader) (int, string, error) {
 	buf := make([]byte, 0, 512)
 	tmp := make([]byte, 1)
+	found := false
 	for len(buf) < 64*1024 {
 		if _, err := io.ReadFull(r, tmp); err != nil {
 			return 0, "", err
 		}
 		buf = append(buf, tmp[0])
 		if len(buf) >= 4 && string(buf[len(buf)-4:]) == "\r\n\r\n" {
+			found = true
 			break
 		}
+	}
+	if !found {
+		return 0, "", errors.New("http proxy: CONNECT response header too large")
 	}
 	if len(buf) < 12 {
 		return 0, "", errors.New("http proxy: short CONNECT response")

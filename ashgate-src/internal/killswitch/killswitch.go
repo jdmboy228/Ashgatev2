@@ -49,6 +49,7 @@ func New(state string) *Firewall {
 			for _, p := range list {
 				// The file is outside this process's control; a quote in
 				// a path would inject arguments into the netsh command line.
+				p = normalizePath(p)
 				if valid(p) {
 					f.cur[strings.ToLower(p)] = p
 				}
@@ -79,6 +80,7 @@ func (f *Firewall) Block(paths []string) error {
 	defer f.mu.Unlock()
 	want := map[string]string{}
 	for _, p := range paths {
+		p = normalizePath(p)
 		if valid(p) {
 			want[strings.ToLower(p)] = p
 		}
@@ -98,7 +100,10 @@ func (f *Firewall) Block(paths []string) error {
 		if _, ok := want[k]; ok {
 			continue
 		}
-		f.del(p)
+		if err := f.del(p); err != nil {
+			errs = append(errs, err)
+			continue
+		}
 		delete(f.cur, k)
 	}
 	if err := f.saveLocked(); err != nil {
@@ -117,12 +122,32 @@ func (f *Firewall) Unblock() error {
 		if errors.Is(err, ErrUnsupported) {
 			return err
 		}
-		if !isNoRulesError(err) {
+		if !f.noRules(err, "") {
 			return err
 		}
 	}
 	clear(f.cur)
 	return f.saveLocked()
+}
+
+// noRules reports whether a failed delete means no matching firewall rule
+// exists (locale-independent fallback via `show rule` when the text is not a
+// known English/Russian message).
+func (f *Firewall) noRules(err error, program string) bool {
+	if err == nil {
+		return false
+	}
+	if isNoRulesError(err) {
+		return true
+	}
+	show := `advfirewall firewall show rule name="` + RuleName + `"`
+	if program != "" {
+		show += ` program="` + program + `"`
+	}
+	if serr := f.run(show); serr != nil && !errors.Is(serr, ErrUnsupported) {
+		return true
+	}
+	return false
 }
 
 // isNoRulesError reports netsh's response when no firewall rules exist with
@@ -142,16 +167,19 @@ func (f *Firewall) add(path string) error {
 		line := `advfirewall firewall add rule name="` + RuleName + `" dir=` + dir +
 			` action=block enable=yes profile=any program="` + path + `"`
 		if err := f.run(line); err != nil {
-			f.del(path)
+			_ = f.del(path)
 			return err
 		}
 	}
 	return nil
 }
 
-func (f *Firewall) del(path string) {
-	// netsh fails when nothing matches; that is the wanted end state.
-	_ = f.run(`advfirewall firewall delete rule name="` + RuleName + `" program="` + path + `"`)
+func (f *Firewall) del(path string) error {
+	err := f.run(`advfirewall firewall delete rule name="` + RuleName + `" program="` + path + `"`)
+	if err != nil && !f.noRules(err, path) {
+		return err
+	}
+	return nil
 }
 
 func (f *Firewall) listLocked() []string {
@@ -175,12 +203,21 @@ func (f *Firewall) saveLocked() error {
 	return atomicfile.Write(f.state, data)
 }
 
-// valid accepts absolute Windows paths to an .exe. A quote would break the
-// netsh command line, and Windows paths cannot contain one.
+func normalizePath(p string) string {
+	p = strings.TrimSpace(p)
+	if p == "" {
+		return ""
+	}
+	return filepath.FromSlash(filepath.Clean(p))
+}
+
+// valid accepts absolute Windows paths to an .exe with backslash separators.
+// A quote would break the netsh command line, and Windows paths cannot contain
+// one.
 func valid(p string) bool {
 	low := strings.ToLower(p)
-	return strings.HasSuffix(low, ".exe") && len(p) > 3 && p[1] == ':' && (p[2] == '\\' || p[2] == '/') &&
-		!strings.ContainsAny(p, "\"\r\n")
+	return strings.HasSuffix(low, ".exe") && len(p) > 3 && p[1] == ':' && p[2] == '\\' &&
+		!strings.ContainsAny(p, "\"\r\n/")
 }
 
 // NewWithRunner is New with a custom netsh runner. Tests use it.

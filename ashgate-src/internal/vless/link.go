@@ -71,7 +71,7 @@ func ParseLink(raw string) (Parsed, error) {
 	if port == "" {
 		port = "443"
 	}
-	if _, err := net.LookupPort("tcp", port); err != nil {
+	if n, err := net.LookupPort("tcp", port); err != nil || n < 1 || n > 65535 {
 		return Parsed{}, badLink("неверный порт")
 	}
 	q := u.Query()

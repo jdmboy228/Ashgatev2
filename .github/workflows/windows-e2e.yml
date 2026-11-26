@@ -64,11 +64,20 @@ jobs:
       - name: Versions agree
         run: |
           $v = (Select-String ashgate-src/internal/version/version.go -Pattern 'const Version = "([^"]+)"').Matches[0].Groups[1].Value
-          $m = (Get-Content -Raw ashgate-src/winres/winres.json | ConvertFrom-Json).RT_MANIFEST.'#1'.'0409'.identity.version
+          $w = Get-Content -Raw ashgate-src/winres/winres.json | ConvertFrom-Json
+          $m = $w.RT_MANIFEST.'#1'.'0409'.identity.version
+          $ff = $w.RT_VERSION.'#1'.'0000'.fixed.file_version
+          $fp = $w.RT_VERSION.'#1'.'0000'.fixed.product_version
+          $if = $w.RT_VERSION.'#1'.'0000'.info.'0409'.FileVersion
+          $ip = $w.RT_VERSION.'#1'.'0000'.info.'0409'.ProductVersion
           $j = (Get-Content -Raw version.json | ConvertFrom-Json).version
           Write-Host "version.go $v · winres.json $m · version.json $j"
           if ($j -ne $v) { throw "version.json $j differs from version.go $v" }
-          if ($m -notlike "$v*") { throw "winres.json manifest identity $m differs from version.go $v" }
+          if ($m -ne "$v.0") { throw "winres.json manifest identity $m differs from $v.0" }
+          if ($ff -ne "$v.0") { throw "winres.json fixed.file_version $ff differs from $v.0" }
+          if ($fp -ne "$v.0") { throw "winres.json fixed.product_version $fp differs from $v.0" }
+          if ($if -ne $v) { throw "winres.json info.FileVersion $if differs from $v" }
+          if ($ip -ne $v) { throw "winres.json info.ProductVersion $ip differs from $v" }
       - name: Build e2e binaries
         working-directory: ashgate-src
         run: |

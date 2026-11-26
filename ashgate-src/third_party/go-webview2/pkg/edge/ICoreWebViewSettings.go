@@ -169,38 +169,35 @@ func (i *ICoreWebViewSettings) GetAreDevToolsEnabled() (bool, error) {
 }
 
 func (i *ICoreWebViewSettings) PutAreDevToolsEnabled(areDevToolsEnabled bool) error {
-	var err error
-	_, _, err = i.vtbl.PutAreDevToolsEnabled.Call(
+	hr, _, _ := i.vtbl.PutAreDevToolsEnabled.Call(
 		uintptr(unsafe.Pointer(i)),
 		uintptr(boolToInt(areDevToolsEnabled)),
 	)
-	if err != windows.ERROR_SUCCESS {
-		return err
+	if int32(hr) < 0 {
+		return windows.Errno(hr)
 	}
 	return nil
 }
 
 func (i *ICoreWebViewSettings) GetAreDefaultContextMenusEnabled() (bool, error) {
-	var err error
 	var enabled bool
-	_, _, err = i.vtbl.GetAreDefaultContextMenusEnabled.Call(
+	hr, _, _ := i.vtbl.GetAreDefaultContextMenusEnabled.Call(
 		uintptr(unsafe.Pointer(i)),
 		uintptr(unsafe.Pointer(&enabled)),
 	)
-	if err != windows.ERROR_SUCCESS {
-		return false, err
+	if int32(hr) < 0 {
+		return false, windows.Errno(hr)
 	}
 	return enabled, nil
 }
 
 func (i *ICoreWebViewSettings) PutAreDefaultContextMenusEnabled(enabled bool) error {
-	var err error
-	_, _, err = i.vtbl.PutAreDefaultContextMenusEnabled.Call(
+	hr, _, _ := i.vtbl.PutAreDefaultContextMenusEnabled.Call(
 		uintptr(unsafe.Pointer(i)),
 		uintptr(boolToInt(enabled)),
 	)
-	if err != windows.ERROR_SUCCESS {
-		return err
+	if int32(hr) < 0 {
+		return windows.Errno(hr)
 	}
 	return nil
 }

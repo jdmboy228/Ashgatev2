@@ -134,8 +134,28 @@ func TestGroupAndKillSwitchSettings(t *testing.T) {
 }
 
 func TestMaskSkipsServiceHost(t *testing.T) {
-	s := Compile([]config.Rule{{Process: "svc*", Action: "proxy", Proxy: "v"}})
+	s := Compile([]config.Rule{
+		{Process: "svc*", Action: "proxy", Proxy: "v"},
+		{Process: "svchost.exe", Action: "proxy", Proxy: "v"},
+	})
 	if d := s.Match(Process{Name: "svchost.exe", Path: `C:\Windows\System32\svchost.exe`}); d.Action != "" {
-		t.Fatalf("mask caught svchost: %+v", d)
+		t.Fatalf("rule caught svchost: %+v", d)
+	}
+}
+
+func TestGlobUTF8QuestionMark(t *testing.T) {
+	if !Glob("п?ивет", "привет") {
+		t.Fatal("? did not match 2-byte UTF-8 rune")
+	}
+	if Glob("п?вет", "привет") {
+		t.Fatal("? matched two runes")
+	}
+}
+
+func TestShellOrSystemDoesNotInheritParentRule(t *testing.T) {
+	s := Compile([]config.Rule{{Process: "code.exe", Action: "proxy", Proxy: "v"}})
+	p := Process{Name: "explorer.exe", Parents: []Process{{Name: "code.exe"}}}
+	if d := s.Match(p); d.Action != "" {
+		t.Fatalf("shell process inherited parent rule: %+v", d)
 	}
 }

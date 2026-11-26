@@ -127,6 +127,9 @@ func parse4(pkt []byte, h *Header) error {
 		return errors.New("packet: bad ipv4 header length")
 	}
 	total := int(binary.BigEndian.Uint16(pkt[2:4]))
+	if total == 0 {
+		total = len(pkt)
+	}
 	if total < ihl || total > len(pkt) {
 		return errors.New("packet: bad ipv4 total length")
 	}
@@ -251,9 +254,14 @@ func parseL4(pkt []byte, h *Header, off, end int) error {
 		h.Src.Port = binary.BigEndian.Uint16(pkt[off : off+2])
 		h.Dst.Port = binary.BigEndian.Uint16(pkt[off+2 : off+4])
 		h.PayloadOff = off + 8
-		h.PayloadLen = end - h.PayloadOff
-		if h.PayloadLen < 0 {
-			return errors.New("packet: bad udp length")
+		if h.Frag {
+			h.PayloadLen = end - h.PayloadOff
+		} else {
+			udpLen := int(binary.BigEndian.Uint16(pkt[off+4 : off+6]))
+			if udpLen < 8 || off+udpLen > end {
+				return errors.New("packet: bad udp length")
+			}
+			h.PayloadLen = udpLen - 8
 		}
 		return nil
 	default:
@@ -270,6 +278,9 @@ func Rewrite(pkt []byte, h *Header, src, dst Addr) error {
 	if h.Ver == 4 {
 		if src.Len != 4 || dst.Len != 4 {
 			return errors.New("packet: ipv4 rewrite requires ipv4 addresses")
+		}
+		if binary.BigEndian.Uint16(pkt[2:4]) == 0 && len(pkt) <= 65535 {
+			binary.BigEndian.PutUint16(pkt[2:4], uint16(len(pkt)))
 		}
 		copy(pkt[12:16], src.IP[:4])
 		copy(pkt[16:20], dst.IP[:4])

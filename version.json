@@ -1,5 +1,5 @@
 {
-  "version": "0.9.7",
+  "version": "0.9.8",
   "download_url": "https://github.com/jdmboy228/Ashgatev2/releases/latest",
-  "release_notes": "Закрыты критические уязвимости и баги стабильности: белый список параметров XHTTP extra в VLESS, устранение утечки сокетов/горутин в TCP splice и гонок ObserveFlow/start(), защита от TOCTOU-удаления через os.OpenRoot, похендловая защита ACL в secureDir, строгий поиск WebView2 из HKLM, защита от OOM в windowPIDs и UNC-утечек в ExeIconPNG."
+  "release_notes": "Комплексное исправление оставшихся Medium и Low замечаний аудита: защита config.json от чтения без прав администратора, инкрементальное обновление таблицы журнала и кэш иконок без токена в URL, IPv6 DoH и DoQ, TCP NAT по (Src,Dst), оптимизация горячего пути, исправления VLESS/SOCKS5/HTTP/bootstrap/Kill Switch/autostart/go-webview2 и скриптов сборки."
 }

@@ -151,13 +151,14 @@ func start(parent context.Context, cfg *config.Config, logs *logbuf.Buffer, brid
 	// Up to 16 batches (1024 packets) wait for consume; the driver's
 	// queue holds the rest.
 	pkts := make(chan netBatch, 16)
+	recycle := make(chan netBatch, 18)
 	wg.Add(1)
-	go recvNet(ctx, cancel, s, netH, pkts, &wg)
+	go recvNet(ctx, cancel, s, netH, pkts, recycle, &wg)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		defer udp.close()
-		consume(ctx, newCapture(eng, div, udp), pkts)
+		consume(ctx, newCapture(eng, div, udp), pkts, recycle)
 	}()
 	wg.Add(1)
 	go acceptLoop(ctx, ln4, eng, &wg)
@@ -179,7 +180,7 @@ func start(parent context.Context, cfg *config.Config, logs *logbuf.Buffer, brid
 			bridges.Close()
 		}
 		eng.SetInjector(nil)
-		_ = netH.Shutdown(windivert.ShutdownBoth)
+		_ = netH.Shutdown(windivert.ShutdownRecv)
 		_ = sockH.Shutdown(windivert.ShutdownBoth)
 		_ = flowH.Shutdown(windivert.ShutdownBoth)
 		_ = ln4.Close()
@@ -187,6 +188,7 @@ func start(parent context.Context, cfg *config.Config, logs *logbuf.Buffer, brid
 			_ = ln6.Close()
 		}
 		wg.Wait()
+		_ = netH.Shutdown(windivert.ShutdownBoth)
 		eng.Wait()
 		res.Close()
 		_ = div.close()
@@ -243,8 +245,8 @@ func readEvents(ctx context.Context, cancel context.CancelFunc, s *Session, what
 }
 
 // recvNet reads up to recvBatch packets per call into one reused buffer.
-// Each batch is copied once, and its packets are slices of that copy.
-func recvNet(ctx context.Context, cancel context.CancelFunc, s *Session, h windivert.Handle, out chan<- netBatch, wg *sync.WaitGroup) {
+// Each batch is copied into a recycled buffer, and its packets are slices of that copy.
+func recvNet(ctx context.Context, cancel context.CancelFunc, s *Session, h windivert.Handle, out chan<- netBatch, recycle <-chan netBatch, wg *sync.WaitGroup) {
 	defer wg.Done()
 	defer close(out)
 	buf := make([]byte, recvBatch*windivert.MTUMax)
@@ -261,10 +263,19 @@ func recvNet(ctx context.Context, cancel context.CancelFunc, s *Session, h windi
 		if n == 0 || count == 0 {
 			continue
 		}
-		data := make([]byte, n)
-		copy(data, buf[:n])
-		b := netBatch{pkts: windivert.SplitBatch(data, count, make([][]byte, 0, count))}
-		b.addrs = append([]windivert.Address(nil), addrs[:len(b.pkts)]...)
+		var b netBatch
+		select {
+		case b = <-recycle:
+		default:
+		}
+		if cap(b.buf) < n {
+			b.buf = make([]byte, n)
+		} else {
+			b.buf = b.buf[:n]
+		}
+		copy(b.buf, buf[:n])
+		b.pkts = windivert.SplitBatch(b.buf, count, b.pkts[:0])
+		b.addrs = append(b.addrs[:0], addrs[:len(b.pkts)]...)
 		select {
 		case out <- b:
 		case <-ctx.Done():

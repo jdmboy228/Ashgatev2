@@ -11,6 +11,8 @@ rem folder name (C:\Users\O'Neil) would break or inject the command.
 set "ASHGATE_UPDATE_SELF=%~f0"
 set "ASHGATE_UPDATE_TARGET=%~1"
 if "%~1"=="" goto :elevate
+powershell -NoProfile -Command "if ($env:ASHGATE_UPDATE_TARGET -match '[\x22\x26\x7c\x25\x3c\x3e\x00-\x1f\x7f]') { exit 1 }"
+if errorlevel 1 goto :badtarget
 powershell -NoProfile -Command "Start-Process -FilePath $env:ASHGATE_UPDATE_SELF -ArgumentList ('\"' + $env:ASHGATE_UPDATE_TARGET + '\"') -Verb RunAs"
 exit /b
 :elevate
@@ -19,11 +21,16 @@ exit /b
 :admin
 set "ASHGATE_UPDATE_SELF=%~f0"
 set "ASHGATE_UPDATE_TARGET=%~1"
+if not "%~1"=="" powershell -NoProfile -Command "if ($env:ASHGATE_UPDATE_TARGET -match '[\x22\x26\x7c\x25\x3c\x3e\x00-\x1f\x7f]') { exit 1 }"
+if errorlevel 1 goto :badtarget
 powershell -NoProfile -ExecutionPolicy Bypass -Command "Invoke-Expression ([IO.File]::ReadAllText($env:ASHGATE_UPDATE_SELF, [Text.Encoding]::UTF8))"
 set "rc=%errorlevel%"
 echo.
 pause
 exit /b %rc%
+:badtarget
+echo Invalid target path.
+exit /b 1
 #>
 
 # ---------------------------------------------------------------------------
@@ -140,10 +147,6 @@ Info "Готово: $stage\ashgate.exe"
 Step 4 "Ищу установленный Ashgate"
 $target = $env:ASHGATE_UPDATE_TARGET
 $how = 'указана при запуске'
-if (-not $target) {
-  $p = Get-Process -Name ashgate -ErrorAction SilentlyContinue | Where-Object { $_.Path } | Select-Object -First 1
-  if ($p) { $target = Split-Path -Parent $p.Path; $how = 'работающая копия' }
-}
 $svc = Get-CimInstance Win32_Service -Filter "Name='Ashgate'" -ErrorAction SilentlyContinue
 if (-not $target -and $svc) {
   $exe = $svc.PathName
@@ -156,6 +159,14 @@ if (-not $target) {
     $exe = $task.Actions[0].Execute.Trim('"')
     if (Test-Path $exe) { $target = Split-Path -Parent $exe; $how = 'задача «Запускать с Windows»' }
   }
+}
+if (-not $target) {
+  $pfDir = Join-Path $env:ProgramFiles 'Ashgate'
+  if (Test-Path (Join-Path $pfDir 'ashgate.exe')) { $target = $pfDir; $how = 'Program Files' }
+}
+if (-not $target) {
+  $p = Get-Process -Name ashgate -ErrorAction SilentlyContinue | Where-Object { $_.Path } | Select-Object -First 1
+  if ($p) { $target = Split-Path -Parent $p.Path; $how = 'работающая копия' }
 }
 if (-not $target) { $target = Join-Path $src 'dist'; $how = 'папка сборки' }
 $target = [IO.Path]::GetFullPath($target)

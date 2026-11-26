@@ -45,6 +45,7 @@ const (
 // Resolver looks up host names over DoH and caches the answers.
 type Resolver struct {
 	mu      sync.Mutex
+	writeMu sync.Mutex
 	servers []string
 	cache   map[string]entry
 	file    string
@@ -120,7 +121,7 @@ func (r *Resolver) LookupIP(ctx context.Context, host string) ([]net.IP, error) 
 	r.mu.Unlock()
 	now := r.now()
 	if ok && now.Before(cached.Until) {
-		return cached.IPs, nil
+		return append([]net.IP(nil), cached.IPs...), nil
 	}
 	if len(servers) == 0 {
 		servers = DefaultServers
@@ -139,7 +140,7 @@ func (r *Resolver) LookupIP(ctx context.Context, host string) ([]net.IP, error) 
 		return ips, nil
 	}
 	if ok && now.Sub(cached.At) < staleFor {
-		return cached.IPs, nil
+		return append([]net.IP(nil), cached.IPs...), nil
 	}
 	return nil, fmt.Errorf("DoH не ответил: %s", strings.Join(errs, "; "))
 }
@@ -167,6 +168,7 @@ func (r *Resolver) ask(ctx context.Context, url, host string) ([]net.IP, time.Du
 		err error
 	}
 	out := make(chan res, 2)
+	var v4, v6 []net.IP
 	for _, t := range []dnsmessage.Type{dnsmessage.TypeA, dnsmessage.TypeAAAA} {
 		go func(t dnsmessage.Type) {
 			ips, ttl, err := r.query(ctx, url, host, t)
@@ -186,11 +188,18 @@ func (r *Resolver) ask(ctx context.Context, url, host string) ([]net.IP, time.Du
 			continue
 		}
 		answered = true
-		ips = append(ips, x.ips...)
+		for _, ip := range x.ips {
+			if ip.To4() != nil {
+				v4 = append(v4, ip)
+			} else {
+				v6 = append(v6, ip)
+			}
+		}
 		if len(x.ips) > 0 && x.ttl < ttl {
 			ttl = x.ttl
 		}
 	}
+	ips = append(v4, v6...)
 	if !answered {
 		return nil, 0, firstErr
 	}
@@ -293,6 +302,8 @@ func parseAnswer(raw []byte, t dnsmessage.Type) ([]net.IP, time.Duration, error)
 func (r *Resolver) store(host string, ips []net.IP, ttl time.Duration) {
 	ttl = max(minTTL, min(ttl, maxTTL))
 	now := r.now()
+	r.writeMu.Lock()
+	defer r.writeMu.Unlock()
 	r.mu.Lock()
 	r.cache[host] = entry{IPs: ips, Until: now.Add(ttl), At: now}
 	file := r.file
@@ -340,7 +351,12 @@ func Dial(ctx context.Context, network, addr string) (net.Conn, error) {
 	var d net.Dialer
 	var last error
 	for _, ip := range ips {
-		c, err := d.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
+		dctx, cancel := ctx, context.CancelFunc(func() {})
+		if len(ips) > 1 {
+			dctx, cancel = context.WithTimeout(ctx, 5*time.Second)
+		}
+		c, err := d.DialContext(dctx, network, net.JoinHostPort(ip.String(), port))
+		cancel()
 		if err == nil {
 			return c, nil
 		}

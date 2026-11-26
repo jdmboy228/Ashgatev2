@@ -88,13 +88,16 @@ func sharedPath() string {
 // the folder for them ("Открыть папку").
 const sharedDirSDDL = "O:BAD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"
 
-// ownerReadACE is the extra entry for the user running the elevated window.
+// ownerReadACE is the extra entry for the user running the elevated window:
+// directory listing / read only (no OICI inheritance), so Explorer still opens
+// the folder ("Открыть папку") and log files can be read, while config.json
+// and sealed subscriptions do not inherit non-elevated read access.
 func ownerReadACE() string {
 	u, err := windows.GetCurrentProcessToken().GetTokenUser()
 	if err != nil {
 		return ""
 	}
-	return "(A;OICI;0x1200a9;;;" + u.User.Sid.String() + ")"
+	return "(A;;0x1200a9;;;" + u.User.Sid.String() + ")"
 }
 
 var (
@@ -207,11 +210,11 @@ func secureHandle(path string, owner *windows.SID, dacl *windows.ACL, isDir bool
 	return nil
 }
 
-func secureTree(dir string, owner *windows.SID, dacl *windows.ACL, depth int) error {
+func secureTree(dir string, owner *windows.SID, dirDACL, fileDACL *windows.ACL, depth int) error {
 	if depth > maxSecureDepth {
 		return fmt.Errorf("protected directory nesting too deep at %q", dir)
 	}
-	if err := secureHandle(dir, owner, dacl, true); err != nil {
+	if err := secureHandle(dir, owner, dirDACL, true); err != nil {
 		return err
 	}
 	entries, err := os.ReadDir(dir)
@@ -231,15 +234,20 @@ func secureTree(dir string, owner *windows.SID, dacl *windows.ACL, depth int) er
 				// Lock down any leftover 0.9.5 ProgramData\Ashgate\WebView2
 				// directory handle itself without recursing into deep Chromium
 				// cache trees; Ashgate only removes this directory via os.Root.
-				if err := secureHandle(child, owner, dacl, true); err != nil {
+				if err := secureHandle(child, owner, fileDACL, true); err != nil {
 					return err
 				}
 				continue
 			}
-			if err := secureTree(child, owner, dacl, depth+1); err != nil {
+			if err := secureTree(child, owner, dirDACL, fileDACL, depth+1); err != nil {
 				return err
 			}
 		} else {
+			dacl := fileDACL
+			if depth == 0 && strings.HasPrefix(strings.ToLower(e.Name()), "ashgate.log") {
+				// Allow the current user to read log files in Explorer/Notepad.
+				dacl = dirDACL
+			}
 			if err := secureHandle(child, owner, dacl, false); err != nil {
 				return err
 			}
@@ -269,7 +277,11 @@ func secureDir(dir string) error {
 	if securedShared {
 		return nil
 	}
-	sd, err := windows.SecurityDescriptorFromString(sharedDirSDDL + ownerReadACE())
+	dirSD, err := windows.SecurityDescriptorFromString(sharedDirSDDL + ownerReadACE())
+	if err != nil {
+		return err
+	}
+	fileSD, err := windows.SecurityDescriptorFromString(sharedDirSDDL)
 	if err != nil {
 		return err
 	}
@@ -277,22 +289,29 @@ func secureDir(dir string) error {
 	// pre-planted files inside it), and an owner can always rewrite the
 	// access list. Take ownership and apply the explicit protected DACL
 	// by handle on the folder and all existing children.
-	owner, _, err := sd.Owner()
+	owner, _, err := dirSD.Owner()
 	if err != nil {
 		return err
 	}
 	if owner == nil {
 		return errors.New("shared folder security descriptor missing owner")
 	}
-	dacl, _, err := sd.DACL()
+	dirDACL, _, err := dirSD.DACL()
 	if err != nil {
 		return err
 	}
-	if dacl == nil {
+	if dirDACL == nil {
 		return errors.New("shared folder security descriptor missing DACL")
 	}
+	fileDACL, _, err := fileSD.DACL()
+	if err != nil {
+		return err
+	}
+	if fileDACL == nil {
+		return errors.New("shared file security descriptor missing DACL")
+	}
 	enableTakeOwnership()
-	if err := secureTree(dir, owner, dacl, 0); err != nil {
+	if err := secureTree(dir, owner, dirDACL, fileDACL, 0); err != nil {
 		return err
 	}
 	securedShared = true

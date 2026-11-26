@@ -41,7 +41,7 @@ func StopDriver() error {
 	if err != nil {
 		return err
 	}
-	if !strings.Contains(strings.ToLower(cfg.BinaryPathName), strings.ToLower(filepath.Dir(exe))) {
+	if !strings.EqualFold(filepath.Dir(strings.TrimPrefix(cfg.BinaryPathName, `\??\`)), filepath.Dir(exe)) {
 		return nil
 	}
 	if _, err := s.Control(svc.Stop); err != nil && !errors.Is(err, windows.ERROR_SERVICE_NOT_ACTIVE) {

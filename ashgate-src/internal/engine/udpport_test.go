@@ -101,3 +101,62 @@ func TestClosedUDPPortForgetsBlockAndUnknown(t *testing.T) {
 		t.Fatal("another port lost its entries")
 	}
 }
+
+func TestForgetUDPPortDrainsActiveFlowAndReDecidesPort(t *testing.T) {
+	res := &ownerRes{p: rules.Process{PID: 9, Name: "curl.exe"}}
+	dial := &fakeDial{}
+	e, _ := newEngine(t, testConfig(), res, dial, nil)
+	src, dst := packet.V4(10, 0, 0, 4, 4455), packet.V4(1, 2, 3, 4, 443)
+	pkt := func() []byte {
+		b, err := packet.BuildUDP(src, dst, []byte("hello"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return b
+	}
+	r1 := e.HandlePacket(pkt(), Meta{}, true)
+	if r1.Action != ActionUDP || r1.UDP == nil {
+		t.Fatalf("initial proxied UDP: %v", r1.Action)
+	}
+	// Socket closes: ForgetUDPPort detaches the flow into draining.
+	e.ForgetUDPPort(src.Port)
+	// Already-queued datagram still carries its flow pointer.
+	if r1.UDP.flow == nil {
+		t.Fatal("UDPDatagram missing flow pointer")
+	}
+	// A new unrouted process reuses the port and must be decided fresh (Pass).
+	res.set(rules.Process{PID: 10, Name: "other.exe"})
+	if r2 := e.HandlePacket(pkt(), Meta{}, true); r2.Action != ActionPass {
+		t.Fatalf("new app on reused UDP port went %v, want ActionPass", r2.Action)
+	}
+	// Sweep past udpIdle retires the draining flow and compacts e.draining.
+	e.sweep(time.Now().Add(udpIdle + time.Second))
+	e.mu.Lock()
+	drainingLen := len(e.draining)
+	e.mu.Unlock()
+	if drainingLen != 0 {
+		t.Fatalf("draining not compacted: %d", drainingLen)
+	}
+	if e.Active() != 0 {
+		t.Fatalf("active flows after draining sweep: %d", e.Active())
+	}
+}
+
+func TestTCPFlowsSameSrcDifferentDstDoNotCollide(t *testing.T) {
+	res := &ownerRes{p: rules.Process{PID: 9, Name: "curl.exe"}}
+	e, _ := newEngine(t, testConfig(), res, &fakeDial{}, nil)
+	src := packet.V4(10, 0, 0, 4, 5555)
+	dst1 := packet.V4(1, 2, 3, 4, 443)
+	dst2 := packet.V4(5, 6, 7, 8, 443)
+	syn1, _ := packet.BuildTCP(src, dst1, 0x02)
+	syn2, _ := packet.BuildTCP(src, dst2, 0x02)
+	if r := e.HandlePacket(syn1, Meta{}, true); r.Action != ActionModified {
+		t.Fatalf("syn1: %v", r.Action)
+	}
+	if r := e.HandlePacket(syn2, Meta{}, true); r.Action != ActionModified {
+		t.Fatalf("syn2: %v", r.Action)
+	}
+	if e.Active() != 2 {
+		t.Fatalf("expected 2 independent TCP flows for same src / different dst, got %d", e.Active())
+	}
+}

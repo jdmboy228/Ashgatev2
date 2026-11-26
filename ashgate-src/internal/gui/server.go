@@ -126,6 +126,20 @@ type controller struct {
 	statPrev  map[string]engine.RuleStat
 	statAt    time.Time
 	statRates map[string][2]int64
+	statSess  *rt.Session
+
+	// ctx ends with shutdown; background work derives its contexts from it.
+	ctx    context.Context
+	cancel context.CancelFunc
+}
+
+// baseCtx is the controller's context; controllers built without one (in
+// tests) use Background.
+func (c *controller) baseCtx() context.Context {
+	if c.ctx != nil {
+		return c.ctx
+	}
+	return context.Background()
 }
 
 // tokenHeader carries controller.token on every API request.
@@ -144,7 +158,9 @@ func newController(path string, cfg *config.Config, logs *logbuf.Buffer, h hooks
 		cfg = config.Default()
 	}
 	vless.PortOwner = process.TCPOwner
+	ctx, cancel := context.WithCancel(context.Background())
 	c := &controller{
+		ctx: ctx, cancel: cancel,
 		path: path, cfg: cfg, logs: logs, checks: map[string]probe.Report{},
 		bridges: vless.NewManager(), bridgeSt: map[string]vless.Status{}, hooks: h,
 		token: newToken(), done: make(chan struct{}), loopDone: make(chan struct{}),
@@ -187,6 +203,9 @@ func (c *controller) shutdown() {
 	c.sessWg.Wait()
 	if c.done != nil {
 		c.doneOnce.Do(func() { close(c.done) })
+	}
+	if c.cancel != nil {
+		c.cancel()
 	}
 	if c.bridges != nil {
 		c.bridges.Close()
@@ -314,13 +333,13 @@ func (c *controller) api(w http.ResponseWriter, r *http.Request) {
 				if err != nil {
 					return nil, err
 				}
-				return probeCheck(context.Background(), p), nil
+				return probeCheck(r.Context(), p), nil
 			}
 			p, err := c.proxyForProbe(body.Name)
 			if err != nil {
 				return nil, err
 			}
-			return c.probeOne(p), nil
+			return c.probeOneCtx(r.Context(), p), nil
 		})
 	case "/api/probe-all":
 		c.post(w, r, func() (any, error) {
@@ -834,6 +853,10 @@ func (c *controller) replaceLocked(next *config.Config) error {
 		next.Extra = old.Extra
 	}
 	keepSubs(next, old)
+	if next != nil && old != nil {
+		// The window may not redirect where the elevated process logs.
+		next.Log.File = old.Log.File
+	}
 	cp := cloneCfg(next)
 	cp.ApplyDefaults()
 	if err := cp.Validate(); err != nil {
@@ -975,7 +998,11 @@ func (c *controller) proxyForProbe(name string) (config.Proxy, error) {
 }
 
 func (c *controller) probeOne(p config.Proxy) probe.Report {
-	rep := probeCheck(context.Background(), p)
+	return c.probeOneCtx(c.baseCtx(), p)
+}
+
+func (c *controller) probeOneCtx(ctx context.Context, p config.Proxy) probe.Report {
+	rep := probeCheck(ctx, p)
 	if p.Name != "" {
 		c.mu.Lock()
 		c.checks[p.Name] = rep
@@ -1044,7 +1071,7 @@ func revealConfigDir(path string) error {
 	if runtime.GOOS != "windows" {
 		return errors.New("папка открывается в Windows")
 	}
-	return exec.Command(explorerExe(), dir).Start()
+	return startReaped(exec.Command(explorerExe(), dir))
 }
 
 // openInBrowser opens an https link in the default browser. Explorer hands
@@ -1057,17 +1084,23 @@ func openInBrowser(link string) error {
 	if runtime.GOOS != "windows" {
 		return errors.New("ссылка открывается в Windows")
 	}
-	return exec.Command(explorerExe(), link).Start()
+	return startReaped(exec.Command(explorerExe(), link))
 }
 
 // explorerExe is an absolute path: this process is elevated and must not
 // run an explorer.exe found on PATH.
 func explorerExe() string {
-	root := os.Getenv("SystemRoot")
-	if root == "" {
-		root = `C:\Windows`
+	return filepath.Join(windowsDir(), "explorer.exe")
+}
+
+// startReaped starts cmd and waits for it in the background so the process
+// handle is released.
+func startReaped(cmd *exec.Cmd) error {
+	if err := cmd.Start(); err != nil {
+		return err
 	}
-	return filepath.Join(root, "explorer.exe")
+	go func() { _ = cmd.Wait() }()
+	return nil
 }
 
 func ruConfig(err error) string {

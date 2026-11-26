@@ -127,14 +127,22 @@ func start(t testing.TB, env *Env, exe string, o LaunchOpts, withEnv bool) *App 
 	}
 	a.cmd.Env = append(base, o.Env...)
 	// A Go panic of the GUI goes to stderr; keep it as an artifact.
+	var logFile *os.File
 	if env != nil {
 		if f, err := os.Create(env.Path("app", fmt.Sprintf("stderr-%d.log", time.Now().UnixNano()))); err == nil {
 			a.cmd.Stdout, a.cmd.Stderr = f, f
+			logFile = f
 		}
 	}
 	a.Started = time.Now()
 	if err := a.cmd.Start(); err != nil {
+		if logFile != nil {
+			logFile.Close()
+		}
 		t.Fatalf("start %s: %v", exe, err)
+	}
+	if logFile != nil {
+		logFile.Close()
 	}
 	a.PID = a.cmd.Process.Pid
 	go func() {

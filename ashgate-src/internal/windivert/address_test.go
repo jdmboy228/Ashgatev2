@@ -74,4 +74,13 @@ func TestMarkValidChecksums(t *testing.T) {
 	if b.bit(bitIPSum) || b.bit(bitTCPSum) || !b.bit(bitUDPSum) || !b.bit(bitIPv6) {
 		t.Fatalf("v6 flags %x", b.flags())
 	}
+	// Extension header length 255 must not overflow uint8 to 0.
+	v6Ext := make([]byte, 48)
+	v6Ext[0] = 0x60
+	v6Ext[6] = 0 // hop-by-hop
+	v6Ext[40] = 17
+	v6Ext[41] = 255
+	if got := ipv6Proto(v6Ext); got != 0 {
+		t.Fatalf("ipv6Proto with len=255 returned %d, want 0", got)
+	}
 }

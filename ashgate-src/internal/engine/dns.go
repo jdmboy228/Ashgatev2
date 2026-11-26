@@ -245,20 +245,26 @@ var dohServers = func() map[packet.Addr]struct{} {
 		"94.140.14.14", "94.140.15.15", "77.88.8.8", "77.88.8.1",
 		"2606:4700:4700::1111", "2606:4700:4700::1001", "2001:4860:4860::8888",
 		"2001:4860:4860::8844", "2620:fe::fe", "2620:fe::9",
+		"2a10:50c0::ad1:ff", "2a10:50c0::ad2:ff",
+		"2a02:6b8::feed:0ff", "2a02:6b8:0:1::feed:0ff",
 	} {
 		m[packet.FromIP(net.ParseIP(ip), 443)] = struct{}{}
 	}
 	return m
 }()
 
-// encryptedDNS reports DNS over TLS (TCP 853) or over HTTPS (443, TCP or
-// QUIC, to a resolver in dohServers).
+func isDoHServer(a packet.Addr) bool {
+	_, ok := dohServers[a]
+	return ok
+}
+
+// encryptedDNS reports DNS over TLS (TCP 853), DNS over QUIC (UDP 853), or
+// over HTTPS (443, TCP or QUIC, to a resolver in dohServers).
 func encryptedDNS(h *packet.Header) bool {
 	if h.Dst.Port == 853 {
-		return h.Proto == packet.ProtoTCP
+		return h.Proto == packet.ProtoTCP || h.Proto == packet.ProtoUDP
 	}
-	_, ok := dohServers[h.Dst]
-	return ok
+	return isDoHServer(h.Dst)
 }
 
 // systemEncryptedDNS sends the Windows DNS client's DoT and DoH through
@@ -275,8 +281,7 @@ func (e *Engine) systemEncryptedDNS(pkt []byte, h *packet.Header, meta Meta, pro
 	if h.Proto == packet.ProtoTCP {
 		if !(h.SYN && !h.ACK) {
 			// Opened before capture: reset, Windows reconnects through the tunnel.
-			e.reset(h, meta)
-			return Result{Action: ActionDrop}
+			return e.reset(h)
 		}
 		return e.startTCP(pkt, h, meta, proc, p, snap, "", nil, false)
 	}

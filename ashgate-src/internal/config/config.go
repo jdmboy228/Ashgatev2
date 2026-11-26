@@ -358,20 +358,21 @@ func (c *Config) Validate() error {
 	default:
 		return fmt.Errorf("dns.mode must be proxy or original, got %q", c.DNS.Mode)
 	}
-	if c.DNS.Mode == "proxy" {
-		if len(c.DNS.Servers) == 0 {
-			return errors.New("dns.servers is required when dns.mode is proxy")
-		}
-		for _, s := range c.DNS.Servers {
-			if _, _, err := splitAddr(s); err != nil {
-				return fmt.Errorf("dns server %q: %w", s, err)
-			}
+	if c.DNS.Mode == "proxy" && len(c.DNS.Servers) == 0 {
+		return errors.New("dns.servers is required when dns.mode is proxy")
+	}
+	for _, s := range c.DNS.Servers {
+		if _, _, err := splitAddr(s); err != nil {
+			return fmt.Errorf("dns server %q: %w", s, err)
 		}
 	}
 	switch c.UDPUnsupported {
 	case "block", "direct":
 	default:
 		return fmt.Errorf("udpUnsupported must be block or direct, got %q", c.UDPUnsupported)
+	}
+	if err := validateLogFile(c.Log.File); err != nil {
+		return fmt.Errorf("log.file: %w", err)
 	}
 	switch c.Log.Level {
 	case "info", "debug":
@@ -663,7 +664,7 @@ func Save(path string, cfg *Config) error {
 	if cfg == nil {
 		return errors.New("nil config")
 	}
-	cp := *cfg
+	cp := deepCopy(cfg)
 	cp.ApplyDefaults()
 	if err := cp.Validate(); err != nil {
 		return err
@@ -681,6 +682,90 @@ func Save(path string, cfg *Config) error {
 		return err
 	}
 	return atomicfile.Write(path, data)
+}
+
+func cloneStrings(in []string) []string {
+	if in == nil {
+		return nil
+	}
+	out := make([]string, len(in))
+	copy(out, in)
+	return out
+}
+
+func deepCopy(cfg *Config) Config {
+	cp := *cfg
+	cp.DNS.Servers = cloneStrings(cfg.DNS.Servers)
+	cp.DNS.Bootstrap = cloneStrings(cfg.DNS.Bootstrap)
+	cp.DirectDomains = cloneStrings(cfg.DirectDomains)
+	if cfg.Proxies != nil {
+		cp.Proxies = make([]Proxy, len(cfg.Proxies))
+		for i, p := range cfg.Proxies {
+			if p.VLESS != nil {
+				v := *p.VLESS
+				if v.Extra != nil {
+					v.Extra = append(json.RawMessage(nil), v.Extra...)
+				}
+				p.VLESS = &v
+			}
+			if p.Sub != nil {
+				s := *p.Sub
+				p.Sub = &s
+			}
+			cp.Proxies[i] = p
+		}
+	}
+	if cfg.Rules != nil {
+		cp.Rules = make([]Rule, len(cfg.Rules))
+		for i, r := range cfg.Rules {
+			if r.Enabled != nil {
+				v := *r.Enabled
+				r.Enabled = &v
+			}
+			if r.Children != nil {
+				v := *r.Children
+				r.Children = &v
+			}
+			if r.KillSwitch != nil {
+				v := *r.KillSwitch
+				r.KillSwitch = &v
+			}
+			cp.Rules[i] = r
+		}
+	}
+	if cfg.Groups != nil {
+		cp.Groups = make([]Group, len(cfg.Groups))
+		for i, g := range cfg.Groups {
+			if g.Enabled != nil {
+				v := *g.Enabled
+				g.Enabled = &v
+			}
+			cp.Groups[i] = g
+		}
+	}
+	cp.Extra = CloneExtra(cfg.Extra)
+	return cp
+}
+
+// validateLogFile rejects UNC shares, Windows device namespaces, and ".."
+// traversal segments in log.file.
+func validateLogFile(p string) error {
+	if p == "" {
+		return nil
+	}
+	if strings.ContainsAny(p, "\x00\r\n") {
+		return errors.New("invalid characters in path")
+	}
+	norm := strings.ReplaceAll(strings.TrimSpace(p), "/", `\`)
+	if strings.HasPrefix(norm, `\\`) {
+		return fmt.Errorf("UNC or device path %q is not allowed", p)
+	}
+	for _, seg := range strings.Split(norm, `\`) {
+		if seg == ".." {
+			return fmt.Errorf("path traversal %q is not allowed", p)
+		}
+	}
+	return nil
 }
 
 func (c *Config) marshal() ([]byte, error) {

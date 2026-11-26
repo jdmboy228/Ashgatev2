@@ -76,4 +76,7 @@ func TestParseRejectsShortTable(t *testing.T) {
 	if _, err := ParseOwnerTable(buf, TableUDP6); err == nil {
 		t.Fatal("expected error")
 	}
+	if _, err := ParseOwnerTable(buf, TableKind(99)); err == nil {
+		t.Fatal("expected error for unknown table kind")
+	}
 }

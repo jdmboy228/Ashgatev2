@@ -1,8 +1,10 @@
 package runtime
 
 import (
+	"context"
 	"fmt"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -282,5 +284,49 @@ func TestCaptureFlushAllFailEnds(t *testing.T) {
 	c.handle(batchOf(t, 1, 2, 3))
 	if len(out.log) != 3 {
 		t.Fatalf("%d sends: %v", len(out.log), out.log)
+	}
+}
+
+type errOut struct {
+	err   error
+	calls int
+}
+
+func (e *errOut) send([]byte, *windivert.Address) error { return e.err }
+func (e *errOut) sendBatch(*windivert.Batch) (int, error) {
+	e.calls++
+	return 0, e.err
+}
+
+func TestCaptureFlushStopsOnClosedHandle(t *testing.T) {
+	eng := &fakeEngine{decide: func(uint16, bool) engine.Result { return engine.Result{Action: engine.ActionPass} }}
+	for _, code := range []syscall.Errno{232, 6} {
+		out := &errOut{err: code}
+		c, _ := newTestCapture(eng, out, nil)
+		c.handle(batchOf(t, 1, 2, 3))
+		if out.calls != 1 {
+			t.Fatalf("errno %d: flush retried %d times, want 1", code, out.calls)
+		}
+	}
+}
+
+func TestConsumeRecyclesBatch(t *testing.T) {
+	eng := &fakeEngine{decide: func(uint16, bool) engine.Result { return engine.Result{Action: engine.ActionPass} }}
+	out := &fakeOut{}
+	c, _ := newTestCapture(eng, out, nil)
+	in := make(chan netBatch, 1)
+	recycle := make(chan netBatch, 1)
+	b := batchOf(t, 1, 2)
+	b.buf = make([]byte, 128)
+	in <- b
+	close(in)
+	consume(context.Background(), c, in, recycle)
+	select {
+	case rb := <-recycle:
+		if cap(rb.buf) != 128 || len(rb.pkts) != 0 || len(rb.addrs) != 0 {
+			t.Fatalf("unexpected recycled batch: bufCap=%d pkts=%d addrs=%d", cap(rb.buf), len(rb.pkts), len(rb.addrs))
+		}
+	default:
+		t.Fatal("batch was not recycled")
 	}
 }

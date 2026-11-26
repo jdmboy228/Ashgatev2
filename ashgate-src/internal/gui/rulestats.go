@@ -28,6 +28,10 @@ func (c *controller) ruleStatsLocked(now time.Time) map[string]ruleStatView {
 	if c.sess == nil {
 		return out
 	}
+	if c.statSess != c.sess {
+		c.statSess = c.sess
+		c.statPrev, c.statAt, c.statRates = nil, time.Time{}, nil
+	}
 	cur := c.sess.RuleStats()
 	if dt := now.Sub(c.statAt); c.statPrev == nil || dt >= rateEvery {
 		rates := map[string][2]int64{}

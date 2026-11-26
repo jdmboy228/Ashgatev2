@@ -34,6 +34,8 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 $env:CGO_ENABLED = "0"
+$env:GOOS = "windows"
+$env:GOARCH = "amd64"
 $exe = Join-Path dist "ashgate.exe"
 # A stale exe from an earlier build must never be packaged.
 if (Test-Path $exe) { Remove-Item $exe }

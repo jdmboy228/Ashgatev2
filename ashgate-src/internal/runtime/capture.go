@@ -31,6 +31,7 @@ type reinjector interface {
 
 // netBatch is the packets of one WinDivertRecvEx and their addresses.
 type netBatch struct {
+	buf   []byte
 	pkts  [][]byte
 	addrs []windivert.Address
 }
@@ -59,8 +60,9 @@ func newCapture(eng classifier, out reinjector, udp *udpQueue) *capture {
 }
 
 // consume decides the packets from in until it closes or ctx ends. Held
-// packets are retried every holdTick.
-func consume(ctx context.Context, c *capture, in <-chan netBatch) {
+// packets are retried every holdTick. When recycle is non-nil, processed
+// batches are returned to recvNet for buffer reuse.
+func consume(ctx context.Context, c *capture, in <-chan netBatch, recycle chan<- netBatch) {
 	tick := time.NewTicker(holdTick)
 	defer tick.Stop()
 	for {
@@ -74,6 +76,15 @@ func consume(ctx context.Context, c *capture, in <-chan netBatch) {
 				return
 			}
 			c.handle(b)
+			if recycle != nil {
+				clear(b.pkts)
+				b.pkts = b.pkts[:0]
+				b.addrs = b.addrs[:0]
+				select {
+				case recycle <- b:
+				default:
+				}
+			}
 		case <-tick.C:
 			c.release(false)
 		}
@@ -190,6 +201,9 @@ func (c *capture) flush() {
 	for c.batch.Len() > 0 {
 		sent, err := c.out.sendBatch(&c.batch)
 		if err == nil {
+			break
+		}
+		if windivert.IsNoData(err) || windivert.IsInvalidHandle(err) {
 			break
 		}
 		c.batch.Skip(sent)

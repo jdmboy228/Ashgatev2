@@ -187,16 +187,9 @@ function apStatus(r) {
 }
 function apTelemetry(s) {
   if (s.flows) {
-    return `<div class="l1"><span class="dn">↓ ${esc(apRate(s.down))}</span><span class="dim">·</span><span class="up">↑ ${esc(apRate(s.up))}</span></div><div class="l2">${s.flows} ${flowWord(s.flows)} · ${esc(s.sub)}</div>`;
+    return `<div class="l1"><span class="dn">↓ ${esc(apRate(s.down))}</span><span class="dim">·</span><span class="up">↑ ${esc(apRate(s.up))}</span></div><div class="l2">${s.flows} ${plural(s.flows, "поток", "потока", "потоков")} · ${esc(s.sub)}</div>`;
   }
   return `<div class="l1${s.bad ? " bad" : ""}" title="${esc(s.error || s.line)}">${esc(s.line)}</div><div class="l2">${esc(s.sub)}</div>`;
-}
-function flowWord(n) {
-  const m10 = n % 10;
-  const m100 = n % 100;
-  if (m10 === 1 && m100 !== 11) return "поток";
-  if (m10 >= 2 && m10 <= 4 && (m100 < 12 || m100 > 14)) return "потока";
-  return "потоков";
 }
 
 // ---------- page ----------
@@ -240,11 +233,11 @@ function fillApps() {
   const active = onUnits.filter(live).concat(onUnits.filter((u) => !live(u)));
   const inactive = visible.filter((u) => !isOn(u));
   const activeCount = active.reduce((n, u) => n + (u.group ? u.members.filter((j) => apOn(rules[j].enabled)).length : 1), 0);
-  const inactiveCount = rules.filter((r) => apMatches(r)).length - activeCount;
+  const inactiveCount = inactive.reduce((n, u) => n + (u.group ? u.members.length : 1), 0);
   const groupsOn = active.filter((u) => u.group).length;
   const sel = apSelected.size ? apSelectionBar(rules.filter(apSelectable).length) : "";
   const body = `${ksNotice()}${apKillBanner()}${sel}
-    <div class="ap-sec"><div class="ap-sec-h"><span class="t">Активные правила</span><span class="c">${activeCount}</span>${groupsOn ? `<span class="g">(${groupsOn} ${groupWord(groupsOn)})</span>` : ""}</div>
+    <div class="ap-sec"><div class="ap-sec-h"><span class="t">Активные правила</span><span class="c">${activeCount}</span>${groupsOn ? `<span class="g">(${groupsOn} ${plural(groupsOn, "группа", "группы", "групп")})</span>` : ""}</div>
     ${active.length ? `<div class="ap-list">${active.map((u) => apUnitHTML(u)).join("")}</div>` : `<div class="ap-none">${apQuery ? "Ничего не найдено." : "Нет активных правил. Включите правило ниже или добавьте приложение."}</div>`}</div>
     <div class="ap-sec off"><div class="ap-sec-h"><span class="t">Отключённые и неактивные</span><span class="c">${Math.max(0, inactiveCount)}</span><span class="note">Трафик направляется напрямую в обход прокси</span></div>
     ${inactive.length ? `<div class="ap-list">${inactive.map((u) => apUnitHTML(u)).join("")}</div>` : `<div class="ap-none">Все правила включены.</div>`}</div>
@@ -268,13 +261,6 @@ function apPlacePopover(host) {
   const r = pop.getBoundingClientRect();
   const room = r.top - box.top;
   if (r.bottom > box.bottom - 8 && room > r.height + 48) pop.classList.add("up");
-}
-function groupWord(n) {
-  const m10 = n % 10;
-  const m100 = n % 100;
-  if (m10 === 1 && m100 !== 11) return "группа";
-  if (m10 >= 2 && m10 <= 4 && (m100 < 12 || m100 > 14)) return "группы";
-  return "групп";
 }
 
 function apKillBanner() {
@@ -362,10 +348,10 @@ function apGroupHTML(u) {
   });
   let tele;
   if (!on) tele = `<div class="l1">Группа отключена · —</div><div class="l2">Приложения группы работают напрямую</div>`;
-  else if (g.action !== "proxy") tele = `<div class="l1">${g.action === "direct" ? "Напрямую" : "Блокируется"}</div><div class="l2">${members.length} ${appWord(members.length)}</div>`;
-  else if (!state.running) tele = `<div class="l1">Перехват выключен</div><div class="l2">${members.length} ${appWord(members.length)}</div>`;
-  else if (flows) tele = `<div class="l1"><span class="dn">↓ ${esc(apRate(down))}</span><span class="dim">·</span><span class="up">↑ ${esc(apRate(up))}</span></div><div class="l2">${flows} ${flowWord(flows)} · ${bytes(total)}</div>`;
-  else tele = `<div class="l1">Нет соединений</div><div class="l2">${members.length} ${appWord(members.length)} суммарно</div>`;
+  else if (g.action !== "proxy") tele = `<div class="l1">${g.action === "direct" ? "Напрямую" : "Блокируется"}</div><div class="l2">${members.length} ${plural(members.length, "приложение", "приложения", "приложений")}</div>`;
+  else if (!state.running) tele = `<div class="l1">Перехват выключен</div><div class="l2">${members.length} ${plural(members.length, "приложение", "приложения", "приложений")}</div>`;
+  else if (flows) tele = `<div class="l1"><span class="dn">↓ ${esc(apRate(down))}</span><span class="dim">·</span><span class="up">↑ ${esc(apRate(up))}</span></div><div class="l2">${flows} ${plural(flows, "поток", "потока", "потоков")} · ${bytes(total)}</div>`;
+  else tele = `<div class="l1">Нет соединений</div><div class="l2">${members.length} ${plural(members.length, "приложение", "приложения", "приложений")} суммарно</div>`;
   const icons = members.slice(0, 4).map((r) => `<span class="mini" title="${esc(apLabel(r.process))}">${appIconHTML(apPath(r.process), "width:16px;height:16px;font-size:8px")}</span>`).join("");
   const target = "g:" + g.name;
   apTele[target] = tele;
@@ -382,13 +368,6 @@ function apGroupHTML(u) {
     </div>
     ${open ? `<div class="ap-members">${u.members.map((j) => apRuleHTML(j, true)).join("")}</div>` : ""}
   </div>`;
-}
-function appWord(n) {
-  const m10 = n % 10;
-  const m100 = n % 100;
-  if (m10 === 1 && m100 !== 11) return "приложение";
-  if (m10 >= 2 && m10 <= 4 && (m100 < 12 || m100 > 14)) return "приложения";
-  return "приложений";
 }
 function apGroupMenu(g) {
   return `<div class="ap-pop menu"><div class="cap">Группа «${esc(g.name)}»</div>
@@ -413,6 +392,7 @@ function apMoveUnit(key, delta) {
 }
 function apMoveRule(i, delta) {
   const r = cfg().rules[i];
+  if (!r) return false;
   if (!r.group) return apMoveUnit("r:" + i, delta);
   // Inside a group: move among its members only.
   const rules = cfg().rules;
@@ -501,31 +481,37 @@ function appsClick(id, act) {
     }
     case "ap-toggle": {
       const r = rules[i];
+      if (!r) return;
       r.enabled = !apOn(r.enabled);
       return apSave(`${apLabel(r.process)}: ${r.enabled ? "включено" : "выключено"}`);
     }
     case "ap-gtoggle": {
       const g = apGroup(gname);
+      if (!g) return;
       g.enabled = !apOn(g.enabled);
       return apSave(`Группа «${g.name}» ${g.enabled ? "включена" : "отключена"}`);
     }
     case "ap-collapse": {
       const g = apGroup(gname);
+      if (!g) return;
       g.collapsed = !g.collapsed;
       return apSave();
     }
     case "ap-children": {
       const r = rules[i];
+      if (!r) return;
       if (r.children === false) delete r.children; else r.children = false;
       return apSave();
     }
     case "ap-ks": {
       const r = rules[i];
+      if (!r) return;
       r.killSwitch = !apRuleKS(r);
       return apSave(`${apLabel(r.process)}: kill switch ${r.killSwitch ? "включён" : "выключен"}`);
     }
     case "ap-proto": {
       const r = rules[i];
+      if (!r) return;
       if (act.dataset.value === "tcp") r.tcpOnly = true; else delete r.tcpOnly;
       return apSave();
     }
@@ -541,6 +527,7 @@ function appsClick(id, act) {
     case "ap-edit": return apOpenEdit(i);
     case "ap-del": {
       const r = rules[i];
+      if (!r) return;
       rules.splice(i, 1);
       apSelected.clear();
       return apSave(`Правило «${apLabel(r.process)}» удалено`);
@@ -548,6 +535,7 @@ function appsClick(id, act) {
     case "ap-ungroup-one": {
       // Move the rule just after its group so the group stays contiguous.
       const r = rules[i];
+      if (!r) return;
       const name = r.group;
       const last = rules.map((x, j) => (x.group === name ? j : -1)).filter((j) => j >= 0).pop();
       delete r.group;
@@ -562,7 +550,7 @@ function appsClick(id, act) {
       rules.forEach((r) => { if (r.group === gname) delete r.group; });
       cfg().groups = apGroups().filter((g) => g.name !== gname);
       apSelected.clear();
-      return apSave(`Группа «${gname}» разделена: ${n} ${appWord(n)} снова отдельно`);
+      return apSave(`Группа «${gname}» разделена: ${n} ${plural(n, "приложение", "приложения", "приложений")} снова отдельно`);
     }
     case "ap-gdel":
       return askConfirm("Удалить группу?", `Группа «${gname}» и все её правила исчезнут из списка.`, "Удалить", true, () => {
@@ -660,6 +648,7 @@ function apOpenWindows() {
 }
 function apOpenEdit(i) {
   const r = cfg().rules[i];
+  if (!r) return;
   modal = { kind: "ap-edit", index: i, value: r.process };
   renderModal();
 }
@@ -764,7 +753,7 @@ function apGroupNewHTML() {
   const rules = cfg().rules;
   const members = m.members.map((j) => `<span class="ap-member">${appIconHTML(rules[j].process, "width:18px;height:18px;border-radius:5px;font-size:9px")}${esc(apLabel(rules[j].process))}<button type="button" data-act="ap-gnew-drop" data-i="${j}" title="Убрать из группы">${icon("close", 12)}</button></span>`).join("");
   return `<div class="scrim"><form class="dialog ap-dlg" id="dlg">
-    <div class="ap-dlg-h"><span class="ic">${icon("folder", 16)}</span><div><h2>Создать группу приложений</h2><div class="dsub">${m.members.length} ${appWord(m.members.length)} под общим тумблером и маршрутом</div></div></div>
+    <div class="ap-dlg-h"><span class="ic">${icon("folder", 16)}</span><div><h2>Создать группу приложений</h2><div class="dsub">${m.members.length} ${plural(m.members.length, "приложение", "приложения", "приложений")} под общим тумблером и маршрутом</div></div></div>
     <div class="body"><label class="lbl" for="ap-gnew-name">Название группы</label>
     <div class="field"><input id="ap-gnew-name" value="${esc(m.name)}" placeholder="Например: Мессенджеры, Игры…" autocomplete="off" autofocus></div>
     <div class="ap-presets"><span>Быстрые варианты:</span>${AP_GROUP_PRESETS.map((p) => `<button type="button" data-act="ap-gnew-preset" data-name="${esc(p)}">${esc(p)}</button>`).join("")}</div>
@@ -940,7 +929,7 @@ function appsSubmit() {
     apSelected.clear();
     modal = null;
     renderModal();
-    apSave(`Группа «${name}» создана: ${moved.length} ${appWord(moved.length)}`);
+    apSave(`Группа «${name}» создана: ${moved.length} ${plural(moved.length, "приложение", "приложения", "приложений")}`);
     return;
   }
   if (m.kind === "ap-gname") {

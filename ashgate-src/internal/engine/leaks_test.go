@@ -143,7 +143,7 @@ func TestSystemEncryptedDNSThroughTunnel(t *testing.T) {
 			t.Fatalf("DNS client to %s went %v, want the tunnel", dst, r.Action)
 		}
 		e.mu.Lock()
-		f := e.byClient[src]
+		f := e.byClient[tcpKey{Src: src, Dst: dst}]
 		e.mu.Unlock()
 		if f == nil || f.proxy.Name != "socks" || f.orig != dst || !f.dial.IsZero() {
 			t.Fatalf("flow to %s: %+v", dst, f)
@@ -153,6 +153,19 @@ func TestSystemEncryptedDNSThroughTunnel(t *testing.T) {
 	r := e.HandlePacket(quic, Meta{}, true)
 	if r.Action != ActionUDP || r.UDP.RelayDst != packet.V4(8, 8, 8, 8, 443) {
 		t.Fatalf("DoH over QUIC went %v %+v", r.Action, r.UDP)
+	}
+	// DoQ (UDP/853) and IPv6 AdGuard/Yandex DoH also route through the tunnel.
+	doq, _ := packet.BuildUDP(packet.V4(10, 0, 0, 2, 4610), packet.V4(94, 140, 14, 14, 853), []byte("doq"))
+	if r := e.HandlePacket(doq, Meta{}, true); r.Action != ActionUDP {
+		t.Fatalf("DoQ (UDP/853) went %v, want ActionUDP", r.Action)
+	}
+	for i, ip := range []string{"2a10:50c0::ad1:ff", "2a10:50c0::ad2:ff", "2a02:6b8::feed:0ff", "2a02:6b8:0:1::feed:0ff"} {
+		dst := packet.V6(net.ParseIP(ip), 443)
+		src := packet.V6(net.ParseIP("2001:db8:1::10"), uint16(4620+i))
+		syn, _ := packet.BuildTCP(src, dst, 0x02)
+		if r := e.HandlePacket(syn, Meta{}, true); r.Action != ActionModified {
+			t.Fatalf("IPv6 DoH %s went %v, want ActionModified", ip, r.Action)
+		}
 	}
 	update, _ := packet.BuildTCP(packet.V4(10, 0, 0, 2, 4601), packet.V4(13, 107, 4, 50, 443), 0x02)
 	if r := e.HandlePacket(update, Meta{}, true); r.Action != ActionPass {

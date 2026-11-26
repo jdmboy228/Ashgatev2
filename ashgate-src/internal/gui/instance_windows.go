@@ -194,11 +194,13 @@ func watchEvent(ev windows.Handle, stop <-chan struct{}, fire func()) {
 
 // requestQuit asks the window thread to exit as «Выход» does.
 func requestQuit() {
-	h := appHost
-	if h == nil || h.hwnd == 0 {
+	h := appHost.Load()
+	if h == nil {
 		return
 	}
-	pPostMessage.Call(h.hwnd, wmQuitReq, 0, 0)
+	if hwnd := h.hwnd.Load(); hwnd != 0 {
+		pPostMessage.Call(hwnd, wmQuitReq, 0, 0)
+	}
 }
 
 // Quit result codes for the ashgate quit command.
@@ -243,11 +245,13 @@ func Quit(timeout time.Duration) int {
 }
 
 func requestShow() {
-	h := appHost
-	if h == nil || h.hwnd == 0 {
+	h := appHost.Load()
+	if h == nil {
 		return
 	}
-	pPostMessage.Call(h.hwnd, wmShow, 0, 0)
+	if hwnd := h.hwnd.Load(); hwnd != 0 {
+		pPostMessage.Call(hwnd, wmShow, 0, 0)
+	}
 }
 
 // signalExisting lets the process that already owns the window restore itself.

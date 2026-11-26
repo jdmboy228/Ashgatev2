@@ -23,9 +23,9 @@ func (e *Engine) addDirectUDP(k udpKey) {
 }
 
 // ForgetUDPPort drops the cached decisions of UDP sources on port: direct,
-// blocked and "program unknown". A block or an unknown owner belonged to the
-// socket that closed, not to the next one on the port. Proxied flows in
-// e.udp stay; they retire on idle.
+// blocked, "program unknown", and detaches active proxied flows on that port
+// into e.draining so already-queued datagrams finish forwarding while a new
+// socket reusing the port is decided fresh.
 // The capture loop calls it when a UDP socket on that port closes. The port
 // alone is enough: a socket bound to 0.0.0.0 closes with that address, and
 // forgetting too much only means one more lookup.
@@ -47,6 +47,12 @@ func (e *Engine) ForgetUDPPort(port uint16) {
 					delete(gen, k)
 				}
 			}
+		}
+	}
+	for k, f := range e.udp {
+		if k.Src.Port == port {
+			delete(e.udp, k)
+			e.draining = append(e.draining, f)
 		}
 	}
 }

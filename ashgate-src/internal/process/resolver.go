@@ -59,6 +59,7 @@ type exactKey struct {
 
 type wildKey struct {
 	proto uint8
+	ver   uint8
 	port  uint16
 }
 
@@ -98,7 +99,7 @@ type Resolver struct {
 	// exited reports that pid no longer names the process cached for it.
 	// Windows reuses PIDs, so a cached name must be checked before reuse.
 	// Nil means the platform cannot tell; the cache is then only size-capped.
-	exited func(pid uint32) bool
+	exited func(pid uint32, started int64) bool
 	// release frees platform resources, such as held process handles.
 	release func()
 }
@@ -154,8 +155,7 @@ func (r *Resolver) observe(proto uint8, local packet.Addr, pid uint32, closing, 
 		e.until = now.Add(closeGrace)
 	}
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	wk := wildKey{proto, local.Port}
+	wk := wildKey{proto, local.Len, local.Port}
 	if unspecified(local) {
 		if closing {
 			// Do not clobber a newer open wildcard socket of another process.
@@ -171,8 +171,8 @@ func (r *Resolver) observe(proto uint8, local packet.Addr, pid uint32, closing, 
 				}
 			}
 		} else {
-			// A new wildcard socket on (proto, port) invalidates stale exact entries
-			// on that port (e.g. from a previous owner whose CLOSE was missed or late).
+			// A new wildcard socket on (proto, ver, port) invalidates stale exact entries
+			// on that port and family (e.g. from a previous owner whose CLOSE was missed or late).
 			for ek := range r.exactPorts[wk] {
 				r.delExactLocked(ek)
 			}
@@ -193,7 +193,7 @@ func (r *Resolver) observe(proto uint8, local packet.Addr, pid uint32, closing, 
 			}
 		} else if fromFlow {
 			cur, hasCur := r.exact[ek]
-			w, hasWild := r.wild[wk]
+			w, hasWild := r.wildEntryLocked(wk)
 			wildAlive := hasWild && alive(w, now)
 			switch {
 			case hasCur && cur.until.IsZero() && cur.proc.PID != pid:
@@ -211,10 +211,16 @@ func (r *Resolver) observe(proto uint8, local packet.Addr, pid uint32, closing, 
 			r.setExactLocked(ek, e)
 		}
 	}
+	needPrune := false
 	if r.pruneAt.IsZero() {
 		r.pruneAt = now
 	} else if now.Sub(r.pruneAt) >= pruneEvery {
-		r.pruneLocked(now)
+		r.pruneAt = now
+		needPrune = true
+	}
+	r.mu.Unlock()
+	if needPrune {
+		r.prune(now)
 	}
 }
 
@@ -223,7 +229,7 @@ func (r *Resolver) setExactLocked(k exactKey, e entry) {
 	if r.exactPorts == nil {
 		r.exactPorts = map[wildKey]map[exactKey]struct{}{}
 	}
-	wk := wildKey{k.proto, k.addr.Port}
+	wk := wildKey{k.proto, k.addr.Len, k.addr.Port}
 	m := r.exactPorts[wk]
 	if m == nil {
 		m = map[exactKey]struct{}{}
@@ -234,7 +240,7 @@ func (r *Resolver) setExactLocked(k exactKey, e entry) {
 
 func (r *Resolver) delExactLocked(k exactKey) {
 	delete(r.exact, k)
-	wk := wildKey{k.proto, k.addr.Port}
+	wk := wildKey{k.proto, k.addr.Len, k.addr.Port}
 	if m := r.exactPorts[wk]; m != nil {
 		delete(m, k)
 		if len(m) == 0 {
@@ -243,57 +249,73 @@ func (r *Resolver) delExactLocked(k exactKey) {
 	}
 }
 
-func (r *Resolver) wildOpenForOtherLocked(wk wildKey, pid uint32) bool {
-	w, ok := r.wild[wk]
-	return ok && w.until.IsZero() && w.proc.PID != pid
+func (r *Resolver) wildEntryLocked(wk wildKey) (entry, bool) {
+	if w, ok := r.wild[wk]; ok {
+		return w, true
+	}
+	if wk.ver == 4 {
+		if w, ok := r.wild[wildKey{wk.proto, 16, wk.port}]; ok {
+			return w, true
+		}
+	}
+	return entry{}, false
 }
 
-// pruneLocked drops closed sockets past their grace period, sockets of
-// processes that have exited (their CLOSE event may have been lost), and
-// cached images of exited processes.
-func (r *Resolver) pruneLocked(now time.Time) {
-	r.pruneAt = now
-	gone := map[uint32]bool{}
-	dead := func(pid uint32) bool {
-		if r.exited == nil {
-			return false
-		}
-		d, ok := gone[pid]
-		if !ok {
-			d = r.exited(pid)
-			gone[pid] = d
-		}
-		return d
+func (r *Resolver) wildOpenForOtherLocked(wk wildKey, pid uint32) bool {
+	if w, ok := r.wild[wk]; ok && w.until.IsZero() && w.proc.PID != pid {
+		return true
 	}
-	// A socket's process is gone by the handle when its image is cached.
-	// Without one (System, a protected process) exited has no handle to
-	// ask and says true, so present decides; else live sockets would
-	// vanish every pruneEvery.
-	sockGone := map[uint32]bool{}
-	socketDead := func(pid uint32) bool {
-		if img, ok := r.images[pid]; ok && (img.Name != "" || img.Path != "") || r.present == nil {
-			return dead(pid)
+	if wk.ver == 4 {
+		if w, ok := r.wild[wildKey{wk.proto, 16, wk.port}]; ok && w.until.IsZero() && w.proc.PID != pid {
+			return true
 		}
-		d, ok := sockGone[pid]
-		if !ok {
-			d = !r.present(pid)
-			sockGone[pid] = d
+	}
+	return false
+}
+
+// prune drops closed sockets past their grace period, sockets of processes
+// that have exited (their CLOSE event may have been lost), and cached images
+// of exited processes. Process-liveness probes run outside r.mu.
+func (r *Resolver) prune(now time.Time) {
+	type pidStart struct {
+		pid     uint32
+		started int64
+	}
+	r.mu.Lock()
+	exitedFn := r.exited
+	presentFn := r.present
+	checkExited := map[pidStart]struct{}{}
+	checkPresent := map[uint32]struct{}{}
+	noteSock := func(p rules.Process) {
+		if img, ok := r.images[p.PID]; ok && (img.Name != "" || img.Path != "") || presentFn == nil {
+			if exitedFn != nil {
+				st := p.Started
+				if ok && st == 0 {
+					st = img.Started
+				}
+				checkExited[pidStart{p.PID, st}] = struct{}{}
+			}
+			return
 		}
-		return d
+		checkPresent[p.PID] = struct{}{}
 	}
 	for k, e := range r.exact {
-		if !alive(e, now) || socketDead(e.proc.PID) {
+		if !alive(e, now) {
 			r.delExactLocked(k)
+			continue
 		}
+		noteSock(e.proc)
 	}
 	for k, e := range r.wild {
-		if !alive(e, now) || socketDead(e.proc.PID) {
+		if !alive(e, now) {
 			delete(r.wild, k)
+			continue
 		}
+		noteSock(e.proc)
 	}
-	for pid := range r.images {
-		if dead(pid) {
-			delete(r.images, pid)
+	if exitedFn != nil {
+		for pid, img := range r.images {
+			checkExited[pidStart{pid, img.Started}] = struct{}{}
 		}
 	}
 	for k, at := range r.missAt {
@@ -306,9 +328,54 @@ func (r *Resolver) pruneLocked(now time.Time) {
 		clear(r.helperWild)
 		r.helperAt = time.Time{}
 	}
+	r.mu.Unlock()
+
+	deadExited := map[pidStart]bool{}
+	for ps := range checkExited {
+		if exitedFn(ps.pid, ps.started) {
+			deadExited[ps] = true
+		}
+	}
+	deadPresent := map[uint32]bool{}
+	for pid := range checkPresent {
+		if !presentFn(pid) {
+			deadPresent[pid] = true
+		}
+	}
+
+	r.mu.Lock()
+	sockDead := func(p rules.Process) bool {
+		if img, ok := r.images[p.PID]; ok && (img.Name != "" || img.Path != "") || presentFn == nil {
+			st := p.Started
+			if ok && st == 0 {
+				st = img.Started
+			}
+			return deadExited[pidStart{p.PID, st}]
+		}
+		return deadPresent[p.PID]
+	}
+	for k, e := range r.exact {
+		if !alive(e, now) || sockDead(e.proc) {
+			r.delExactLocked(k)
+		}
+	}
+	for k, e := range r.wild {
+		if !alive(e, now) || sockDead(e.proc) {
+			delete(r.wild, k)
+		}
+	}
+	for ps := range deadExited {
+		if cur, ok := r.images[ps.pid]; ok && cur.Started == ps.started {
+			delete(r.images, ps.pid)
+		}
+	}
 	if len(r.images) > maxImages {
 		clear(r.images)
+		if r.release != nil {
+			r.release()
+		}
 	}
+	r.mu.Unlock()
 }
 
 // Lookup implements engine.Resolver. It is a last try: it may read the
@@ -499,15 +566,25 @@ func (r *Resolver) socketLocked(proto uint8, src packet.Addr, now time.Time, sta
 			closed = e.closed
 		}
 	}
-	wk := wildKey{proto, src.Port}
-	if e, ok := r.wild[wk]; ok {
-		switch {
-		case !alive(e, now):
-			delete(r.wild, wk)
-		case counts(e):
-			return e.proc, true, time.Time{}
-		case e.closed.After(closed):
-			closed = e.closed
+	checkWild := func(wk wildKey) (rules.Process, bool) {
+		if e, ok := r.wild[wk]; ok {
+			switch {
+			case !alive(e, now):
+				delete(r.wild, wk)
+			case counts(e):
+				return e.proc, true
+			case e.closed.After(closed):
+				closed = e.closed
+			}
+		}
+		return rules.Process{}, false
+	}
+	if p, ok := checkWild(wildKey{proto, src.Len, src.Port}); ok {
+		return p, true, time.Time{}
+	}
+	if src.Len == 4 {
+		if p, ok := checkWild(wildKey{proto, 16, src.Port}); ok {
+			return p, true, time.Time{}
 		}
 	}
 	return rules.Process{}, false, closed
@@ -519,8 +596,13 @@ func (r *Resolver) helperLocked(proto uint8, src packet.Addr) (rules.Process, bo
 	if pid, ok := r.helper[exactKey{proto, src}]; ok {
 		return rules.Process{PID: pid}, true
 	}
-	if pid, ok := r.helperWild[wildKey{proto, src.Port}]; ok {
+	if pid, ok := r.helperWild[wildKey{proto, src.Len, src.Port}]; ok {
 		return rules.Process{PID: pid}, true
+	}
+	if src.Len == 4 {
+		if pid, ok := r.helperWild[wildKey{proto, 16, src.Port}]; ok {
+			return rules.Process{PID: pid}, true
+		}
 	}
 	return rules.Process{}, false
 }
@@ -533,7 +615,7 @@ func (r *Resolver) storeHelper(rows []Endpoint, now time.Time) {
 			continue
 		}
 		if row.Unspecified {
-			w[wildKey{row.Proto, row.Addr.Port}] = row.PID
+			w[wildKey{row.Proto, row.Addr.Len, row.Addr.Port}] = row.PID
 			continue
 		}
 		h[exactKey{row.Proto, row.Addr}] = row.PID
@@ -555,7 +637,7 @@ func (r *Resolver) resolveAt(pid uint32, depth int) rules.Process {
 	p, ok := r.images[pid]
 	r.mu.Unlock()
 	if ok && (p.Name != "" || p.Path != "") {
-		if r.exited == nil || !r.exited(pid) {
+		if r.exited == nil || !r.exited(pid, p.Started) {
 			return p
 		}
 		// The process is gone and the PID may now belong to another one.
@@ -639,7 +721,11 @@ func (r *Resolver) SetImage(fn func(pid uint32) rules.Process) {
 
 // SetExited overrides the process-exit check. Tests use it.
 func (r *Resolver) SetExited(fn func(pid uint32) bool) {
-	r.exited = fn
+	if fn == nil {
+		r.exited = nil
+		return
+	}
+	r.exited = func(pid uint32, _ int64) bool { return fn(pid) }
 }
 
 // SetHelper overrides the IP Helper refresh. Tests use it.

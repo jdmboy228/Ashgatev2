@@ -439,12 +439,13 @@ func TestDNSFailureAnswersServfail(t *testing.T) {
 func TestTCPDNSDialsConfiguredServer(t *testing.T) {
 	e, _ := newEngine(t, testConfig(), fixedRes{p: rules.Process{PID: 5, Name: "curl.exe"}, ok: true}, &fakeDial{}, nil)
 	src := packet.V4(10, 0, 0, 5, 50070)
-	syn, _ := packet.BuildTCP(src, packet.V4(192, 168, 1, 1, 53), 0x02)
+	dst := packet.V4(192, 168, 1, 1, 53)
+	syn, _ := packet.BuildTCP(src, dst, 0x02)
 	if r := e.HandlePacket(syn, Meta{}, true); r.Action != ActionModified {
 		t.Fatal(r.Action)
 	}
 	e.mu.Lock()
-	flow := e.byClient[src]
+	flow := e.byClient[tcpKey{Src: src, Dst: dst}]
 	e.mu.Unlock()
 	if flow == nil || flow.dial.String() != "1.1.1.1:53" {
 		t.Fatalf("flow %+v", flow)

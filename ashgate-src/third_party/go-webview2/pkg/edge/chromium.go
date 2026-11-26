@@ -21,6 +21,7 @@ type Chromium struct {
 	controller            *ICoreWebView2Controller
 	webview               *ICoreWebView2
 	inited                uintptr
+	initFailed            uintptr
 	envCompleted          *iCoreWebView2CreateCoreWebView2EnvironmentCompletedHandler
 	controllerCompleted   *iCoreWebView2CreateCoreWebView2ControllerCompletedHandler
 	webMessageReceived    *iCoreWebView2WebMessageReceivedEventHandler
@@ -118,11 +119,14 @@ func (e *Chromium) Embed(hwnd uintptr) bool {
 			0,
 			0,
 		)
-		if r == 0 {
+		if r == 0 || int32(r) == -1 {
 			break
 		}
 		_, _, _ = w32.User32TranslateMessage.Call(uintptr(unsafe.Pointer(&msg)))
 		_, _, _ = w32.User32DispatchMessageW.Call(uintptr(unsafe.Pointer(&msg)))
+	}
+	if atomic.LoadUintptr(&e.initFailed) != 0 || e.webview == nil {
+		return false
 	}
 	e.Init("window.external={invoke:s=>window.chrome.webview.postMessage(s)}")
 	return true
@@ -184,32 +188,49 @@ func (e *Chromium) Release() uintptr {
 }
 
 func (e *Chromium) EnvironmentCompleted(res uintptr, env *ICoreWebView2Environment) uintptr {
-	if int64(res) < 0 {
-		log.Fatalf("Creating environment failed with %08x", res)
+	if int32(res) < 0 || env == nil {
+		log.Printf("Creating environment failed with %08x", uint32(res))
+		atomic.StoreUintptr(&e.initFailed, 1)
+		atomic.StoreUintptr(&e.inited, 1)
+		return 0
 	}
 	_, _, _ = env.vtbl.AddRef.Call(uintptr(unsafe.Pointer(env)))
 	e.environment = env
 
-	_, _, _ = env.vtbl.CreateCoreWebView2Controller.Call(
+	hr, _, _ := env.vtbl.CreateCoreWebView2Controller.Call(
 		uintptr(unsafe.Pointer(env)),
 		e.hwnd,
 		uintptr(unsafe.Pointer(e.controllerCompleted)),
 	)
+	if int32(hr) < 0 {
+		log.Printf("CreateCoreWebView2Controller call failed with %08x", uint32(hr))
+		atomic.StoreUintptr(&e.initFailed, 1)
+		atomic.StoreUintptr(&e.inited, 1)
+	}
 	return 0
 }
 
 func (e *Chromium) CreateCoreWebView2ControllerCompleted(res uintptr, controller *ICoreWebView2Controller) uintptr {
-	if int64(res) < 0 {
-		log.Fatalf("Creating controller failed with %08x", res)
+	if int32(res) < 0 || controller == nil {
+		log.Printf("Creating controller failed with %08x", uint32(res))
+		atomic.StoreUintptr(&e.initFailed, 1)
+		atomic.StoreUintptr(&e.inited, 1)
+		return 0
 	}
 	_, _, _ = controller.vtbl.AddRef.Call(uintptr(unsafe.Pointer(controller)))
 	e.controller = controller
 
 	var token _EventRegistrationToken
-	_, _, _ = controller.vtbl.GetCoreWebView2.Call(
+	hr, _, _ := controller.vtbl.GetCoreWebView2.Call(
 		uintptr(unsafe.Pointer(controller)),
 		uintptr(unsafe.Pointer(&e.webview)),
 	)
+	if int32(hr) < 0 || e.webview == nil {
+		log.Printf("GetCoreWebView2 failed with %08x", uint32(hr))
+		atomic.StoreUintptr(&e.initFailed, 1)
+		atomic.StoreUintptr(&e.inited, 1)
+		return 0
+	}
 	_, _, _ = e.webview.vtbl.AddRef.Call(
 		uintptr(unsafe.Pointer(e.webview)),
 	)

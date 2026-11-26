@@ -69,11 +69,14 @@ func (e *Engine) ForwardUDP(ctx context.Context, d UDPDatagram) error {
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
-	e.mu.Lock()
-	flow := e.udp[d.Key]
-	e.mu.Unlock()
+	flow := d.flow
 	if flow == nil {
-		return nil
+		e.mu.Lock()
+		flow = e.udp[d.Key]
+		e.mu.Unlock()
+		if flow == nil {
+			return nil
+		}
 	}
 	flow.touch(e.now())
 	if flow.proxy.Type == "http" || (flow.sys && flow.proxy.Type == "socks5") {
@@ -133,7 +136,9 @@ func (e *Engine) udpSession(ctx context.Context, flow *udpFlow, payload []byte) 
 		e.failDNS(flow, payload)
 		return nil, nil
 	}
-	sess, err := e.dial.DialUDP(ctx, flow.proxy)
+	dialCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	sess, err := e.dial.DialUDP(dialCtx, flow.proxy)
+	cancel()
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
@@ -212,6 +217,7 @@ func (e *Engine) retireUDP(flow *udpFlow) {
 	if cur, ok := e.udp[flow.key]; ok && cur == flow {
 		delete(e.udp, flow.key)
 	}
+	e.removeDrainingLocked(flow)
 	dec := flow.live
 	flow.live = false
 	if dec && flow.stat != nil {
@@ -293,6 +299,26 @@ func (e *Engine) sweep(now time.Time) {
 			staleUDP = append(staleUDP, f)
 		}
 	}
+	keepDraining := e.draining[:0]
+	for _, f := range e.draining {
+		f.mu.Lock()
+		closed := f.closed
+		f.mu.Unlock()
+		if closed {
+			continue
+		}
+		keepDraining = append(keepDraining, f)
+		last := time.Unix(0, f.last.Load())
+		idle := udpIdle
+		if f.orig.Port == 53 {
+			idle = dnsIdle
+		}
+		if now.Sub(last) > idle {
+			staleUDP = append(staleUDP, f)
+		}
+	}
+	clear(e.draining[len(keepDraining):])
+	e.draining = keepDraining
 	for _, f := range staleTCP {
 		e.dropFlowLocked(f)
 	}
@@ -309,12 +335,27 @@ func (e *Engine) sweep(now time.Time) {
 	}
 }
 
+func (e *Engine) removeDrainingLocked(flow *udpFlow) {
+	for i, f := range e.draining {
+		if f == flow {
+			last := len(e.draining) - 1
+			e.draining[i] = e.draining[last]
+			e.draining[last] = nil
+			e.draining = e.draining[:last]
+			return
+		}
+	}
+}
+
 func (e *Engine) closeAll() {
 	e.mu.Lock()
 	var udps []*udpFlow
 	for _, f := range e.udp {
 		udps = append(udps, f)
 	}
+	udps = append(udps, e.draining...)
+	clear(e.draining)
+	e.draining = nil
 	var tcps []*tcpFlow
 	for _, f := range e.byClient {
 		tcps = append(tcps, f)
@@ -368,7 +409,7 @@ func (e *Engine) udpFlowMatchesLocked(flow *udpFlow, snap *snapshot) bool {
 				}
 				wantProxy = *snap.sysProxy
 				wantSys = true
-			case func() bool { _, ok := dohServers[flow.orig]; return ok }():
+			case flow.orig.Port == 853 || isDoHServer(flow.orig):
 				if snap.sysProxy == nil {
 					return false
 				}

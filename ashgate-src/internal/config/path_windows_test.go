@@ -130,7 +130,7 @@ func TestSecureHandleRefusesNilDACLAndJunction(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(deepWV, "cache.dat"), []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := secureTree(realDir, owner, dacl, 0); err != nil {
+	if err := secureTree(realDir, owner, dacl, dacl, 0); err != nil {
 		t.Fatalf("secureTree on normal dir failed: %v", err)
 	}
 
@@ -146,7 +146,7 @@ func TestSecureHandleRefusesNilDACLAndJunction(t *testing.T) {
 	if out, err := exec.Command("cmd", "/c", "mklink", "/J", childJunction, base).CombinedOutput(); err != nil {
 		t.Skipf("mklink /J unavailable: %v (%s)", err, strings.TrimSpace(string(out)))
 	}
-	if err := secureTree(realDir, owner, dacl, 0); err == nil {
+	if err := secureTree(realDir, owner, dacl, dacl, 0); err == nil {
 		t.Fatal("secureTree accepted child NTFS junction")
 	}
 }

@@ -18,3 +18,14 @@ Changes:
   pointers across the `winloader.Proc.Call` boundary), so an elevated host can pin the
   machine-wide `HKLM` WebView2 Runtime under Program Files instead of letting
   `WebView2Loader.dll` fall back to user-writable `HKCU` registry keys.
+- `pkg/edge/chromium.go`: added `initFailed`, fixed COM `HRESULT` sign checks (`int32(res) < 0`
+  and nil interface checks instead of `int64(res) < 0` + `log.Fatalf`) in
+  `EnvironmentCompleted` and `CreateCoreWebView2ControllerCompleted`, guarded `GetMessageW`
+  errors (`r == 0 || int32(r) == -1`), and made `Embed()` return `false` when initialization
+  fails instead of crashing or dereferencing a nil `e.webview`.
+- `pkg/edge/corewebview2.go`, `pkg/edge/ICoreWebViewSettings.go`: check the COM `HRESULT`
+  return value (`int32(hr) < 0`) instead of Win32 `GetLastError` in `GetSettings`,
+  `PutAreDevToolsEnabled`, `GetAreDefaultContextMenusEnabled`, and
+  `PutAreDefaultContextMenusEnabled`.
+- `webview.go`: return `nil` (after `w.Destroy()`) instead of calling `log.Fatal` if applying
+  WebView2 settings fails in `NewWithOptions`.

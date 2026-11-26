@@ -27,6 +27,7 @@ type Endpoint struct {
 	Proto       uint8
 	Addr        packet.Addr
 	PID         uint32
+	State       uint32
 	Unspecified bool
 }
 
@@ -39,6 +40,9 @@ func ParseOwnerTable(buf []byte, kind TableKind) ([]Endpoint, error) {
 	}
 	count := binary.LittleEndian.Uint32(buf[:4])
 	rowSize, proto, parse := rowLayout(kind)
+	if rowSize == 0 {
+		return nil, fmt.Errorf("unknown ip helper table kind %d", kind)
+	}
 	need := 4 + int(count)*rowSize
 	if count > 1_000_000 || need < 0 || need > len(buf) {
 		return nil, fmt.Errorf("ip helper table count %d does not fit %d bytes", count, len(buf))
@@ -72,7 +76,9 @@ func rowLayout(kind TableKind) (int, uint8, func([]byte) Endpoint) {
 }
 
 func parseTCP4(row []byte) Endpoint {
-	return v4row(binary.LittleEndian.Uint32(row[4:8]), binary.LittleEndian.Uint32(row[8:12]), binary.LittleEndian.Uint32(row[20:24]))
+	ep := v4row(binary.LittleEndian.Uint32(row[4:8]), binary.LittleEndian.Uint32(row[8:12]), binary.LittleEndian.Uint32(row[20:24]))
+	ep.State = binary.LittleEndian.Uint32(row[0:4])
+	return ep
 }
 
 func parseUDP4(row []byte) Endpoint {
@@ -80,7 +86,9 @@ func parseUDP4(row []byte) Endpoint {
 }
 
 func parseTCP6(row []byte) Endpoint {
-	return v6row(row[0:16], binary.LittleEndian.Uint32(row[20:24]), binary.LittleEndian.Uint32(row[52:56]))
+	ep := v6row(row[0:16], binary.LittleEndian.Uint32(row[20:24]), binary.LittleEndian.Uint32(row[52:56]))
+	ep.State = binary.LittleEndian.Uint32(row[48:52])
+	return ep
 }
 
 func parseUDP6(row []byte) Endpoint {

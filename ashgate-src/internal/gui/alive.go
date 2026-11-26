@@ -58,6 +58,12 @@ func (c *controller) refreshAlive() {
 	if !stale {
 		return
 	}
+	if len(rs) == 0 {
+		c.mu.Lock()
+		c.alive, c.aliveAt, c.aliveBusy = map[string]bool{}, time.Now(), false
+		c.mu.Unlock()
+		return
+	}
 	go func() {
 		m := aliveRules(rs, snapshotProcs())
 		c.mu.Lock()

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"slices"
 	"strconv"
 	"sync"
 )
@@ -79,7 +80,7 @@ func (s *SOCKS) serve(c net.Conn) {
 	}
 	needAuth := s.User != "" || s.Pass != ""
 	if needAuth {
-		if !contains(methods, 0x02) {
+		if !slices.Contains(methods, 0x02) {
 			_, _ = c.Write([]byte{5, 0xff})
 			return
 		}
@@ -245,13 +246,4 @@ func encodeUDP(dst *net.UDPAddr, payload []byte) ([]byte, error) {
 	binary.BigEndian.PutUint16(out[8:10], uint16(dst.Port))
 	copy(out[10:], payload)
 	return out, nil
-}
-
-func contains(b []byte, v byte) bool {
-	for _, x := range b {
-		if x == v {
-			return true
-		}
-	}
-	return false
 }

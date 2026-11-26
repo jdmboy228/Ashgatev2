@@ -24,9 +24,16 @@ const ksEvery = 15 * time.Second
 // ksLoop keeps the firewall rules in step with the config and with the
 // processes that start while capture is stopped.
 func (c *controller) ksLoop() {
+	c.syncKill()
+	t := time.NewTicker(ksEvery)
+	defer t.Stop()
 	for {
-		c.syncKill()
-		time.Sleep(ksEvery)
+		select {
+		case <-c.done:
+			return
+		case <-t.C:
+			c.syncKill()
+		}
 	}
 }
 

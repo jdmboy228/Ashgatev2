@@ -26,10 +26,12 @@ func pushLog(s string) {
 	}
 	logMu.Lock()
 	defer logMu.Unlock()
-	logLines = append(logLines, logLine{at: time.Now(), s: s})
-	if len(logLines) > 64 {
-		logLines = logLines[len(logLines)-64:]
+	if len(logLines) >= 64 {
+		copy(logLines, logLines[1:])
+		logLines[len(logLines)-1] = logLine{at: time.Now(), s: s}
+		return
 	}
+	logLines = append(logLines, logLine{at: time.Now(), s: s})
 }
 
 // RecentLog is the Xray log text recorded since t. Tests use it when a
@@ -73,12 +75,13 @@ func Explain(err error) error {
 	msg := err.Error()
 	low := strings.ToLower(msg)
 	blob := low + "\n" + strings.ToLower(RecentLog(time.Now().Add(-12*time.Second)))
+	failCtx := strings.Contains(blob, "fail") || strings.Contains(blob, "не уда") || strings.Contains(blob, "error") || strings.Contains(blob, "invalid") || strings.Contains(blob, "mismatch")
 	switch {
 	case strings.Contains(msg, "Не удалось разобрать ссылку VLESS"):
 		return err
 	case strings.Contains(msg, "локальный мост не запущен"):
 		return err
-	case strings.Contains(blob, "reality") || (strings.Contains(blob, "handshake") && (strings.Contains(blob, "fail") || strings.Contains(blob, "не уда"))):
+	case failCtx && (strings.Contains(blob, "reality") || strings.Contains(blob, "handshake")):
 		return errors.New("REALITY: рукопожатие не удалось. Проверьте публичный ключ, short id и SNI")
 	case strings.Contains(blob, "x509:") || strings.Contains(blob, "certificate signed by unknown authority"):
 		// REALITY with a wrong key ends up checking the decoy site's

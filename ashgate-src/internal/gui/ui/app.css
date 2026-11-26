@@ -232,7 +232,6 @@ nav { display: flex; flex-direction: column; gap: 4px; }
 .badge.err { background: var(--err-bg); color: var(--err); }
 .badge.warn { background: var(--warn-bg); color: var(--warn); }
 .badge.info i { background: var(--tx3); }
-.badge.acc { color: var(--acc); }
 .badge.neu i { background: var(--tx3); }
 .badge.plain { padding: 0 8px; }
 .badge.plain i { display: none; }
@@ -258,7 +257,7 @@ nav { display: flex; flex-direction: column; gap: 4px; }
 
 /* ---- inputs ---- */
 .field { position: relative; }
-.field input, .field select, .selectish, .set input.mono, .set select, .dialog select {
+.field input, .field select, .set input.mono, .set select, .dialog select {
   height: 32px; width: 100%; border-radius: 8px; border: 1px solid var(--stroke-ctl); border-bottom-color: var(--stroke-in);
   background: var(--ctl); color: var(--tx); padding: 0 11px; outline: none;
 }
@@ -274,7 +273,7 @@ nav { display: flex; flex-direction: column; gap: 4px; }
 .field input::placeholder, .field textarea::placeholder { color: var(--tx3); }
 .field input:disabled, .set input:disabled, .set select:disabled { opacity: .5; }
 .field.bad input, .field.bad textarea, .field.bad select { border-bottom-color: var(--err); box-shadow: inset 0 -1px 0 var(--err); }
-.field-err, .parse-err { color: var(--err); font-size: 12px; line-height: 16px; margin-top: 6px; }
+.field-err { color: var(--err); font-size: 12px; line-height: 16px; margin-top: 6px; }
 .field.search input { padding-left: 34px; }
 .field.search svg { position: absolute; left: 11px; top: 8px; color: var(--tx3); pointer-events: none; }
 .field label, .lbl { display: block; color: var(--tx); margin-bottom: 6px; }
@@ -304,19 +303,15 @@ select option { background: var(--flyout); color: var(--tx); }
 .stack .sub { font-size: 12px; line-height: 16px; color: var(--tx3); }
 .bytes { text-align: right; font-size: 12px; line-height: 16px; color: var(--tx3); }
 .dim { opacity: .45; }
-.num { color: var(--tx3); font-variant-numeric: tabular-nums; }
-.grip { color: var(--tx3); cursor: grab; border: 0; background: none; padding: 4px; }
 tr.errline:hover { background: transparent !important; }
 .errpanel {
   margin: 0 0 8px; padding: 10px 12px; border-radius: 8px; background: var(--err-bg);
   display: flex; align-items: center; gap: 8px; white-space: normal;
 }
 .errpanel .msg { flex: 1; color: var(--err); line-height: 18px; font-family: "Cascadia Mono", "JetBrains Mono", Consolas, monospace; font-size: 12px; }
-.drop-line td { box-shadow: inset 0 2px 0 var(--acc) !important; }
 
 #log-table { overflow-x: auto; overflow-y: hidden; border-radius: 14px; max-width: 100%; }
 table.table { min-width: 560px; }
-.table td.trunc, .table .trunc { overflow: hidden; text-overflow: ellipsis; }
 #log-table td:nth-child(4) { max-width: 0; width: 38%; overflow: hidden; text-overflow: ellipsis; }
 #log-table td:nth-child(2) { max-width: 180px; }
 @container page (max-width: 759.98px) {
@@ -396,7 +391,6 @@ table.table { min-width: 560px; }
   display: flex; align-items: center; gap: 16px; min-height: 68px; padding: 14px 16px;
   background: var(--card); border: 1px solid var(--stroke); border-radius: 14px;
 }
-.set > svg { flex: none; color: var(--tx); }
 .set .txt { flex: 1; min-width: 0; }
 .set .t { color: var(--tx); }
 .set .d { font-size: 12px; line-height: 16px; color: var(--tx2); }
@@ -491,8 +485,7 @@ table.table { min-width: 560px; }
 .ap-dot.info { background: var(--tx2); }
 .ap-folder { border-radius: 8px; background: var(--neutral); display: grid; place-items: center; color: var(--tx); }
 .ap-name { min-width: 0; flex: 1; display: flex; flex-direction: column; }
-.ap-name .nm { display: flex; align-items: center; gap: 8px; min-width: 0; font-weight: 600; color: var(--tx); }
-.ap-name .nm { overflow: hidden; }
+.ap-name .nm { display: flex; align-items: center; gap: 8px; min-width: 0; font-weight: 600; color: var(--tx); overflow: hidden; }
 .ap-name .nm > span { flex: 0 0 auto; max-width: 70%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* An error badge matters more than the children chip. */
 .ap-name .nm:has(em.bad) .chip { display: none; }
@@ -648,10 +641,6 @@ table.table { min-width: 560px; }
 .proc-line { display: flex; gap: 8px; align-items: center; min-width: 0; }
 .proc-line .field { flex: 1 1 auto; min-width: 0; }
 .proc-line .btn { flex: none; }
-.rule-extra { display: flex; flex-wrap: wrap; gap: 16px 24px; margin-top: 14px; align-items: flex-end; }
-.picker { margin-top: 8px; border-radius: 8px; border: 1px solid var(--stroke); overflow: hidden; background: var(--sub-h); max-height: 200px; display: flex; flex-direction: column; }
-.pick { width: 100%; height: 32px; border: 0; background: transparent; border-radius: 8px; display: grid; grid-template-columns: 22px minmax(72px, .9fr) auto minmax(0, 1.4fr) 16px; gap: 8px; align-items: center; padding: 0 8px; text-align: left; color: var(--tx); min-width: 0; }
-.pick.on { background: var(--sub-sel); }
 @container dlg (max-width: 479.98px) {
   .dialog .grid, .vless-grid { grid-template-columns: 1fr; }
   .vless-grid .span2 { grid-column: auto; }

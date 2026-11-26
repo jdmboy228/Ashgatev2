@@ -17,7 +17,6 @@ function setHTML(el, html) {
 }
 // Fluent icons live in icons.js (FLUENT). These few are drawn here.
 const ICONS = {
-  grip: '<circle cx="9" cy="6" r="1.3" fill="currentColor" stroke="none"/><circle cx="15" cy="6" r="1.3" fill="currentColor" stroke="none"/><circle cx="9" cy="12" r="1.3" fill="currentColor" stroke="none"/><circle cx="15" cy="12" r="1.3" fill="currentColor" stroke="none"/><circle cx="9" cy="18" r="1.3" fill="currentColor" stroke="none"/><circle cx="15" cy="18" r="1.3" fill="currentColor" stroke="none"/>',
   checkbox: '<rect x="4" y="4" width="16" height="16" rx="4" fill="currentColor" stroke="none"/><path d="m8 12 3 3 5-6" stroke="var(--acc-tx)"/>',
   square: '<rect x="4" y="4" width="16" height="16" rx="4"/>',
 };
@@ -59,11 +58,17 @@ function icon(name, size) {
   size = size || 16;
   const f = (size >= 18 && FLUENT[name + "20"]) || FLUENT[name] || FLUENT[name + "20"];
   if (f) return `<svg width="${size}" height="${size}" viewBox="0 0 ${f[0]} ${f[0]}" fill="currentColor" aria-hidden="true"><path d="${f[1]}"/></svg>`;
-  const fill = name === "grip" ? "currentColor" : "none";
-  return `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="${fill}" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">${ICONS[name] || ""}</svg>`;
+  return `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">${ICONS[name] || ""}</svg>`;
 }
 function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+function plural(n, one, few, many) {
+  const m10 = n % 10;
+  const m100 = n % 100;
+  if (m10 === 1 && m100 !== 11) return one;
+  if (m10 >= 2 && m10 <= 4 && (m100 < 12 || m100 > 14)) return few;
+  return many;
 }
 function bytes(n) {
   n = Math.abs(Number(n) || 0);
@@ -388,7 +393,7 @@ function killBanner(ks) {
     text = "Приложения с прокси не выйдут в сеть напрямую. Если перехват остановится или Ashgate закроется, Брандмауэр Windows отключит их от сети.";
   } else if (blocked.length) {
     cls += " warn";
-    title = `Kill switch: ${blocked.length} ${progWord(blocked.length)} без сети`;
+    title = `Kill switch: ${blocked.length} ${plural(blocked.length, "программа", "программы", "программ")} без сети`;
     text = "Перехват выключен, поэтому Брандмауэр Windows блокирует: " + blocked.map((p) => appLabel(p)).join(", ") + ". Нажмите «Старт», чтобы они снова работали через прокси.";
   } else {
     title = "Kill switch включён";
@@ -398,13 +403,6 @@ function killBanner(ks) {
   const err = ks.error ? `<p class="miss">Брандмауэр: ${esc(ks.error)}</p>` : "";
   const btn = !state.running ? `<button class="btn pri sm" type="button" data-act="ks-start"${powerBusy ? " disabled" : ""}>${icon("power", 14)}Старт</button>` : "";
   return `<div class="${cls}">${icon("shield", 18)}<div class="txt"><strong>${esc(title)}</strong><p>${esc(text)}</p>${miss}${err}</div>${btn}</div>`;
-}
-function progWord(n) {
-  const m10 = n % 10;
-  const m100 = n % 100;
-  if (m10 === 1 && m100 !== 11) return "программа";
-  if (m10 >= 2 && m10 <= 4 && (m100 < 12 || m100 > 14)) return "программы";
-  return "программ";
 }
 function fillProxies() {
   const host = document.getElementById("proxy-table");
@@ -444,12 +442,39 @@ function baseName(process) {
 function appLabel(process) {
   return baseName(process).replace(/\.exe$/i, "");
 }
+const iconCache = new Map();
+const iconInflight = new Map();
 const iconMisses = new Set();
 // Forget misses now and then: a program may be installed meanwhile.
 setInterval(() => iconMisses.clear(), 5 * 60 * 1000);
-function iconMiss(img) {
-  iconMisses.add(img.dataset.key || "");
-  img.remove();
+function mountAppIcon(span, key, url) {
+  const img = document.createElement("img");
+  img.alt = "";
+  img.draggable = false;
+  img.dataset.key = key;
+  img.onload = () => span.classList.add("hasimg");
+  img.onerror = () => { iconMisses.add(key); img.remove(); };
+  img.src = url;
+  span.insertBefore(img, span.firstChild);
+  span.removeAttribute("data-icon-key");
+}
+function loadAppIcon(key, path) {
+  if (iconCache.has(key) || iconInflight.has(key) || iconMisses.has(key)) return;
+  const p = fetch("/api/icon?path=" + encodeURIComponent(path), { headers: { "X-Ashgate-Token": TOKEN } })
+    .then((res) => {
+      if (!res.ok) throw new Error("icon");
+      return res.blob();
+    })
+    .then((blob) => {
+      const url = URL.createObjectURL(blob);
+      iconCache.set(key, url);
+      document.querySelectorAll(".appicon[data-icon-key]").forEach((span) => {
+        if (span.dataset.iconKey === key && !span.querySelector("img")) mountAppIcon(span, key, url);
+      });
+    })
+    .catch(() => { iconMisses.add(key); })
+    .finally(() => { iconInflight.delete(key); });
+  iconInflight.set(key, p);
 }
 // appHue gives every app its own tile colour, the same on every redraw.
 function appHue(name) {
@@ -463,11 +488,15 @@ function appIconHTML(process, style) {
   const st = ` style="--hue:${appHue(appLabel(process))};${style || ""}"`;
   // Names and masks are resolved to an exe by the server; 404 keeps the letter.
   if (DEMO || !path.trim()) return `<span class="appicon"${st}>${letter}</span>`;
+  const key = path.toLowerCase();
   // Names without an icon are remembered, so a redraw does not ask again.
-  if (iconMisses.has(path.toLowerCase())) return `<span class="appicon"${st}>${letter}</span>`;
-  const src = "/api/icon?path=" + encodeURIComponent(path) + "&t=" + encodeURIComponent(TOKEN);
-  // draggable=false: a dragged icon would carry its URL, token included.
-  return `<span class="appicon"${st}><img alt="" draggable="false" src="${esc(src)}" data-key="${esc(path.toLowerCase())}" onload="this.parentNode.classList.add('hasimg')" onerror="iconMiss(this)">${letter}</span>`;
+  if (iconMisses.has(key)) return `<span class="appicon"${st}>${letter}</span>`;
+  const cached = iconCache.get(key);
+  if (cached) {
+    return `<span class="appicon hasimg"${st}><img alt="" draggable="false" src="${esc(cached)}" data-key="${esc(key)}">${letter}</span>`;
+  }
+  loadAppIcon(key, path);
+  return `<span class="appicon"${st} data-icon-key="${esc(key)}">${letter}</span>`;
 }
 
 function eventKey(e) {
@@ -513,30 +542,88 @@ function fillLog() {
     return;
   }
   const head = ["Время", "Процесс", "Протокол", "Назначение", "Через", "Статус", "Трафик"];
-  const body = rows.map((e) => {
+  let tbody = host.querySelector("table.table > tbody");
+  if (!tbody) {
+    host.innerHTML = `<table class="table"><thead><tr>${head.map((h) => `<th>${h}</th>`).join("")}</tr></thead><tbody></tbody></table>`;
+    host._html = null;
+    tbody = host.querySelector("tbody");
+  }
+  const existingMain = new Map();
+  const existingErr = new Map();
+  for (const tr of tbody.children) {
+    if (tr.classList.contains("errline")) {
+      const ek = tr.dataset.errFor || "";
+      if (ek && !existingErr.has(ek)) existingErr.set(ek, tr);
+      else tr.remove();
+    } else {
+      const k = tr.dataset.key || "";
+      if (!existingMain.has(k)) existingMain.set(k, []);
+      existingMain.get(k).push(tr);
+    }
+  }
+  const tmp = document.createElement("tbody");
+  const keep = new Set();
+  const desired = [];
+  for (const e of rows) {
     const key = eventKey(e);
     const open = e.status === "error" && openErr === key;
-    // Rows are selected by event, not by position: new events push rows down.
-    const main = `<tr class="${sel.log === key ? "sel" : ""}" data-act="sel-log" data-key="${esc(key)}">
+    const cls = sel.log === key ? "sel" : "";
+    const via = viaText(e.via);
+    const stHtml = statusBadge(e.status);
+    const bytesHtml = `<div>↑ ${esc(bytes(e.bytesUp))}</div><div>↓ ${esc(bytes(e.bytesDown))}</div>`;
+    const pool = existingMain.get(key);
+    let tr = pool && pool.length ? pool.shift() : null;
+    if (tr) {
+      if (tr.className !== cls) tr.className = cls;
+      const tds = tr.children;
+      if (tds[4] && tds[4].textContent !== via) tds[4].textContent = via;
+      if (tds[5] && tds[5]._html !== stHtml) { tds[5].innerHTML = stHtml; tds[5]._html = stHtml; }
+      if (tds[6] && tds[6]._html !== bytesHtml) { tds[6].innerHTML = bytesHtml; tds[6]._html = bytesHtml; }
+    } else {
+      tmp.innerHTML = `<tr class="${cls}" data-act="sel-log" data-key="${esc(key)}">
     <td class="mono">${esc(e.time)}</td>
     <td><div class="stack"><span class="main">${esc(appLabel(e.process))}</span><span class="sub mono">PID ${e.pid || 0}${e.parent ? " · от " + esc(appLabel(e.parent)) : ""}</span></div></td>
     <td><span class="tag ${e.proto === "UDP" ? "udp" : "tcp"}">${esc(e.proto || "")}</span></td>
     <td class="mono" style="color:var(--tx)">${esc(e.dest)}</td>
-    <td>${esc(viaText(e.via))}</td>
-    <td>${statusBadge(e.status)}</td>
-    <td class="bytes mono"><div>↑ ${esc(bytes(e.bytesUp))}</div><div>↓ ${esc(bytes(e.bytesDown))}</div></td>
+    <td>${esc(via)}</td>
+    <td>${stHtml}</td>
+    <td class="bytes mono">${bytesHtml}</td>
   </tr>`;
-    if (!open) return main;
-    const err = e.error || "ошибка";
-    return main + `<tr class="errline"><td colspan="7"><div class="errpanel"><span class="msg">${esc(err)}</span><button class="btn sm" type="button" data-act="copy-text" data-text="${esc(err)}">Копировать</button><button class="btn sm" type="button" data-act="goto-rule" data-proc="${esc(e.process || "")}">К правилу</button></div></td></tr>`;
-  }).join("");
-  setHTML(host, `<table class="table"><thead><tr>${head.map((h) => `<th>${h}</th>`).join("")}</tr></thead><tbody>${body}</tbody></table>`);
+      tr = tmp.firstElementChild;
+      tr.children[5]._html = stHtml;
+      tr.children[6]._html = bytesHtml;
+    }
+    keep.add(tr);
+    desired.push(tr);
+    if (open) {
+      const err = e.error || "ошибка";
+      let errTr = existingErr.get(key);
+      if (errTr) {
+        existingErr.delete(key);
+      } else {
+        tmp.innerHTML = `<tr class="errline" data-err-for="${esc(key)}"><td colspan="7"><div class="errpanel"><span class="msg">${esc(err)}</span><button class="btn sm" type="button" data-act="copy-text" data-text="${esc(err)}">Копировать</button><button class="btn sm" type="button" data-act="goto-rule" data-proc="${esc(e.process || "")}">К правилу</button></div></td></tr>`;
+        errTr = tmp.firstElementChild;
+      }
+      keep.add(errTr);
+      desired.push(errTr);
+    }
+  }
+  for (const tr of Array.from(tbody.children)) {
+    if (!keep.has(tr)) tr.remove();
+  }
+  let cursor = tbody.firstElementChild;
+  for (const node of desired) {
+    if (cursor === node) cursor = cursor.nextElementSibling;
+    else tbody.insertBefore(node, cursor);
+  }
 }
 
 function render() {
   if (!state) return;
   if (page === "tray") {
-    document.getElementById("app").hidden = true;
+    const appEl = document.getElementById("app");
+    appEl.hidden = true;
+    appEl.inert = false;
     const tray = document.getElementById("tray");
     tray.hidden = false;
     if (tray.dataset.built !== "1") { tray.innerHTML = trayHTML(); tray.dataset.built = "1"; }
@@ -564,11 +651,12 @@ function render() {
   fillPage();
   if (document.getElementById("modal").drawnFor !== modal) renderModal();
   else paintSocksPreview();
-  if (state.error) showToast(state.error);
 }
 
 function renderModal() {
   const root = document.getElementById("modal");
+  const appEl = document.getElementById("app");
+  if (appEl) appEl.inert = !!modal;
   if (!modal) { root.innerHTML = ""; root.drawnFor = null; return; }
   // Typed text is in the model already (see the input handlers), so a
   // redraw never reads the fields back and values set by code win. A redraw
@@ -584,6 +672,11 @@ function renderModal() {
   if (modal.kind === "proxy") root.innerHTML = proxyDialog();
   else if (AP_MODALS[modal.kind]) root.innerHTML = AP_MODALS[modal.kind]();
   else if (modal.kind === "confirm" || modal.kind === "alert") root.innerHTML = confirmDialog();
+  const dlgEl = root.querySelector("#dlg");
+  if (dlgEl) {
+    dlgEl.setAttribute("role", "dialog");
+    dlgEl.setAttribute("aria-modal", "true");
+  }
   root.drawnFor = modal;
   if (!again) {
     const first = root.querySelector("[autofocus]");
@@ -621,7 +714,11 @@ function proxyDialog() {
   const type = p.subscription ? "sub" : p.type || "socks5";
   // A saved subscription stays one (its button does nothing); the type of
   // other proxies can change.
-  const types = p.subscription ? [["sub", "Подписка"]] : [["socks5", "SOCKS5"], ["http", "HTTP"], ["vless", "VLESS"], ["sub", "Подписка"]];
+  const types = p.subscription
+    ? [["sub", "Подписка"]]
+    : modal.index < 0
+      ? [["socks5", "SOCKS5"], ["http", "HTTP"], ["vless", "VLESS"], ["sub", "Подписка"]]
+      : [["socks5", "SOCKS5"], ["http", "HTTP"], ["vless", "VLESS"]];
   const vless = type === "vless";
   const sub = type === "sub";
   // autocomplete="off": WebView2 must not keep typed links, UUIDs, keys,
@@ -645,21 +742,15 @@ function proxyDialog() {
 function subFields(p) {
   if (p.subscription) {
     const s = p.subscription;
+    const count = s.count || 0;
     return `<div style="height:14px"></div><label class="lbl">Подписка</label>
-      <div class="help">${esc(s.host || "")} · ${esc(serverWord(s.count || 0))} · ${esc(subUpdated(s))}</div>
+      <div class="help">${esc(s.host || "")} · ${esc(`${count} ${plural(count, "сервер", "сервера", "серверов")}`)} · ${esc(subUpdated(s))}</div>
       <div class="help">Адрес хранится зашифрованным. Чтобы сменить его, удалите подписку и добавьте заново.</div>`;
   }
   return `<div style="height:14px"></div><label class="lbl">Ссылка подписки</label>
       <div class="field${modal.subError ? " bad" : ""}"><input class="mono" id="p-suburl" value="${esc(p.subUrl || "")}" placeholder="https://…/sub/…"></div>
       ${modal.subError ? `<div class="field-err">${esc(modal.subError)}</div>` : ""}
       <div class="help">Подписка 3x-ui. Все серверы из неё — одна группа: XHTTP основной, RAW запасной, переключение само. Обновляется раз в сутки; адрес хранится зашифрованным.</div>`;
-}
-function serverWord(n) {
-  const m10 = n % 10;
-  const m100 = n % 100;
-  if (m10 === 1 && m100 !== 11) return n + " сервер";
-  if (m10 >= 2 && m10 <= 4 && (m100 < 12 || m100 > 14)) return n + " сервера";
-  return n + " серверов";
 }
 function subUpdated(s) {
   // Go writes a zero time as 0001-01-01: never updated.
@@ -798,23 +889,18 @@ function typeIconName(t) {
   if (t === "vless") return "vless";
   return "socks";
 }
-function ruleWord(n) {
-  const m10 = n % 10;
-  const m100 = n % 100;
-  if (m10 === 1 && m100 !== 11) return "правило";
-  if (m10 >= 2 && m10 <= 4 && (m100 < 12 || m100 > 14)) return "правила";
-  return "правил";
-}
 function proxySub(p) {
   const n = (cfg().rules || []).filter((r) => r.proxy === p.name).length;
   const parts = [];
-  if (p.subscription) parts.push(serverWord(p.subscription.count || 0));
-  else if (p.type === "vless" && p.vless) {
+  if (p.subscription) {
+    const count = p.subscription.count || 0;
+    parts.push(`${count} ${plural(count, "сервер", "сервера", "серверов")}`);
+  } else if (p.type === "vless" && p.vless) {
     if (p.vless.network) parts.push(String(p.vless.network).toUpperCase());
     if (p.vless.security) parts.push(String(p.vless.security).toUpperCase());
   } else if (p.username) parts.push(p.username);
   else parts.push("без логина");
-  parts.push(n ? n + " " + ruleWord(n) : "не используется");
+  parts.push(n ? `${n} ${plural(n, "правило", "правила", "правил")}` : "не используется");
   if (p.type === "http") parts.push("без UDP");
   else if (p.type !== "vless") parts.push("UDP есть");
   return parts.join(" · ");
@@ -1294,7 +1380,7 @@ async function commitProxy() {
       return;
     }
     if (modal !== m) return; // cancelled while the link was parsed
-    if (p.socksPort < 0 || p.socksPort > 65535) { showToast("Локальный SOCKS5-порт: число от 1 до 65535 или пусто"); return; }
+    if (p.socksPort < 0 || p.socksPort > 65535) { m.portError = "Локальный SOCKS5-порт: число от 1 до 65535 или пусто"; renderModal(); return; }
     delete p.username;
     delete p.password;
     if (!p.socksPort) delete p.socksPort;
@@ -1323,24 +1409,27 @@ async function commitProxy() {
   if (!p.name) p.name = uniqueProxyName(defaultProxyName(p), m.index);
   if (!validProxyName(p.name)) { m.nameError = NAME_RULE; renderModal(); return; }
   if (uniqueProxyName(p.name, m.index) !== p.name) { m.nameError = "Прокси с таким именем уже есть."; renderModal(); return; }
-  // Work on the live config, but keep a copy: a rejected save must not
-  // leave the new proxy in the list (a retry would add it twice).
-  const before = JSON.parse(JSON.stringify(cfg()));
+  const prevSel = sel.proxy;
   const list = cfg().proxies;
   const oldName = m.index >= 0 ? list[m.index].name : "";
   if (m.index < 0) list.push(proxyPayload(p));
   else list[m.index] = proxyPayload(p);
   if (oldName && oldName !== p.name) renameProxyRefs(oldName, p.name);
+  sel.proxy = m.index < 0 ? list.length - 1 : m.index;
   modal = null;
   built = "";
   render();
   // A save that applied with a warning (a busy port) is still saved: the
   // dialog stays closed and saveConfig shows the warning.
-  saveConfig().then(() => { sel.proxy = m.index < 0 ? list.length - 1 : m.index; }).catch((e) => {
+  saveConfig().then(() => {
+    const fresh = cfg().proxies || [];
+    const idx = fresh.findIndex((x) => x.name === p.name);
+    sel.proxy = idx >= 0 ? idx : (m.index < 0 ? fresh.length - 1 : Math.min(m.index, fresh.length - 1));
+    if (page === "proxies") fillProxies();
+  }).catch((e) => {
     const msg = e.message || "";
-    if (state) state.config = before;
-    built = "";
-    render();
+    sel.proxy = prevSel;
+    refresh();
     if (modal) { showToast(msg); return; }
     modal = m;
     if (/^Имя прокси/i.test(msg)) m.nameError = msg;
@@ -1473,7 +1562,7 @@ function onClick(e) {
   const i = Number(act.dataset.i);
   if (id === "copy-text") { copyText(act.dataset.text || "", act.dataset.shown); return; }
   if (id.startsWith("ap-")) { appsClick(id, act); return; }
-  if (id === "goto") { page = act.dataset.page; built = ""; render(); return; }
+  if (id === "goto") { apOpen = ""; closeMenu(); page = act.dataset.page; built = ""; render(); return; }
   if (id === "sel-proxy") { sel.proxy = i; fillProxies(); return; }
   if (id === "sel-log") {
     const key = act.dataset.key || "";
@@ -1485,6 +1574,8 @@ function onClick(e) {
   }
   if (id === "goto-rule") {
     const proc = (act.dataset.proc || "").toLowerCase();
+    apOpen = "";
+    closeMenu();
     page = "rules";
     built = "";
     apQuery = appLabel(proc);
@@ -1641,7 +1732,7 @@ function onClick(e) {
       });
     };
     if (m.draft.type === "vless") {
-      ensureVLESS(m).then(run).catch((err) => { if (modal === m) showToast(err.message); });
+      ensureVLESS(m).then(run).catch((err) => { if (modal === m) { m.parseError = linkFail(err.message); renderModal(); } });
     } else run();
     return;
   }
@@ -1687,11 +1778,14 @@ function flushSettings() {
     .finally(() => { settingsSaving--; if (page === "settings") fillPage(); });
 }
 async function pasteVLESS(silent) {
+  const startPage = page;
+  const startModal = modal;
   let text = "";
   try { text = await navigator.clipboard.readText(); } catch (e) {
     if (!silent) showToast("Не удалось прочитать буфер обмена");
     return;
   }
+  if (modal !== startModal || (silent && page !== startPage)) return;
   text = (text || "").trim();
   if (!text.toLowerCase().startsWith("vless://")) {
     if (!silent) showToast("В буфере нет ссылки vless://");
@@ -1850,14 +1944,14 @@ function bootChrome() {
   });
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape") {
-      modal = null;
-      closeMenu();
-      renderModal();
-      if (apOpen) { apOpen = ""; if (page === "rules") fillApps(); }
+      const menu = document.getElementById("menu");
+      if (menu && !menu.hidden) { closeMenu(); return; }
+      if (apOpen) { apOpen = ""; if (page === "rules") fillApps(); return; }
+      if (modal) { modal = null; renderModal(); }
     }
   });
   document.addEventListener("click", (e) => {
-    if (!e.target.closest("#menu") && !e.target.closest("[data-act='menu-proxy']") && !e.target.closest("[data-act='menu-rule']") && !e.target.closest("[data-act='head-more']")) closeMenu();
+    if (!e.target.closest("#menu") && !e.target.closest("[data-act='menu-proxy']") && !e.target.closest("[data-act='head-more']")) closeMenu();
   });
 }
 
