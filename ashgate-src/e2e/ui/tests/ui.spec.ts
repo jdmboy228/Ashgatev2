@@ -318,11 +318,12 @@ test.describe.serial("Ashgate window", () => {
     await screens("dialog-ap-add");
     // The exe found for a typed name and a picked app stay in the path
     // field: a redraw used to put the old field contents back. The test
-    // client is always running, and unlike a WebView2 helper it is never
-    // filtered out as a background process.
+    // servers run for this whole step, and unlike a WebView2 helper they
+    // are never filtered out as a background process. The copied client is
+    // not running here, so it would not be listed.
     const pathField = dlg().locator("#ap-add-path");
-    await dlg().locator("#ap-add-q").fill("ashgate-e2e-client");
-    await expect(pathField, "the path found for the name was dropped").toHaveValue(/ashgate-e2e-client\.exe$/i);
+    await dlg().locator("#ap-add-q").fill("ashgate-e2e-servers");
+    await expect(pathField, "the path found for the name was dropped").toHaveValue(/ashgate-e2e-servers\.exe$/i);
     const chip = dlg().locator('[data-act="ap-pick"]').first();
     await expect(chip).toBeVisible();
     const chipPath = (await chip.getAttribute("data-path")) || "";
