@@ -31,6 +31,7 @@ const STATUS = {
   open: ["открыто", "ok"],
   closed: ["закрыто", "neu"],
   direct: ["напрямую", "info"],
+  unmatched: ["без правила", "info"],
   blocked: ["блокировано", "warn"],
   error: ["ошибка", "err"],
 };
@@ -42,6 +43,10 @@ let paused = false;
 let frozen = null;
 let logFilter = "";
 let logProto = "all";
+// logUnmatched shows the feed of programs whose traffic bypassed the rules;
+// directState caches that feed so its own generation check works.
+let logUnmatched = false;
+let directState = { procs: [], events: [], gen: 0 };
 let sel = { proxy: 0, rule: -1, log: "" };
 let built = "";
 let lastBridge = "";
@@ -78,8 +83,11 @@ function bytes(n) {
   const text = i === 0 ? String(Math.round(n)) : n.toFixed(1).replace(".", ",");
   return text + " " + units[i];
 }
-function viaText(v) {
-  if (!v || v === "direct" || v === "block" || v === "relay") return "—";
+function viaText(e) {
+  const v = typeof e === "string" ? e : (e && e.via);
+  const st = e && typeof e === "object" ? e.status : "";
+  if (v === "direct" || st === "direct" || st === "unmatched") return "напрямую";
+  if (!v || v === "block" || v === "relay") return "—";
   return v;
 }
 function badge(label, kind, dot, title) {
@@ -139,7 +147,7 @@ function demoState() {
         },
       ],
       rules: [
-        { enabled: on, process: "*\\Discord\\app-*\\Discord.exe", action: "proxy", proxy: "aeza", group: "Связь и звонки" },
+        { enabled: on, process: "*\\Discord\\app-*\\Discord.exe", action: "proxy", proxy: "aeza", group: "Связь и звонки", companions: ["C:\\Users\\user\\AppData\\Local\\Discord\\app-1.0.9187\\Discord Helper.exe"] },
         { enabled: on, process: "C:\\Users\\user\\AppData\\Roaming\\Telegram Desktop\\Telegram.exe", action: "proxy", proxy: "aeza", group: "Связь и звонки", children: false },
         { enabled: on, process: "Cursor.exe", action: "proxy", proxy: "aeza" },
         { enabled: on, process: "Spotify.exe", action: "proxy", proxy: "backup", killSwitch: true },
@@ -158,6 +166,19 @@ function demoState() {
       "spotify.exe": { flows: 0, up: 120000, down: 14200000, upRate: 0, downRate: 0, error: "SOCKS5: нет ответа от proxy.example.com:1080 (таймаут)" },
       "curl.exe": { flows: 0, up: 800, down: 4100, upRate: 0, downRate: 0 },
     },
+    ruleMembers: {
+      "*\\discord\\app-*\\discord.exe": [
+        { name: "Discord Helper.exe", path: "C:\\Users\\user\\AppData\\Local\\Discord\\app-1.0.9187\\Discord Helper.exe", pattern: "C:\\Users\\user\\AppData\\Local\\Discord\\app-1.0.9187\\Discord Helper.exe", kind: "companion", alive: true, flows: 0, up: 0, down: 0, mask: "C:\\Users\\user\\AppData\\Local\\Discord\\app-*\\Discord Helper.exe" },
+        { name: "Discord Overlay.exe", kind: "child", alive: true, flows: 2, up: 15000, down: 430000 },
+      ],
+      "c:\\users\\user\\appdata\\roaming\\telegram desktop\\telegram.exe": [
+        { name: "Updater.exe", kind: "child", alive: true, flows: 1, up: 1200, down: 3400 },
+      ],
+    },
+    ruleHints: {
+      "spotify.exe": { topCandidate: { name: "SpotifyHelper.exe", path: "C:\\Users\\user\\AppData\\Roaming\\Spotify\\SpotifyHelper.exe", conns: 3, bytes: 24576, score: 60, reasons: ["Активный трафик напрямую"], running: true } },
+    },
+    directCount: 3,
     events: [
       { time: "12:04:31", process: "curl.exe", pid: 9012, proto: "TCP", dest: "api.ipify.org:443", via: "local", status: "open", bytesUp: 800, bytesDown: 4100 },
       { time: "12:04:30", process: "chrome.exe", pid: 4120, proto: "TCP", dest: "www.example.com:443", via: "work-http", status: "open", bytesUp: 12000, bytesDown: 284000 },
@@ -217,13 +238,17 @@ function proxiesHTML() {
 }
 function logHTML() {
   const onlyOn = errorsOnly ? " on" : "";
+  const dc = (state && state.directCount) || 0;
+  const cn = logUnmatched ? " on" : "";
   return `<div class="head"><div><h1>Подключения</h1><p class="sub">Живой журнал перехваченных соединений. Также пишется в ashgate.log.</p></div>
-  <div class="head-actions"><button class="btn secondary" id="pause-btn" data-act="pause" type="button">${icon("pause")}Пауза</button><button class="btn ghost secondary" data-act="clear" type="button">${icon("trash")}Очистить экран</button>${headMore()}</div></div>
+  <div class="head-actions"><button class="btn secondary" id="pause-btn" data-act="pause" type="button">${icon("pause")}Пауза</button><button class="btn ghost secondary" data-act="clear" type="button">${icon("trash")}${logUnmatched ? "Очистить ленту" : "Очистить экран"}</button>${headMore()}</div></div>
   <div class="tools"><label class="field search" style="width:268px">${icon("search")}<input id="log-filter" placeholder="Процесс, адрес или прокси" value="${esc(logFilter)}"></label>
   <div class="seg" id="log-seg">${["Все", "TCP", "UDP"].map((n, i) => `<button type="button" data-act="proto" data-value="${["all", "TCP", "UDP"][i]}" class="${logProto === ["all", "TCP", "UDP"][i] ? "on" : ""}">${n}</button>`).join("")}</div>
   <span class="onlyerr">Только ошибки <button class="toggle${onlyOn}" type="button" data-act="errors-only" aria-pressed="${errorsOnly ? "true" : "false"}" aria-label="Только ошибки"><i></i></button></span>
+  <button class="btn secondary log-unmatched${cn}" id="log-unmatched-btn" data-act="log-unmatched" type="button" title="Показать программы, чей трафик идёт в сеть без правила">${icon("ban", 14)}<span>Без правила</span><span class="cnt" id="log-unmatched-count"${dc ? "" : " hidden"}>${dc}</span></button>
   <div class="live" id="live"><i></i><span></span></div></div>
   <div class="pause-banner" id="pause-banner" hidden></div>
+  <div id="log-direct-strip"></div>
   <div id="log-table"></div>`;
 }
 function settingsHTML() {
@@ -502,25 +527,53 @@ function appIconHTML(process, style) {
 function eventKey(e) {
   return [e.time, e.pid, e.proto, e.dest, e.status, e.error || ""].join("|");
 }
+function logSource() {
+  return logUnmatched ? (directState.events || []) : (state.events || []);
+}
 function missedCount() {
   if (!paused || !frozen) return 0;
   const seen = new Set(frozen.map(eventKey));
-  return (state.events || []).filter((e) => !seen.has(eventKey(e))).length;
+  return logSource().filter((e) => !seen.has(eventKey(e))).length;
 }
 function logEvents() {
-  const src = paused && frozen ? frozen : (state.events || []);
+  const src = paused && frozen ? frozen : logSource();
   const q = logFilter.trim().toLowerCase();
   return src.filter((e) => {
     if (errorsOnly && e.status !== "error") return false;
     if (logProto !== "all" && e.proto !== logProto) return false;
     if (!q) return true;
-    const blob = ((e.process || "") + " " + (e.dest || "") + " " + (e.via || "") + " " + (e.parent || "")).toLowerCase();
+    const blob = ((e.process || "") + " " + (e.path || "") + " " + (e.dest || "") + " " + (e.via || "") + " " + (e.parent || "")).toLowerCase();
     return blob.includes(q);
   });
+}
+// directStripHTML is the row of programs bypassing the rules, above the
+// unmatched feed. Each chip offers to bind it to a rule at once.
+function directStripHTML() {
+  const now = Date.now();
+  const procs = (directState.procs || [])
+    .filter((p) => !p.system && ((p.bytes || 0) > 0 || (p.conns || 0) > 0) && (!p.lastSeen || now - p.lastSeen <= 120000))
+    .sort((a, b) => (b.bytes || 0) - (a.bytes || 0))
+    .slice(0, 8);
+  if (!procs.length) return "";
+  const chips = procs.map((p) => {
+    const name = p.name || appLabel(p.path || "");
+    return `<div class="log-direct-chip" title="${esc(p.path || name)}">${appIconHTML(p.path || p.name, "width:18px;height:18px;border-radius:5px;font-size:9px")}<span class="nm">${esc(appLabel(name))}</span><span class="tr">${esc(bytes(p.bytes || 0))} · ${p.conns || 0} соед.</span><button class="log-attach-btn" type="button" data-act="log-attach" data-path="${esc(p.path || "")}" data-name="${esc(p.name || "")}" title="Добавить в правило">${icon("plus", 12)}<span>В правило</span></button></div>`;
+  }).join("");
+  return `<div class="log-direct-strip"><span class="cap">Активные процессы без правила</span>${chips}</div>`;
+}
+function paintDirectBadge() {
+  const cnt = document.getElementById("log-unmatched-count");
+  if (!cnt) return;
+  const n = (state && state.directCount) || 0;
+  cnt.textContent = n ? String(n) : "";
+  cnt.hidden = !n;
 }
 function fillLog() {
   const host = document.getElementById("log-table");
   if (!host) return;
+  paintDirectBadge();
+  const strip = document.getElementById("log-direct-strip");
+  if (strip) setHTML(strip, logUnmatched ? directStripHTML() : "");
   const live = document.getElementById("live");
   const pause = document.getElementById("pause-btn");
   if (live) {
@@ -538,7 +591,13 @@ function fillLog() {
   }
   const rows = logEvents();
   if (!rows.length) {
-    setHTML(host, `<div class="table"><div class="empty">${(state.events || []).length ? "Ничего не найдено." : "Пока нет перехваченных соединений. Они появятся после «Старт»."}</div></div>`);
+    let empty;
+    if (logUnmatched) {
+      empty = (directState.events || []).length
+        ? "Ничего не найдено."
+        : "Пока нет трафика без правила. Включите перехват и откройте программу без правила.";
+    } else empty = (state.events || []).length ? "Ничего не найдено." : "Пока нет перехваченных соединений. Они появятся после «Старт».";
+    setHTML(host, `<div class="table"><div class="empty">${empty}</div></div>`);
     return;
   }
   const head = ["Время", "Процесс", "Протокол", "Назначение", "Через", "Статус", "Трафик"];
@@ -568,8 +627,13 @@ function fillLog() {
     const key = eventKey(e);
     const open = e.status === "error" && openErr === key;
     const cls = sel.log === key ? "sel" : "";
-    const via = viaText(e.via);
+    const via = viaText(e);
     const stHtml = statusBadge(e.status);
+    const canAttach = logUnmatched || e.via === "direct" || e.status === "direct" || e.status === "unmatched";
+    const attach = canAttach && (e.path || e.process)
+      ? `<button class="log-attach-btn" type="button" data-act="log-attach" data-path="${esc(e.path || "")}" data-name="${esc(e.process || "")}" title="Добавить процесс в правило">${icon("plus", 12)}<span>В правило</span></button>`
+      : "";
+    const stCell = `<div class="log-st">${stHtml}${attach}</div>`;
     const bytesHtml = `<div>↑ ${esc(bytes(e.bytesUp))}</div><div>↓ ${esc(bytes(e.bytesDown))}</div>`;
     const pool = existingMain.get(key);
     let tr = pool && pool.length ? pool.shift() : null;
@@ -577,7 +641,7 @@ function fillLog() {
       if (tr.className !== cls) tr.className = cls;
       const tds = tr.children;
       if (tds[4] && tds[4].textContent !== via) tds[4].textContent = via;
-      if (tds[5] && tds[5]._html !== stHtml) { tds[5].innerHTML = stHtml; tds[5]._html = stHtml; }
+      if (tds[5] && tds[5]._html !== stCell) { tds[5].innerHTML = stCell; tds[5]._html = stCell; }
       if (tds[6] && tds[6]._html !== bytesHtml) { tds[6].innerHTML = bytesHtml; tds[6]._html = bytesHtml; }
     } else {
       tmp.innerHTML = `<tr class="${cls}" data-act="sel-log" data-key="${esc(key)}">
@@ -586,11 +650,11 @@ function fillLog() {
     <td><span class="tag ${e.proto === "UDP" ? "udp" : "tcp"}">${esc(e.proto || "")}</span></td>
     <td class="mono" style="color:var(--tx)">${esc(e.dest)}</td>
     <td>${esc(via)}</td>
-    <td>${stHtml}</td>
+    <td>${stCell}</td>
     <td class="bytes mono">${bytesHtml}</td>
   </tr>`;
       tr = tmp.firstElementChild;
-      tr.children[5]._html = stHtml;
+      tr.children[5]._html = stCell;
       tr.children[6]._html = bytesHtml;
     }
     keep.add(tr);
@@ -1239,6 +1303,21 @@ async function refresh() {
   noteError(err);
   noteBridge();
 }
+// pollDirect keeps the unmatched feed current while «Без правила» is open.
+// The server skips the event list when the log generation is unchanged.
+async function pollDirect() {
+  if (DEMO) return;
+  try {
+    const res = await getJSON("/api/direct?gen=" + (directState.gen || 0));
+    if (!res) return;
+    directState.procs = Array.isArray(res.procs) ? res.procs : [];
+    if (!res.eventsSame) {
+      directState.events = Array.isArray(res.events) ? res.events : [];
+      directState.gen = Number(res.generation) || 0;
+    }
+    if (page === "log" && logUnmatched) fillLog();
+  } catch (e) { /* the next poll tries again */ }
+}
 function setOffline(on) {
   const el = document.getElementById("offline");
   if (el && el.hidden === on) el.hidden = !on;
@@ -1327,7 +1406,9 @@ function closeMenu() { document.getElementById("menu").hidden = true; }
 // keyboard (a click without a mouse position used to put it at 0,0).
 function openMenu(anchor, items, keyboard) {
   const m = document.getElementById("menu");
-  m.innerHTML = items.map((it) => `<button type="button" class="${it.danger ? "danger" : ""}" data-menu="${it.id}">${esc(it.label)}</button>`).join("");
+  m.innerHTML = items.map((it) => it.sep
+    ? `<div class="menu-sep"></div>`
+    : `<button type="button" class="${it.danger ? "danger" : ""}" data-menu="${it.id}">${esc(it.label)}</button>`).join("");
   m.hidden = false;
   const r = anchor.getBoundingClientRect();
   const w = m.offsetWidth;
@@ -1341,12 +1422,46 @@ function openMenu(anchor, items, keyboard) {
     const b = e.target.closest("[data-menu]");
     if (!b) return;
     closeMenu();
-    items.find((it) => it.id === b.dataset.menu).run();
+    const it = items.find((x) => x.id === b.dataset.menu);
+    if (it && it.run) it.run();
   };
   if (keyboard) {
     const first = m.querySelector("button");
     if (first) first.focus();
   }
+}
+// openAttachMenu offers the rules a log row's process can join; the first
+// twelve rules, running ones first, plus a new-rule shortcut.
+function openAttachMenu(anchor, procPath, procName) {
+  const target = procPath || procName;
+  if (!target) return;
+  const alive = (state && state.alive) || null;
+  const rules = (cfg().rules || []).map((r, idx) => ({ r, idx }));
+  const isLive = (r) => !alive || alive[apKey(r.process)] !== false;
+  rules.sort((a, b) => (isLive(a.r) === isLive(b.r) ? 0 : isLive(a.r) ? -1 : 1));
+  const items = rules.slice(0, 12).map(({ r, idx }) => ({
+    id: "r" + idx,
+    label: `${apLabel(r.process)}${r.group ? " · " + r.group : ""}`,
+    run: () => { apAttachCompanion(idx, target); },
+  }));
+  items.push({ sep: true });
+  items.push({ id: "new", label: "Создать новое правило…", run: () => openAttachNew(target, procName) });
+  openMenu(anchor, items, false);
+}
+// openAttachNew opens the usual add-rule dialog with the process filled in.
+function openAttachNew(target, procName) {
+  page = "rules";
+  built = "";
+  apOpen = "";
+  modal = null;
+  render();
+  apOpenAdd();
+  const m = modal;
+  if (!m || m.kind !== "ap-add") return;
+  m.q = apLabel(procName || target);
+  m.path = apVersionMask(target) || target;
+  m.auto = false;
+  renderModal();
 }
 
 function openProxy(index) {
@@ -1748,6 +1863,13 @@ function applySettings(c, s) {
 }
 
 function onClick(e) {
+  // The companions dialog closes by the scrim, like a Windows flyout.
+  if (modal && modal.kind === "ap-companions" && e.target.classList && e.target.classList.contains("scrim")) {
+    apStopCompTimer();
+    modal = null;
+    renderModal();
+    return;
+  }
   const nav = e.target.closest("[data-nav]");
   if (nav) {
     // Settings edits are saved whatever page comes next.
@@ -1858,11 +1980,33 @@ function onClick(e) {
   }
   if (id === "pause") {
     paused = !paused;
-    frozen = paused ? (state.events || []).slice() : null;
+    frozen = paused ? logSource().slice() : null;
     fillLog();
     return;
   }
+  if (id === "log-unmatched") {
+    logUnmatched = !logUnmatched;
+    paused = false;
+    frozen = null;
+    if (logUnmatched) directState = { procs: [], events: [], gen: 0 };
+    built = "";
+    render();
+    if (logUnmatched) pollDirect();
+    return;
+  }
+  if (id === "log-attach") {
+    openAttachMenu(act, act.dataset.path || "", act.dataset.name || "");
+    return;
+  }
   if (id === "clear") {
+    if (logUnmatched) {
+      askConfirm("Очистить ленту?", "Строки трафика без правила исчезнут с экрана.", "Очистить", true, () => {
+        frozen = [];
+        if (!DEMO) post("/api/direct/clear").then(() => { directState.events = []; directState.gen = 0; fillLog(); }).catch((err) => showToast(err.message));
+        else { directState.events = []; fillLog(); }
+      });
+      return;
+    }
     askConfirm("Очистить экран?", "Строки исчезнут с экрана. Файл ashgate.log останется.", "Очистить", true, () => {
       frozen = [];
       if (!DEMO) post("/api/log/clear").then(refresh).catch((err) => showToast(err.message));
@@ -1895,7 +2039,7 @@ function onClick(e) {
     if (page === "settings") queueSettings();
     return;
   }
-  if (id === "cancel") { modal = null; renderModal(); return; }
+  if (id === "cancel") { apStopCompTimer(); modal = null; renderModal(); return; }
   if (id === "eye") { modal.showPass = !modal.showPass; readProxyDraft(); renderModal(); return; }
   if (id === "ptype") {
     // A saved subscription stays one: its only type button does nothing.
@@ -2169,11 +2313,11 @@ function bootChrome() {
       const menu = document.getElementById("menu");
       if (menu && !menu.hidden) { closeMenu(); return; }
       if (apOpen) { apOpen = ""; if (page === "rules") fillApps(); return; }
-      if (modal) { modal = (modal.kind === "qr" && modal.returnModal) ? modal.returnModal : null; renderModal(); }
+      if (modal) { apStopCompTimer(); modal = (modal.kind === "qr" && modal.returnModal) ? modal.returnModal : null; renderModal(); }
     }
   });
   document.addEventListener("click", (e) => {
-    if (!e.target.closest("#menu") && !e.target.closest("[data-act='menu-proxy']") && !e.target.closest("[data-act='head-more']")) closeMenu();
+    if (!e.target.closest("#menu") && !e.target.closest("[data-act='menu-proxy']") && !e.target.closest("[data-act='log-attach']") && !e.target.closest("[data-act='head-more']")) closeMenu();
   });
 }
 
@@ -2249,6 +2393,7 @@ async function poll() {
   polling = true;
   wakeAsked = false;
   await refresh();
+  if (page === "log" && logUnmatched) await pollDirect();
   if (!wakeAsked && (document.hidden || (state && state.hidden && failedPolls === 0))) { polling = false; return; }
   let wait = 1000;
   if (failedPolls) wait = 2000;

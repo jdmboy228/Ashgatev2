@@ -2,7 +2,9 @@
 package rules
 
 import (
+	"sort"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 
 	"ashgate/internal/config"
@@ -27,6 +29,11 @@ type Decision struct {
 	Action    string
 	Proxy     string
 	RuleIndex int
+	// MatchKind says how the rule was matched: MatchExact when the process
+	// itself named the rule, MatchCompanion when one of the rule's companions
+	// did, MatchChild when an ancestor's rule was inherited, MatchFolder when
+	// the process lives in the install folder of the rule or a companion.
+	MatchKind string
 	// Parent names the ancestor whose rule was inherited; empty when the
 	// process matched a rule itself.
 	Parent string
@@ -35,30 +42,40 @@ type Decision struct {
 	TCPOnly    bool
 }
 
+// MatchKind values; see Decision.MatchKind.
+const (
+	MatchExact     = "exact"
+	MatchCompanion = "companion"
+	MatchChild     = "child"
+	MatchFolder    = "folder"
+)
+
 // Set is an immutable list of enabled rules in config order.
 type Set struct {
 	rules []compiled
 }
 
-type compiled struct {
-	path     bool
-	match    string
-	action   string
-	proxy    string
-	index    int
-	children bool
-	ks       bool
-	tcpOnly  bool
-	// glob is set when match contains '*' or '?'.
-	glob bool
-	// dir is the application's install folder, "" when the rule names no
-	// folder of its own. A process started from it or a subfolder inherits
-	// the rule, so a program launched by a service (LDPlayer's
-	// Ld9BoxHeadless.exe, started by Ld9BoxSVC.exe) still follows it.
+// matcher is one compiled process name, path, or glob mask.
+type matcher struct {
+	path  bool
+	match string
+	glob  bool
+	// dir is the install folder of the executable, "" when the mask names no
+	// folder of its own (or one too shallow or shared to mean an application).
 	dir string
-	// family groups the executables of one emulator or launcher; "" when
-	// the rule names no such program.
-	family string
+}
+
+type compiled struct {
+	// primary is the rule's own process; companions are extra executables,
+	// paths, or masks attached to the same rule.
+	primary    matcher
+	companions []matcher
+	action     string
+	proxy      string
+	index      int
+	children   bool
+	ks         bool
+	tcpOnly    bool
 }
 
 // Compile keeps enabled rules in order. Disabled rules are skipped. Pass
@@ -71,26 +88,37 @@ func Compile(rules []config.Rule) *Set {
 		if !r.IsEnabled() {
 			continue
 		}
-		raw := strings.TrimSpace(r.Process)
-		raw = strings.Trim(raw, `"`)
 		c := compiled{action: r.Action, proxy: r.Proxy, index: i, children: r.CoversChildren(),
 			ks: r.RuleKillSwitch(), tcpOnly: r.TCPOnly}
-		if IsPath(raw) {
-			c.path = true
-			c.match = NormalizePath(raw)
-		} else {
-			c.match = NormalizeName(raw)
-			// "chrome" means chrome.exe; every process image has an extension.
-			if c.match != "" && !strings.Contains(c.match, ".") && !strings.HasSuffix(c.match, "*") {
-				c.match += ".exe"
+		c.primary = compileMatcher(r.Process)
+		for _, raw := range r.Companions {
+			if strings.Trim(strings.TrimSpace(raw), `"`) == "" {
+				continue
 			}
+			c.companions = append(c.companions, compileMatcher(raw))
 		}
-		c.glob = strings.ContainsAny(c.match, "*?")
-		c.dir = companionDir(c.match)
-		c.family = Family(c.match)
 		out.rules = append(out.rules, c)
 	}
 	return out
+}
+
+// compileMatcher compiles one process name, path, or glob mask.
+func compileMatcher(raw string) matcher {
+	raw = strings.Trim(strings.TrimSpace(raw), `"`)
+	var m matcher
+	if IsPath(raw) {
+		m.path = true
+		m.match = NormalizePath(raw)
+	} else {
+		m.match = NormalizeName(raw)
+		// "chrome" means chrome.exe; every process image has an extension.
+		if m.match != "" && !strings.Contains(m.match, ".") && !strings.HasSuffix(m.match, "*") {
+			m.match += ".exe"
+		}
+	}
+	m.glob = strings.ContainsAny(m.match, "*?")
+	m.dir = companionDir(m.match)
+	return m
 }
 
 // Match returns the first enabled rule for p. When no rule names p itself,
@@ -101,15 +129,14 @@ func Compile(rules []config.Rule) *Set {
 // everything started from the desktop.
 //
 // When there is no ancestor to inherit from, a companion decides: a process
-// that lives in the rule's install folder (or a subfolder of it), or one
-// that belongs to the same emulator or launcher family. That covers a
-// program a service started, which has no ancestor in the app's tree.
+// that lives in the rule's install folder (or a subfolder of it), or one in
+// the install folder of a companion such as a service-started VM process.
 func (s *Set) Match(p Process) Decision {
 	if s == nil {
 		return Decision{RuleIndex: -1}
 	}
-	if r, ok := s.first(p); ok {
-		return r.decision("")
+	if r, kind, ok := s.first(p); ok {
+		return r.decision("", kind)
 	}
 	if IsShellOrSystem(p) {
 		return Decision{RuleIndex: -1}
@@ -118,23 +145,23 @@ func (s *Set) Match(p Process) Decision {
 		if IsShellOrSystem(a) {
 			break
 		}
-		if r, ok := s.first(a); ok && r.children {
-			return r.decision(appName(a))
+		if r, _, ok := s.first(a); ok && r.children {
+			return r.decision(appName(a), MatchChild)
 		}
 	}
 	return s.companion(p)
 }
 
-// companion returns the first rule whose install folder or family holds p.
-// Only rules that cover children take part, so the existing "proxy child
-// processes" switch controls this too.
+// companion returns the first rule whose install folder holds p, or whose
+// companion's install folder holds it. Only rules that cover children take
+// part, so the existing "proxy child processes" switch controls this too.
 func (s *Set) companion(p Process) Decision {
 	name := NormalizeName(p.Name)
 	if name == "" {
 		name = Base(p.Path)
 	}
-	// System traffic is never caught by a folder or family: svchost carries
-	// other programs' traffic and services host unrelated programs.
+	// System traffic is never caught by a folder: svchost carries other
+	// programs' traffic and services host unrelated programs.
 	if name == "svchost.exe" || shellOrSystem[name] {
 		return Decision{RuleIndex: -1}
 	}
@@ -143,11 +170,13 @@ func (s *Set) companion(p Process) Decision {
 		if !r.children {
 			continue
 		}
-		if r.family != "" && r.family == Family(name) {
-			return r.decision(appName(Process{Name: r.match}))
+		if r.primary.dir != "" && inDir(path, r.primary.dir) {
+			return r.decision(appName(Process{Name: r.primary.match}), MatchFolder)
 		}
-		if r.dir != "" && inDir(path, r.dir) {
-			return r.decision(appName(Process{Name: r.match}))
+		for _, c := range r.companions {
+			if c.dir != "" && inDir(path, c.dir) {
+				return r.decision(appName(Process{Name: r.primary.match}), MatchFolder)
+			}
 		}
 	}
 	return Decision{RuleIndex: -1}
@@ -171,22 +200,22 @@ func appName(p Process) string {
 	return Base(p.Path)
 }
 
-func (r compiled) decision(parent string) Decision {
-	return Decision{Action: r.action, Proxy: r.proxy, RuleIndex: r.index, Parent: parent, KillSwitch: r.ks, TCPOnly: r.tcpOnly}
+func (r compiled) decision(parent, kind string) Decision {
+	return Decision{Action: r.action, Proxy: r.proxy, RuleIndex: r.index, MatchKind: kind, Parent: parent, KillSwitch: r.ks, TCPOnly: r.tcpOnly}
 }
 
-func (r compiled) matches(name, path string) bool {
+func (m matcher) matches(name, path string) bool {
 	want := name
-	if r.path {
+	if m.path {
 		want = path
 	}
 	if want == "" {
 		return false
 	}
-	if r.glob {
-		return Glob(r.match, want)
+	if m.glob {
+		return Glob(m.match, want)
 	}
-	return want == r.match
+	return want == m.match
 }
 
 // Glob matches s against pattern, where '*' is any run of characters and
@@ -230,7 +259,9 @@ func Glob(pattern, s string) bool {
 	return px == len(pattern)
 }
 
-func (s *Set) first(p Process) (compiled, bool) {
+// first returns the first rule naming p, by its primary process (MatchExact)
+// or by one of its companions (MatchCompanion), and in rules order.
+func (s *Set) first(p Process) (compiled, string, bool) {
 	name := NormalizeName(p.Name)
 	if name == "" {
 		name = Base(p.Path)
@@ -238,15 +269,20 @@ func (s *Set) first(p Process) (compiled, bool) {
 	// Never match the Windows service host: svchost carries system traffic
 	// for every program (see dns.systemResolver).
 	if name == "svchost.exe" {
-		return compiled{}, false
+		return compiled{}, "", false
 	}
 	path := NormalizePath(p.Path)
 	for _, r := range s.rules {
-		if r.matches(name, path) {
-			return r, true
+		if r.primary.matches(name, path) {
+			return r, MatchExact, true
+		}
+		for _, c := range r.companions {
+			if c.matches(name, path) {
+				return r, MatchCompanion, true
+			}
 		}
 	}
-	return compiled{}, false
+	return compiled{}, "", false
 }
 
 // shellOrSystem are processes that start unrelated programs. Rules are
@@ -417,34 +453,77 @@ func userHomeDir(p string) string {
 	return root + rest
 }
 
-// families groups the executables of one emulator or launcher. A program a
-// service starts (LDPlayer's Ld9BoxHeadless.exe runs under Ld9BoxSVC.exe)
-// has no ancestor in the app's tree, so the name is what ties it to the
-// rule.
-var families = map[string][]string{
-	"ldplayer":   {"dnplayer.exe", "ldplayer.exe", "ld9boxheadless.exe", "ld9boxsvc.exe", "ld9boxs.exe", "ld9boxvmm.exe"},
-	"bluestacks": {"bluestacks.exe", "hd-player.exe", "bstksvc.exe", "bstkvm.exe", "bstkgb.exe"},
-	"nox":        {"nox.exe", "noxplayer.exe", "noxvmhandle.exe", "noxservice.exe", "noxconsole.exe"},
-	"memu":       {"memu.exe", "memuheadless.exe", "memuconsole.exe", "memusvc.exe"},
+// pathTokenStop are words too common in paths and program names to tell one
+// application family from another.
+var pathTokenStop = map[string]bool{
+	"program": true, "files": true, "x86": true, "x64": true, "bin": true,
+	"app": true, "apps": true, "appdata": true, "local": true, "roaming": true,
+	"users": true, "windows": true, "system32": true, "syswow64": true,
+	"common": true, "client": true, "server": true, "helper": true,
+	"service": true, "svc": true, "headless": true, "player": true,
+	"launcher": true, "updater": true, "update": true, "exe": true,
+	"win": true, "win64": true, "win32": true, "game": true, "games": true,
+	"data": true, "cache": true, "temp": true, "tmp": true, "runtime": true,
+	"core": true, "host": true, "agent": true, "daemon": true, "tray": true,
+	"web": true, "view": true, "webview": true, "browser": true,
+	"electron": true, "portable": true, "release": true, "debug": true,
+	"build": true, "dist": true, "lib": true, "src": true, "box": true,
 }
 
-// familyOf maps an executable name to its family; built once from families.
-var familyOf = func() map[string]string {
-	out := make(map[string]string)
-	for fam, names := range families {
-		for _, n := range names {
-			out[n] = fam
+// PathTokens returns the meaningful words of a path or program name: the
+// path is split on separators, letter/digit boundaries and camelCase, then
+// lower-cased, with short, numeric and stop words dropped. Two programs of
+// one product share a token even when they live in different folders and
+// have unrelated names, such as C:\LDPlayer\...\dnmultiplayerex.exe and
+// C:\Program Files\ldplayer9box\Ld9BoxHeadless.exe ("ldplayer").
+func PathTokens(path string) []string {
+	s := strings.Trim(strings.TrimSpace(path), `"`)
+	s = strings.ReplaceAll(s, "/", `\`)
+	s = strings.TrimPrefix(s, `\??\`)
+	s = strings.TrimPrefix(s, `\\?\`)
+
+	var b strings.Builder
+	var prev rune
+	for i, r := range s {
+		if i > 0 {
+			alnum := unicode.IsLetter(prev) || unicode.IsDigit(prev)
+			switch {
+			case alnum && (unicode.IsLetter(r) || unicode.IsDigit(r)) && unicode.IsDigit(prev) != unicode.IsDigit(r):
+				b.WriteByte(' ')
+			case unicode.IsLower(prev) && unicode.IsUpper(r):
+				b.WriteByte(' ')
+			}
+		}
+		b.WriteRune(r)
+		prev = r
+	}
+	fields := strings.FieldsFunc(b.String(), func(r rune) bool {
+		return r == '\\' || r == '/' || r == '_' || r == '-' || r == '.' || unicode.IsSpace(r)
+	})
+
+	seen := make(map[string]bool, len(fields))
+	out := make([]string, 0, len(fields))
+	for _, f := range fields {
+		t := strings.ToLower(f)
+		if utf8.RuneCountInString(t) < 3 || pathTokenStop[t] || allDigits(t) || seen[t] {
+			continue
+		}
+		seen[t] = true
+		out = append(out, t)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// allDigits reports that s has at least one rune and every one is a digit.
+func allDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if !unicode.IsDigit(r) {
+			return false
 		}
 	}
-	return out
-}()
-
-// Family returns the emulator or launcher family of an executable name or
-// path, or "" when it belongs to none.
-func Family(p string) string {
-	name := Base(p)
-	if name == "" {
-		name = strings.ToLower(strings.TrimSpace(p))
-	}
-	return familyOf[name]
+	return true
 }

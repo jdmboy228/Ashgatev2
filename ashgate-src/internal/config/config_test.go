@@ -2,6 +2,7 @@ package config
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -105,6 +106,11 @@ func TestValidateErrors(t *testing.T) {
 		{"system dns mode", Config{DNS: DNS{SystemResolver: "on"}}, "systemResolver"},
 		{"bootstrap name", Config{DNS: DNS{Bootstrap: []string{"https://dns.google/dns-query"}}}, "IP address"},
 		{"bootstrap plain http", Config{DNS: DNS{Bootstrap: []string{"http://1.1.1.1/dns-query"}}}, "https"},
+		{"empty companion", Config{Rules: []Rule{{Process: "a.exe", Action: "direct", Companions: []string{"  "}}}}, "companions"},
+		{"quoted empty companion", Config{Rules: []Rule{{Process: "a.exe", Action: "direct", Companions: []string{`""`}}}}, "companions"},
+		{"svchost companion", Config{Rules: []Rule{{Process: "a.exe", Action: "direct", Companions: []string{`C:\Windows\System32\svchost.exe`}}}}, "svchost"},
+		{"companion mask", Config{Rules: []Rule{{Process: "a.exe", Action: "direct", Companions: []string{"*"}}}}, "matches every program"},
+		{"companion exe mask", Config{Rules: []Rule{{Process: "a.exe", Action: "direct", Companions: []string{"*.exe"}}}}, "matches every program"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -564,5 +570,57 @@ func TestBootstrapURLs(t *testing.T) {
 	c.DNS.Bootstrap = []string{"https://1.1.1.1/dns-query", "http://127.0.0.1:8053/dns-query", "https://[2606:4700:4700::1111]/dns-query"}
 	if err := c.Validate(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestRuleCompanionsJSON(t *testing.T) {
+	// An empty list leaves the key out entirely.
+	data, err := json.Marshal(Rule{Process: "a.exe", Action: "direct"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(data, []byte("companions")) {
+		t.Fatalf("empty companions written: %s", data)
+	}
+
+	raw := []byte(`{"process": "dnplayer.exe", "action": "direct", "companions": ["Ld9BoxHeadless.exe", "C:\\VM\\Service\\svc.exe"]}`)
+	var r Rule
+	if err := json.Unmarshal(raw, &r); err != nil {
+		t.Fatal(err)
+	}
+	if len(r.Companions) != 2 || r.Companions[0] != "Ld9BoxHeadless.exe" || r.Companions[1] != `C:\VM\Service\svc.exe` {
+		t.Fatalf("companions: %#v", r.Companions)
+	}
+	data, err = json.Marshal(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var again Rule
+	if err := json.Unmarshal(data, &again); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(again.Companions, ",") != strings.Join(r.Companions, ",") {
+		t.Fatalf("round trip: %#v", again.Companions)
+	}
+}
+
+func TestRuleCompanionsDeepCopy(t *testing.T) {
+	cfg := &Config{Rules: []Rule{{
+		Process: "a.exe", Action: "direct",
+		Companions: []string{"b.exe", "c.exe"},
+	}}}
+	cp := deepCopy(cfg)
+	cfg.Rules[0].Companions[0] = "changed"
+	if cp.Rules[0].Companions[0] != "b.exe" {
+		t.Fatalf("deepCopy shares the companions slice: %#v", cp.Rules[0].Companions)
+	}
+	// EffectiveRules must not hand the engine a slice that config edits mutate.
+	eff := cfg.EffectiveRules()
+	cfg.Rules[0].Companions[1] = "changed too"
+	if eff[0].Companions[1] != "c.exe" {
+		t.Fatalf("EffectiveRules shares the companions slice: %#v", eff[0].Companions)
+	}
+	if len(eff[0].Companions) != 2 {
+		t.Fatalf("EffectiveRules lost companions: %#v", eff[0].Companions)
 	}
 }

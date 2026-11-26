@@ -1,0 +1,744 @@
+package gui
+
+import (
+	"fmt"
+	"sort"
+	"strings"
+	"time"
+
+	"ashgate/internal/config"
+	"ashgate/internal/engine"
+	"ashgate/internal/process"
+	"ashgate/internal/rules"
+)
+
+// metaInspector is the part of process.Inspector companion scoring needs.
+// An interface keeps the scoring testable without touching real files.
+type metaInspector interface {
+	FileMetadata(path string) process.FileMeta
+	CommandLine(pid uint32, started int64) string
+}
+
+// ruleMemberView is one companion, child, or folder member of a rule, as the
+// Apps tab shows it under the rule's row.
+type ruleMemberView struct {
+	Name    string `json:"name"`
+	Path    string `json:"path,omitempty"`
+	Pattern string `json:"pattern,omitempty"`
+	Kind    string `json:"kind"` // "companion" | "child" | "folder"
+	Alive   bool   `json:"alive"`
+	Flows   int64  `json:"flows"`
+	Up      int64  `json:"up"`
+	Down    int64  `json:"down"`
+	Mask    string `json:"mask,omitempty"`
+}
+
+// companionCandidate is a running or recently direct program the user can
+// attach to a rule as a companion, with the signals that suggest it.
+type companionCandidate struct {
+	Name        string   `json:"name"`
+	Path        string   `json:"path"`
+	PID         uint32   `json:"pid,omitempty"`
+	Mask        string   `json:"mask,omitempty"`
+	Conns       int64    `json:"conns"`
+	Bytes       int64    `json:"bytes"`
+	LastSeen    int64    `json:"lastSeen,omitempty"`
+	SampleDests []string `json:"sampleDests,omitempty"`
+	Score       int      `json:"score"`
+	Reasons     []string `json:"reasons,omitempty"`
+	System      bool     `json:"system,omitempty"`
+	Running     bool     `json:"running"`
+	OtherRule   string   `json:"otherRule,omitempty"`
+}
+
+// ruleHintView is the suggestion the Apps tab shows for a rule whose app is
+// running but silent: a candidate companion, or a plain "quiet" mark.
+type ruleHintView struct {
+	Quiet        bool                `json:"quiet,omitempty"`
+	TopCandidate *companionCandidate `json:"topCandidate,omitempty"`
+}
+
+const (
+	// quietRuleDelay is how long a proxy rule must have been running with no
+	// traffic before the page looks for a missing companion.
+	quietRuleDelay = 10 * time.Second
+	// hintsEvery is how often the background hint scan may run.
+	hintsEvery = 2 * time.Second
+	// directRecent is the window of direct traffic that counts as current.
+	directRecent = 2 * time.Minute
+	// candidateLimit bounds the list the page receives.
+	candidateLimit = 80
+)
+
+// buildRuleMembers merges what the config saved, what is running now, and
+// what the engine counted into one list per rule. The rule's own process is
+// not repeated in the list (the engine reports it as an exact match).
+func buildRuleMembers(cfg *config.Config, stats map[string]engine.RuleStat, live map[string][]liveMember) map[string][]ruleMemberView {
+	if cfg == nil {
+		return nil
+	}
+	out := map[string][]ruleMemberView{}
+	for _, r := range cfg.Rules {
+		key := ruleKey(r.Process)
+		if key == "" {
+			continue
+		}
+		var list []ruleMemberView
+		var comps []*rules.Set
+		for _, raw := range r.Companions {
+			comp := strings.Trim(strings.TrimSpace(raw), `"`)
+			if comp == "" {
+				continue
+			}
+			v := ruleMemberView{Name: displayBase(comp), Kind: "companion", Pattern: comp}
+			if rules.IsPath(comp) {
+				v.Path = comp
+			}
+			if mask, ok := rules.VersionMask(comp); ok {
+				v.Mask = mask
+			}
+			list = append(list, v)
+			comps = append(comps, rules.Compile([]config.Rule{{Process: comp, Action: "direct"}}))
+		}
+		savedFor := func(m liveMember) int {
+			for i, set := range comps {
+				// Only a companion itself, not a process that merely lives in
+				// its folder: that one is a child and keeps its own row.
+				dec := set.Match(rules.Process{Name: m.Name, Path: m.Path})
+				if dec.Action != "" && (dec.MatchKind == rules.MatchExact || dec.MatchKind == rules.MatchCompanion) {
+					return i
+				}
+			}
+			return -1
+		}
+		for _, m := range live[key] {
+			if i := savedFor(m); i >= 0 {
+				v := &list[i]
+				v.Alive = true
+				if m.Path != "" {
+					v.Path = m.Path
+				}
+				if m.Name != "" {
+					v.Name = m.Name
+				}
+				continue
+			}
+			name := m.Name
+			if name == "" {
+				name = displayBase(m.Path)
+			}
+			list = append(list, ruleMemberView{Name: name, Path: m.Path, Kind: memberKind(m.Kind), Alive: true})
+		}
+		for _, p := range stats[key].Procs {
+			if p.Kind == rules.MatchExact {
+				continue
+			}
+			idx := -1
+			for i := range list {
+				if sameProc(list[i].Path, list[i].Name, p.Path, p.Name) {
+					idx = i
+					break
+				}
+			}
+			if idx >= 0 {
+				list[idx].Flows, list[idx].Up, list[idx].Down = p.Flows, p.Up, p.Down
+				if list[idx].Kind == "" {
+					list[idx].Kind = memberKind(p.Kind)
+				}
+				continue
+			}
+			name := p.Name
+			if name == "" {
+				name = displayBase(p.Path)
+			}
+			list = append(list, ruleMemberView{
+				Name: name, Path: p.Path, Kind: memberKind(p.Kind),
+				Flows: p.Flows, Up: p.Up, Down: p.Down,
+			})
+		}
+		if len(list) == 0 {
+			continue
+		}
+		sortRuleMembers(list)
+		out[key] = list
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// memberKind normalizes an engine or live match kind for the page.
+func memberKind(kind string) string {
+	switch kind {
+	case "companion", "child", "folder":
+		return kind
+	}
+	return "child"
+}
+
+// memberKindRank puts saved companions first; they are what the user chose.
+func memberKindRank(kind string) int {
+	switch kind {
+	case "companion":
+		return 0
+	case "child":
+		return 1
+	case "folder":
+		return 2
+	}
+	return 3
+}
+
+func sortRuleMembers(list []ruleMemberView) {
+	sort.SliceStable(list, func(i, j int) bool {
+		a, b := list[i], list[j]
+		if ra, rb := memberKindRank(a.Kind), memberKindRank(b.Kind); ra != rb {
+			return ra < rb
+		}
+		if a.Alive != b.Alive {
+			return a.Alive
+		}
+		if a.Flows != b.Flows {
+			return a.Flows > b.Flows
+		}
+		if at, bt := a.Up+a.Down, b.Up+b.Down; at != bt {
+			return at > bt
+		}
+		return strings.ToLower(a.Name) < strings.ToLower(b.Name)
+	})
+}
+
+// displayBase is the file name of a path or mask, keeping its case.
+func displayBase(p string) string {
+	p = strings.Trim(strings.TrimSpace(p), `"`)
+	p = strings.ReplaceAll(p, "/", `\`)
+	if i := strings.LastIndex(p, `\`); i >= 0 {
+		p = p[i+1:]
+	}
+	return p
+}
+
+// nameKey is a process name comparable across the config ("chrome") and the
+// process list ("chrome.exe").
+func nameKey(name string) string {
+	n := strings.ToLower(displayBase(name))
+	if n != "" && !strings.Contains(n, ".") && !strings.HasSuffix(n, "*") {
+		n += ".exe"
+	}
+	return n
+}
+
+// procKey identifies a candidate by path, falling back to its file name.
+func procKey(path, name string) string {
+	if p := rules.NormalizePath(path); p != "" {
+		return p
+	}
+	return nameKey(name)
+}
+
+// sameProc reports whether two process descriptions name the same program.
+func sameProc(pathA, nameA, pathB, nameB string) bool {
+	pa, pb := rules.NormalizePath(pathA), rules.NormalizePath(pathB)
+	if pa != "" && pb != "" {
+		return pa == pb
+	}
+	na := nameKey(nameA)
+	return na != "" && na == nameKey(nameB)
+}
+
+// dirOf is the install folder of a path or mask, normalized. A mask names
+// the folder before its first wildcard.
+func dirOf(p string) string {
+	p = rules.NormalizePath(p)
+	if p == "" {
+		return ""
+	}
+	if i := strings.IndexAny(p, "*?"); i >= 0 {
+		p = p[:i]
+		if j := strings.LastIndex(p, `\`); j >= 0 {
+			p = p[:j]
+		}
+		return strings.TrimSuffix(p, `\`)
+	}
+	if j := strings.LastIndex(p, `\`); j > 0 {
+		return p[:j]
+	}
+	return ""
+}
+
+// commonDirs hold unrelated programs, so a match there says nothing about
+// the application. Mirrors rules' shared-folder list, which is unexported.
+var commonDirs = map[string]bool{
+	`c:`: true, `c:\windows`: true, `c:\windows\system32`: true,
+	`c:\windows\syswow64`: true, `c:\windows\installer`: true,
+	`c:\program files`: true, `c:\program files (x86)`: true,
+	`c:\program files\common files`: true, `c:\program files (x86)\common files`: true,
+	`c:\programdata`: true, `c:\programdata\microsoft`: true, `c:\users`: true,
+}
+
+// genericDir reports a folder too broad to tie a process to one application.
+func genericDir(dir string) bool {
+	if dir == "" || len(dir) < 8 || commonDirs[dir] {
+		return true
+	}
+	if strings.HasPrefix(dir, `c:\users\`) {
+		rest := strings.TrimPrefix(dir, `c:\users\`)
+		if !strings.Contains(rest, `\`) {
+			return true // the profile itself
+		}
+	}
+	return false
+}
+
+// commonVendors sign platforms widely used by many programs; a shared
+// publisher there is weak evidence of the same application.
+var commonVendors = []string{"microsoft", "google", "apple", "oracle", "nvidia", "intel", "amd", "valve", "adobe"}
+
+func isCommonVendor(s string) bool {
+	s = strings.ToLower(s)
+	if s == "" {
+		return false
+	}
+	for _, v := range commonVendors {
+		if strings.Contains(s, v) {
+			return true
+		}
+	}
+	return false
+}
+
+// rankCandidates scores the programs that could be a missing companion of
+// rule. directProcs carried traffic no rule matched; runningProcs is the
+// whole process list. Processes the rule already covers are left out.
+func rankCandidates(rule config.Rule, allRules []config.Rule, ruleRunning []rules.Process, directProcs []engine.DirectProc, runningProcs []rules.Process, ins metaInspector, now time.Time) []companionCandidate {
+	if ins == nil {
+		ins = process.NewInspector()
+	}
+	on := true
+	rc := rule
+	rc.Enabled, rc.Action, rc.Proxy = &on, "direct", ""
+	ruleSet := rules.Compile([]config.Rule{rc})
+
+	var others []config.Rule
+	for _, r := range allRules {
+		if ruleKey(r.Process) == ruleKey(rule.Process) {
+			continue
+		}
+		o := r
+		o.Enabled, o.Action = &on, "direct"
+		others = append(others, o)
+	}
+	otherSet := rules.Compile(others)
+
+	type cand struct {
+		view    companionCandidate
+		started int64
+		parents []rules.Process
+	}
+	pool := map[string]*cand{}
+	covered := func(p rules.Process) bool { return ruleSet.Match(p).Action != "" }
+	isSelf := func(path, name string) bool {
+		return nameKey(name) == "ashgate.exe" || nameKey(path) == "ashgate.exe"
+	}
+	for _, dp := range directProcs {
+		if dp.Path == "" && dp.Name == "" {
+			continue
+		}
+		p := rules.Process{Name: dp.Name, Path: dp.Path, PID: dp.PID, Started: dp.Started}
+		if isSelf(dp.Path, dp.Name) || covered(p) {
+			continue
+		}
+		key := procKey(dp.Path, dp.Name)
+		if key == "" {
+			continue
+		}
+		c := pool[key]
+		if c == nil {
+			c = &cand{}
+			pool[key] = c
+		}
+		v := &c.view
+		if v.Name == "" {
+			v.Name = dp.Name
+		}
+		if v.Path == "" {
+			v.Path = dp.Path
+		}
+		if v.PID == 0 {
+			v.PID = dp.PID
+		}
+		if c.started == 0 {
+			c.started = dp.Started
+		}
+		v.Conns += dp.Conns
+		v.Bytes += dp.Bytes
+		if dp.LastSeen > v.LastSeen {
+			v.LastSeen = dp.LastSeen
+		}
+		if len(v.SampleDests) == 0 {
+			v.SampleDests = append([]string(nil), dp.SampleDests...)
+		}
+		v.System = v.System || dp.System || rules.IsShellOrSystem(p) || rules.IsSystemDNS(p.Name)
+	}
+	for _, p := range runningProcs {
+		if p.Path == "" && p.Name == "" {
+			continue
+		}
+		if isSelf(p.Path, p.Name) || covered(p) {
+			continue
+		}
+		key := procKey(p.Path, p.Name)
+		if key == "" {
+			continue
+		}
+		c := pool[key]
+		if c == nil {
+			c = &cand{}
+			pool[key] = c
+		}
+		v := &c.view
+		v.Running = true
+		if v.Name == "" {
+			v.Name = p.Name
+		}
+		if v.Path == "" {
+			v.Path = p.Path
+		}
+		if v.PID == 0 {
+			v.PID = p.PID
+		}
+		if c.started == 0 {
+			c.started = p.Started
+		}
+		if len(c.parents) == 0 {
+			c.parents = p.Parents
+		}
+		v.System = v.System || rules.IsShellOrSystem(p) || rules.IsSystemDNS(p.Name)
+	}
+
+	// Reference signals of the rule's application.
+	var rulePaths []string
+	if pp := strings.Trim(strings.TrimSpace(rule.Process), `"`); rules.IsPath(pp) {
+		rulePaths = append(rulePaths, pp)
+	}
+	for _, comp := range rule.Companions {
+		if cp := strings.Trim(strings.TrimSpace(comp), `"`); rules.IsPath(cp) {
+			rulePaths = append(rulePaths, cp)
+		}
+	}
+	for _, p := range ruleRunning {
+		if p.Path != "" {
+			rulePaths = append(rulePaths, p.Path)
+		}
+	}
+	var ruleDirs []string
+	dirSeen := map[string]bool{}
+	for _, p := range rulePaths {
+		d := dirOf(p)
+		if d == "" || genericDir(d) || dirSeen[d] {
+			continue
+		}
+		dirSeen[d] = true
+		ruleDirs = append(ruleDirs, d)
+	}
+	ruleTokens := map[string]bool{}
+	for _, t := range rules.PathTokens(rule.Process) {
+		ruleTokens[t] = true
+	}
+	for _, comp := range rule.Companions {
+		for _, t := range rules.PathTokens(comp) {
+			ruleTokens[t] = true
+		}
+	}
+	for _, p := range ruleRunning {
+		for _, t := range rules.PathTokens(p.Path) {
+			ruleTokens[t] = true
+		}
+		for _, t := range rules.PathTokens(p.Name) {
+			ruleTokens[t] = true
+		}
+	}
+	var ruleMeta process.FileMeta
+	metaDone := false
+	takeMeta := func(path string) {
+		if metaDone || path == "" {
+			return
+		}
+		m := ins.FileMetadata(path)
+		if m.Signer != "" || m.Company != "" || m.Product != "" {
+			ruleMeta, metaDone = m, true
+		}
+	}
+	takeMeta(rule.Process)
+	for _, p := range ruleRunning {
+		takeMeta(p.Path)
+	}
+	var ruleStarted int64
+	for _, p := range ruleRunning {
+		if p.Started != 0 && (ruleStarted == 0 || p.Started < ruleStarted) {
+			ruleStarted = p.Started
+		}
+	}
+	ruleExe := nameKey(rule.Process)
+	ruleExeUsable := ruleExe != "" && !strings.ContainsAny(ruleExe, "*?")
+
+	out := make([]companionCandidate, 0, len(pool))
+	for _, c := range pool {
+		v := c.view
+		if v.Name == "" {
+			v.Name = displayBase(v.Path)
+		}
+		v.Mask, _ = rules.VersionMask(v.Path)
+		if !v.System {
+			score, reasons := 0, []string(nil)
+			var candMeta process.FileMeta
+			if v.Path != "" {
+				candMeta = ins.FileMetadata(v.Path)
+			}
+			if v.PID != 0 {
+				if cmd := ins.CommandLine(v.PID, c.started); cmd != "" {
+					low := strings.ToLower(cmd)
+					hit := false
+					for _, d := range ruleDirs {
+						if strings.Contains(low, d) {
+							hit = true
+							break
+						}
+					}
+					if !hit && ruleExeUsable && strings.Contains(low, ruleExe) {
+						hit = true
+					}
+					if hit {
+						score += 60
+						reasons = append(reasons, "Запущен с путём программы")
+					}
+				}
+			}
+			signer := strings.TrimSpace(ruleMeta.Signer)
+			candSigner := strings.TrimSpace(candMeta.Signer)
+			common := isCommonVendor(ruleMeta.Signer) || isCommonVendor(ruleMeta.Company) || isCommonVendor(ruleMeta.Product)
+			if signer != "" && candSigner != "" && strings.EqualFold(signer, candSigner) {
+				if common {
+					score += 10
+				} else {
+					score += 50
+				}
+				reasons = append(reasons, "Тот же издатель")
+			} else {
+				sameCompany := ruleMeta.Company != "" && candMeta.Company != "" && strings.EqualFold(ruleMeta.Company, candMeta.Company)
+				sameProduct := ruleMeta.Product != "" && candMeta.Product != "" && strings.EqualFold(ruleMeta.Product, candMeta.Product)
+				if sameCompany || sameProduct {
+					if common {
+						score += 5
+					} else {
+						score += 30
+					}
+					reasons = append(reasons, "Та же компания")
+				}
+			}
+			if v.Path != "" && len(ruleTokens) > 0 {
+				for _, t := range rules.PathTokens(v.Path) {
+					if ruleTokens[t] {
+						score += 35
+						reasons = append(reasons, fmt.Sprintf("Похожий путь (%s)", t))
+						break
+					}
+				}
+			}
+			if v.Conns > 0 {
+				age := now.UnixMilli() - v.LastSeen
+				switch {
+				case age >= 0 && age <= 60_000:
+					score += 25
+					if v.Bytes >= 16*1024 {
+						score += 10
+					}
+					reasons = append(reasons, "Активный трафик напрямую")
+				case age >= 0 && age <= 5*60_000:
+					score += 15
+					reasons = append(reasons, "Недавний трафик напрямую")
+				}
+			}
+			if ruleStarted > 0 && c.started > 0 {
+				d := c.started - ruleStarted
+				if d < 0 {
+					d = -d
+				}
+				if d <= int64(90*time.Second) {
+					score += 15
+					reasons = append(reasons, "Запущен вместе с программой")
+				}
+			}
+			v.Score, v.Reasons = score, reasons
+		}
+		if otherSet != nil {
+			dec := otherSet.Match(rules.Process{Name: v.Name, Path: v.Path, PID: v.PID, Started: c.started, Parents: c.parents})
+			if dec.Action != "" && dec.RuleIndex >= 0 && dec.RuleIndex < len(others) {
+				v.OtherRule = others[dec.RuleIndex].Process
+			}
+		}
+		out = append(out, v)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].System != out[j].System {
+			return !out[i].System
+		}
+		if out[i].Score != out[j].Score {
+			return out[i].Score > out[j].Score
+		}
+		if out[i].Bytes != out[j].Bytes {
+			return out[i].Bytes > out[j].Bytes
+		}
+		if out[i].Conns != out[j].Conns {
+			return out[i].Conns > out[j].Conns
+		}
+		if out[i].LastSeen != out[j].LastSeen {
+			return out[i].LastSeen > out[j].LastSeen
+		}
+		return strings.ToLower(out[i].Name) < strings.ToLower(out[j].Name)
+	})
+	if len(out) > candidateLimit {
+		out = out[:candidateLimit]
+	}
+	return out
+}
+
+// topCandidate returns the best non-system candidate when it is strong
+// enough to suggest, and nil otherwise. System entries are last, but are
+// skipped explicitly so they never become a suggestion. Candidates with
+// high affinity but zero traffic or already bound to another rule are
+// skipped rather than stopping the search, so the best active direct
+// candidate still surfaces.
+func topCandidate(cands []companionCandidate) *companionCandidate {
+	for i := range cands {
+		if cands[i].System {
+			continue
+		}
+		c := cands[i]
+		if c.Score < 45 {
+			return nil
+		}
+		if (c.Conns > 0 || c.Bytes > 0) && c.OtherRule == "" {
+			return &c
+		}
+	}
+	return nil
+}
+
+// countDirect is the number of programs sending direct traffic right now;
+// the Apps tab shows it as a badge.
+func countDirect(procs []engine.DirectProc, now time.Time) int {
+	nowMs := now.UnixMilli()
+	n := 0
+	for _, dp := range procs {
+		if dp.System || dp.LastSeen <= 0 {
+			continue
+		}
+		if age := nowMs - dp.LastSeen; age >= 0 && age <= directRecent.Milliseconds() {
+			n++
+		}
+	}
+	return n
+}
+
+// refreshHints looks, in the background, for rules whose app runs but sends
+// no traffic and for a direct program that looks like its missing companion.
+// It runs only while the window is visible and capture is on; a tray window
+// has nobody to show the hint to.
+func (c *controller) refreshHints() {
+	c.mu.Lock()
+	if c.hintsBusy || time.Since(c.hintsAt) < hintsEvery {
+		c.mu.Unlock()
+		return
+	}
+	sess := c.sess
+	if sess == nil || !sess.Running() {
+		c.hintsCache, c.hintsAt, c.hintsBusy = nil, time.Now(), false
+		c.mu.Unlock()
+		return
+	}
+	c.hintsBusy = true
+	rs := c.cfg.EffectiveRules()
+	alive := make(map[string]bool, len(c.alive))
+	for k, v := range c.alive {
+		alive[k] = v
+	}
+	since := make(map[string]time.Time, len(c.aliveSince))
+	for k, v := range c.aliveSince {
+		since[k] = v
+	}
+	ruleProcs := make(map[string][]rules.Process, len(c.liveRuleProcs))
+	for k, v := range c.liveRuleProcs {
+		ruleProcs[k] = append([]rules.Process(nil), v...)
+	}
+	procs := append([]rules.Process(nil), c.liveProcs...)
+	ins := c.inspector
+	if ins == nil {
+		ins = process.NewInspector()
+		c.inspector = ins
+	}
+	c.mu.Unlock()
+
+	go func() {
+		now := time.Now()
+		directProcs, _, _ := sess.DirectSnapshot()
+		recent := make([]engine.DirectProc, 0, len(directProcs))
+		for _, dp := range directProcs {
+			if dp.System || dp.LastSeen <= 0 {
+				continue
+			}
+			if age := now.UnixMilli() - dp.LastSeen; age < 0 || age > directRecent.Milliseconds() {
+				continue
+			}
+			recent = append(recent, dp)
+		}
+		var hints map[string]ruleHintView
+		if len(recent) > 0 {
+			// Limit running process enrichment to processes that actually sent
+			// recent direct traffic, avoiding metadata/cmdline queries on idle
+			// background processes during periodic 2 s hint scans.
+			recentKeys := make(map[string]bool, len(recent))
+			for _, dp := range recent {
+				if k := procKey(dp.Path, dp.Name); k != "" {
+					recentKeys[k] = true
+				}
+			}
+			var recentRunning []rules.Process
+			for _, p := range procs {
+				if recentKeys[procKey(p.Path, p.Name)] {
+					recentRunning = append(recentRunning, p)
+				}
+			}
+			stats := sess.RuleStats()
+			hints = map[string]ruleHintView{}
+			for _, r := range rs {
+				if !r.IsEnabled() || r.Action != "proxy" {
+					continue
+				}
+				k := ruleKey(r.Process)
+				if k == "" || !alive[k] {
+					continue
+				}
+				at, ok := since[k]
+				if !ok || now.Sub(at) < quietRuleDelay {
+					continue
+				}
+				st := stats[k]
+				if st.Flows != 0 || st.Up+st.Down >= 4096 {
+					continue
+				}
+				cands := rankCandidates(r, rs, ruleProcs[k], recent, recentRunning, ins, now)
+				if best := topCandidate(cands); best != nil {
+					hints[k] = ruleHintView{TopCandidate: best}
+				} else {
+					hints[k] = ruleHintView{Quiet: true}
+				}
+			}
+		}
+		c.mu.Lock()
+		c.hintsCache = hints
+		c.hintsAt, c.hintsBusy = time.Now(), false
+		c.mu.Unlock()
+	}()
+}

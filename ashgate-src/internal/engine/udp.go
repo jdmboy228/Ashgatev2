@@ -30,6 +30,8 @@ type udpFlow struct {
 	closed bool
 	parent string
 	stat   *ruleStat
+	// owner is the per-process share of stat's counters; nil for system DNS.
+	owner *subProcStat
 	// sys marks system DNS (see dns.go): split by name per packet, and
 	// DNS over TCP through SOCKS5.
 	sys  bool
@@ -181,6 +183,10 @@ func (e *Engine) readUDP(flow *udpFlow, sess dialer.Session) {
 		if flow.stat != nil {
 			flow.stat.down.Add(n)
 		}
+		if flow.owner != nil {
+			flow.owner.down.Add(n)
+			flow.owner.lastSeen.Store(e.now().UnixMilli())
+		}
 		flow.touch(e.now())
 		// A reply that cannot be built (too big for one packet) or
 		// injected is lost like any UDP datagram; the flow goes on.
@@ -222,6 +228,9 @@ func (e *Engine) retireUDP(flow *udpFlow) {
 	flow.live = false
 	if dec && flow.stat != nil {
 		flow.stat.flows.Add(-1)
+	}
+	if dec && flow.owner != nil {
+		flow.owner.flows.Add(-1)
 	}
 	e.mu.Unlock()
 	if dec {
@@ -323,6 +332,7 @@ func (e *Engine) sweep(now time.Time) {
 		e.dropFlowLocked(f)
 	}
 	e.mu.Unlock()
+	e.direct.sweep(now)
 	for _, f := range staleUDP {
 		f.mu.Lock()
 		sess := f.sess

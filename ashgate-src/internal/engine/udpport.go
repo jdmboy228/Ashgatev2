@@ -7,10 +7,11 @@ package engine
 // socket's CLOSE event therefore drops the port's cached decisions; the
 // next packet from the port is decided again.
 
-// addDirectUDP caches a direct decision and indexes it by source port.
-// Callers hold e.mu.
-func (e *Engine) addDirectUDP(k udpKey) {
-	e.directUDP.add(k)
+// addDirectUDP caches a direct decision with the unmatched program behind it
+// (nil for an explicit direct rule) and indexes it by source port. Callers
+// hold e.mu.
+func (e *Engine) addDirectUDP(k udpKey, dp *directProcEntry) {
+	e.directUDP.set(k, dp)
 	if e.directPorts == nil {
 		e.directPorts = map[uint16]map[udpKey]struct{}{}
 	}
@@ -61,7 +62,7 @@ func (e *Engine) ForgetUDPPort(port uint16) {
 // so the index does not keep keys the cache dropped. Callers hold e.mu.
 func (e *Engine) reindexDirectUDP() {
 	idx := map[uint16]map[udpKey]struct{}{}
-	for _, gen := range []map[udpKey]struct{}{e.directUDP.cur, e.directUDP.old} {
+	for _, gen := range []map[udpKey]*directProcEntry{e.directUDP.cur, e.directUDP.old} {
 		for k := range gen {
 			m := idx[k.Src.Port]
 			if m == nil {

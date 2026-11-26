@@ -77,6 +77,21 @@ type controller struct {
 	alive     map[string]bool
 	aliveAt   time.Time
 	aliveBusy bool
+	// aliveSince is when each rule's app became continuously alive, used to
+	// tell a rule that is merely starting from one that runs but is silent.
+	aliveSince map[string]time.Time
+	// liveMembers are the processes each rule caught without naming them;
+	// liveProcs is the last process snapshot; liveRuleProcs is every process
+	// each rule caught, for companion scoring. Guarded by mu.
+	liveMembers   map[string][]liveMember
+	liveProcs     []rules.Process
+	liveRuleProcs map[string][]rules.Process
+	// inspector reads process metadata for companion scoring.
+	inspector metaInspector
+	// hintsCache is the last background rule-hint scan; see companions.go.
+	hintsCache map[string]ruleHintView
+	hintsAt    time.Time
+	hintsBusy  bool
 	// startMu serializes start, stop, and shutdown.
 	startMu sync.Mutex
 	// sessWg tracks session watcher goroutines launched by start.
@@ -164,6 +179,7 @@ func newController(path string, cfg *config.Config, logs *logbuf.Buffer, h hooks
 		path: path, cfg: cfg, logs: logs, checks: map[string]probe.Report{},
 		bridges: vless.NewManager(), bridgeSt: map[string]vless.Status{}, hooks: h,
 		token: newToken(), done: make(chan struct{}), loopDone: make(chan struct{}),
+		inspector: process.NewInspector(),
 	}
 	c.syncSubsLocked(cfg, time.Now())
 	_ = c.syncBridges(c.runtimeCfg())
@@ -371,6 +387,79 @@ func (c *controller) api(w http.ResponseWriter, r *http.Request) {
 			wg.Wait()
 			return out, nil
 		})
+	case "/api/companions/candidates":
+		if r.Method != http.MethodGet {
+			http.Error(w, "method", http.StatusMethodNotAllowed)
+			return
+		}
+		key := ruleKey(r.URL.Query().Get("rule"))
+		eff := c.runtimeCfg().EffectiveRules()
+		var found *config.Rule
+		for i := range eff {
+			if ruleKey(eff[i].Process) == key {
+				found = &eff[i]
+				break
+			}
+		}
+		if found == nil {
+			http.NotFound(w, r)
+			return
+		}
+		c.mu.Lock()
+		procs := append([]rules.Process(nil), c.liveProcs...)
+		ruleProcs := append([]rules.Process(nil), c.liveRuleProcs[key]...)
+		ins := c.inspector
+		sess := c.sess
+		c.mu.Unlock()
+		if ins == nil {
+			ins = process.NewInspector()
+		}
+		if len(procs) == 0 {
+			procs = snapshotProcs()
+		}
+		var direct []engine.DirectProc
+		if sess != nil {
+			direct, _, _ = sess.DirectSnapshot()
+		}
+		cands := rankCandidates(*found, eff, ruleProcs, direct, procs, ins, time.Now())
+		if cands == nil {
+			cands = []companionCandidate{}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"rule": key, "candidates": cands})
+	case "/api/direct":
+		if r.Method != http.MethodGet {
+			http.Error(w, "method", http.StatusMethodNotAllowed)
+			return
+		}
+		since, _ := strconv.ParseUint(r.URL.Query().Get("gen"), 10, 64)
+		c.mu.Lock()
+		sess := c.sess
+		c.mu.Unlock()
+		var procs []engine.DirectProc
+		var evs []logbuf.Event
+		var generation uint64
+		if sess != nil {
+			procs, evs, generation = sess.DirectSnapshot()
+		}
+		same := since != 0 && since == generation
+		var events []eventView
+		if !same {
+			events = eventsToViews(evs)
+		}
+		writeJSON(w, http.StatusOK, directView{
+			Procs:      procs,
+			Events:     events,
+			EventsSame: same,
+			Generation: generation,
+		})
+	case "/api/direct/clear":
+		c.post(w, r, func() (any, error) {
+			c.mu.Lock()
+			sess := c.sess
+			c.mu.Unlock()
+			sess.ClearDirectEvents()
+			return nil, nil
+		})
 	case "/api/icon":
 		if r.Method != http.MethodGet {
 			http.Error(w, "method", http.StatusMethodNotAllowed)
@@ -547,6 +636,12 @@ type stateView struct {
 	// (Squirrel) folders, for rules whose saved path still names one
 	// version. The page offers to apply it; nothing changes on its own.
 	RuleMasks map[string]string `json:"ruleMasks,omitempty"`
+	// RuleMembers: rule key -> its companions and the processes it caught.
+	RuleMembers map[string][]ruleMemberView `json:"ruleMembers,omitempty"`
+	// RuleHints: rule key -> a suggested missing companion, or a quiet mark.
+	RuleHints map[string]ruleHintView `json:"ruleHints,omitempty"`
+	// DirectCount is the number of programs sending direct traffic now.
+	DirectCount int `json:"directCount,omitempty"`
 	// Hidden tells the page it is in the tray, so it polls slowly.
 	Hidden     bool        `json:"hidden,omitempty"`
 	Events     []eventView `json:"events"`
@@ -568,6 +663,7 @@ type eventView struct {
 	BytesDown int64  `json:"bytesDown"`
 	Error     string `json:"error,omitempty"`
 	Parent    string `json:"parent,omitempty"`
+	Path      string `json:"path,omitempty"`
 }
 
 func (c *controller) snapshot() stateView {
@@ -583,10 +679,21 @@ func (c *controller) snapshotSince(since uint64) stateView {
 		// The running-app scan opens every process. In the tray nobody
 		// sees its result, and the page still polls every 3 seconds.
 		c.refreshAlive()
+		c.refreshHints()
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	cfg := cloneCfg(c.cfg)
+	now := time.Now()
+	var stats map[string]engine.RuleStat
+	var directCount int
+	if c.sess != nil {
+		stats = c.sess.RuleStats()
+		procs, _, _ := c.sess.DirectSnapshot()
+		directCount = countDirect(procs, now)
+	}
+	members := buildRuleMembers(cfg, stats, c.liveMembers)
+	hints := c.hintsCache
 	running := c.sess != nil && c.sess.Running()
 	var tcp, udp int
 	var up, down int64
@@ -621,34 +728,37 @@ func (c *controller) snapshotSince(since uint64) stateView {
 		events = eventViews(c.logs)
 	}
 	return stateView{
-		Version:    version.Version,
-		Build:      version.Build(),
-		Path:       c.path,
-		Running:    running,
-		Active:     active,
-		TCP:        tcp,
-		UDP:        udp,
-		BytesUp:    up,
-		BytesDown:  down,
-		Admin:      c.hooks.admin,
-		Driver:     running,
-		Error:      errText,
-		Notice:     notice,
-		Theme:      theme,
-		Autostart:  c.auto,
-		Config:     cfg,
-		Checks:     checks,
-		Bridges:    bridges,
-		KillSwitch: c.ksSnapshot(killWanted(cfg)),
-		RuleStats:  c.ruleStatsLocked(time.Now()),
-		Subs:       c.subViewsLocked(),
-		Alive:      c.alive,
-		RuleMasks:  ruleMasks(cfg),
-		Hidden:     hidden,
-		Events:     events,
-		EventsSame: same,
-		Generation: g,
-		Goroutines: runtime.NumGoroutine(),
+		Version:     version.Version,
+		Build:       version.Build(),
+		Path:        c.path,
+		Running:     running,
+		Active:      active,
+		TCP:         tcp,
+		UDP:         udp,
+		BytesUp:     up,
+		BytesDown:   down,
+		Admin:       c.hooks.admin,
+		Driver:      running,
+		Error:       errText,
+		Notice:      notice,
+		Theme:       theme,
+		Autostart:   c.auto,
+		Config:      cfg,
+		Checks:      checks,
+		Bridges:     bridges,
+		KillSwitch:  c.ksSnapshot(killWanted(cfg)),
+		RuleStats:   c.ruleStatsLocked(now),
+		Subs:        c.subViewsLocked(),
+		Alive:       c.alive,
+		RuleMasks:   ruleMasks(cfg),
+		RuleMembers: members,
+		RuleHints:   hints,
+		DirectCount: directCount,
+		Hidden:      hidden,
+		Events:      events,
+		EventsSame:  same,
+		Generation:  g,
+		Goroutines:  runtime.NumGoroutine(),
 	}
 }
 
@@ -890,6 +1000,8 @@ func (c *controller) replaceLocked(next *config.Config) error {
 	}
 	c.mu.Lock()
 	c.cfg = cp
+	c.hintsCache = nil
+	c.hintsAt = time.Time{}
 	for name := range c.checks {
 		if _, ok := cp.ProxyByName(name); !ok {
 			delete(c.checks, name) // deleted or renamed
@@ -1058,22 +1170,45 @@ func eventViews(logs *logbuf.Buffer) []eventView {
 	all := logs.Recent(300)
 	out := make([]eventView, 0, len(all))
 	for i := len(all) - 1; i >= 0; i-- {
-		e := all[i]
-		out = append(out, eventView{
-			Time:      e.Time.Format("15:04:05"),
-			Process:   e.Process,
-			PID:       e.PID,
-			Proto:     e.Proto,
-			Dest:      e.Dest,
-			Via:       e.Via,
-			Status:    e.Status,
-			BytesUp:   e.BytesUp,
-			BytesDown: e.BytesDown,
-			Error:     e.Error,
-			Parent:    e.Parent,
-		})
+		out = append(out, eventToView(all[i]))
 	}
 	return out
+}
+
+// eventsToViews converts events in the order given. The direct-traffic feed
+// is already oldest first.
+func eventsToViews(evs []logbuf.Event) []eventView {
+	out := make([]eventView, 0, len(evs))
+	for _, e := range evs {
+		out = append(out, eventToView(e))
+	}
+	return out
+}
+
+func eventToView(e logbuf.Event) eventView {
+	return eventView{
+		Time:      e.Time.Format("15:04:05"),
+		Process:   e.Process,
+		PID:       e.PID,
+		Proto:     e.Proto,
+		Dest:      e.Dest,
+		Via:       e.Via,
+		Status:    e.Status,
+		BytesUp:   e.BytesUp,
+		BytesDown: e.BytesDown,
+		Error:     e.Error,
+		Parent:    e.Parent,
+		Path:      e.Path,
+	}
+}
+
+// directView is /api/direct: the programs bypassing the rules and the feed
+// of their destinations.
+type directView struct {
+	Procs      []engine.DirectProc `json:"procs"`
+	Events     []eventView         `json:"events"`
+	EventsSame bool                `json:"eventsSame,omitempty"`
+	Generation uint64              `json:"generation"`
 }
 
 func gen(logs *logbuf.Buffer) uint64 {

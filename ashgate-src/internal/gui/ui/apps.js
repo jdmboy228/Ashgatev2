@@ -12,6 +12,84 @@ let apDrag = null; // unit key being dragged
 // that is filled in place, so traffic updating every second does not
 // rebuild the list (that used to swallow clicks).
 let apTele = {};
+// apExpanded holds rule keys whose companion/child list is open. It is a
+// view setting only and is never saved to config.json.
+const apExpanded = new Set();
+// apDismissedHints holds rule keys whose «no traffic» hint was dismissed
+// for this window session.
+const apDismissedHints = new Set();
+// apCompTimer refreshes the open companions dialog's candidates.
+let apCompTimer = null;
+
+// fmtBytes is bytes() under the name the companion UI uses.
+function fmtBytes(n) {
+  return bytes(n);
+}
+function apProcWord(n) {
+  return plural(n, "процесс", "процесса", "процессов");
+}
+function apIsPath(p) {
+  p = String(p || "").trim();
+  return /[\\/]/.test(p) || (p.length >= 2 && p[1] === ":");
+}
+// apVersionMask mirrors rules.VersionMask: a path with Squirrel-style
+// «app-1.2.3» folders becomes version-proof, or "" when there is nothing
+// to generalize.
+function apVersionMask(p) {
+  p = String(p || "").trim().replace(/^"+|"+$/g, "");
+  if (!p || /[*?]/.test(p) || !apIsPath(p)) return "";
+  const sep = p.indexOf("\\") >= 0 ? "\\" : "/";
+  const segs = p.split(sep);
+  let changed = false;
+  for (let i = 0; i < segs.length; i++) {
+    const low = segs[i].toLowerCase();
+    if (low.startsWith("app-") && low.length > 4 && low[4] >= "0" && low[4] <= "9") {
+      segs[i] = segs[i].slice(0, 4) + "*";
+      changed = true;
+    }
+  }
+  return changed ? segs.join(sep) : "";
+}
+// apCompanionError is the page-side check before a process becomes a
+// companion: the server refuses the same values when the config is saved.
+function apCompanionError(p) {
+  p = String(p || "").trim().replace(/^"+|"+$/g, "");
+  if (!p) return "Укажите имя процесса, путь или маску";
+  if (/^svchost\.exe$/i.test(baseName(p))) return "Не указывайте svchost.exe — для системного DNS есть «Системный резолвер» в настройках";
+  if (/[*?]/.test(p)) {
+    const rest = p.toLowerCase().replace(/[*?]/g, "").replace(/\.exe/g, "").replace(/[\\/.]/g, "");
+    if (!rest) return "Маска совпадает со всеми программами";
+  }
+  return "";
+}
+// apProcKey identifies a candidate the way the server does: its normalized
+// path, or its file name when no path is known.
+function apProcKey(path, name) {
+  const p = String(path || "").trim().replace(/^"+|"+$/g, "").replace(/\//g, "\\").toLowerCase();
+  if (p) return p;
+  let n = baseName(String(name || "")).toLowerCase();
+  if (n && n.indexOf(".") < 0 && !n.endsWith("*")) n += ".exe";
+  return n;
+}
+// apRuleMembers merges the server's live member list with the config, so
+// the list is right even before the first poll reaches the page.
+function apRuleMembers(r) {
+  if (!r) return [];
+  const key = apKey(r.process);
+  const live = (state && state.ruleMembers && state.ruleMembers[key]) || [];
+  if (live.length) return live;
+  return (r.companions || []).map((comp) => ({
+    name: baseName(comp) || comp,
+    path: apIsPath(comp) ? comp : "",
+    pattern: comp,
+    kind: "companion",
+    alive: false,
+    flows: 0,
+    up: 0,
+    down: 0,
+    mask: apVersionMask(comp),
+  }));
+}
 
 function apGroups() {
   const c = cfg();
@@ -300,24 +378,125 @@ function apSwitch(act, data, on, title) {
   return `<button class="ap-switch${on ? " on" : ""}" type="button" role="switch" aria-checked="${on}" data-act="${act}" ${data} title="${esc(title)}"><i></i></button>`;
 }
 
+// ---------- companions ----------
+
+// apAttachCompanion binds an extra process (name, path, or mask) to a rule.
+// mask, when given, replaces rawPathOrMask; it is what the radar suggests
+// for versioned app-* folders.
+function apAttachCompanion(ruleIdx, rawPathOrMask, mask) {
+  const r = (cfg().rules || [])[ruleIdx];
+  if (!r) return false;
+  const pattern = String(mask || rawPathOrMask || "").trim().replace(/^"+|"+$/g, "");
+  const err = apCompanionError(pattern);
+  if (err) { showToast(err); return false; }
+  const key = apKey(pattern);
+  const dup = apKey(r.process) === key || (r.companions || []).some((c) => apKey(c) === key);
+  if (dup) { showToast(`${apLabel(pattern)} уже связан с этим правилом`); return false; }
+  if (!Array.isArray(r.companions)) r.companions = [];
+  r.companions.push(pattern);
+  apDismissedHints.delete(apKey(r.process));
+  return apSave(`${apLabel(pattern)} подключён к правилу «${apLabel(r.process)}»`);
+}
+function apRemoveCompanion(ruleIdx, pattern) {
+  const r = (cfg().rules || [])[ruleIdx];
+  if (!r || !Array.isArray(r.companions)) return false;
+  const key = apKey(pattern);
+  const at = r.companions.findIndex((c) => apKey(c) === key);
+  if (at < 0) return false;
+  const name = apLabel(r.companions[at]);
+  r.companions.splice(at, 1);
+  if (!r.companions.length) delete r.companions;
+  return apSave(`${name} отвязан от правила «${apLabel(r.process)}»`);
+}
+function apGeneralizeCompanion(ruleIdx, pattern, mask) {
+  const r = (cfg().rules || [])[ruleIdx];
+  if (!r || !Array.isArray(r.companions) || !mask) return false;
+  const key = apKey(pattern);
+  const at = r.companions.findIndex((c) => apKey(c) === key);
+  if (at < 0) return false;
+  r.companions[at] = mask;
+  return apSave(`Путь ${apLabel(mask)} обобщён для обновлений`);
+}
+
 function apRuleHTML(i, inGroup) {
   const r = cfg().rules[i];
   const s = apStatus(r);
   const eff = apEffective(r);
   const selected = apSelected.has(i);
+  const key = apKey(r.process);
+  const members = apRuleMembers(r);
+  const open = !!key && apExpanded.has(key);
   // Grouped rules take the group's selection, route and switch.
   const check = inGroup ? "" : `<button class="ap-check${selected ? " on" : ""}" type="button" data-act="ap-select" data-i="${i}" title="${selected ? "Снять выбор" : "Выбрать правило для группировки"}" aria-pressed="${selected}">${selected ? icon("check", 12) : ""}</button>`;
   const route = inGroup ? "" : apRouteBadge("r" + i, r.action, r.proxy || "", s.bad);
   apTele["r" + i] = apTelemetry(s);
-  return `<div class="ap-card${eff.enabled ? "" : " dim"}${inGroup ? " member" : ""}${selected ? " picked" : ""}" draggable="${inGroup ? "false" : "true"}" data-unit="r:${i}">
+  const pill = members.length
+    ? `<button type="button" class="ap-sub-pill${open ? " open" : ""}" data-act="ap-sub-toggle" data-i="${i}" title="Показать связанные и дочерние процессы">${icon("chevr", 12)}<span>+${members.length} ${apProcWord(members.length)}</span></button>`
+    : "";
+  const card = `<div class="ap-card${eff.enabled ? "" : " dim"}${inGroup ? " member" : ""}${selected ? " picked" : ""}" draggable="${inGroup ? "false" : "true"}" data-unit="r:${i}">
     <div class="ap-left">${inGroup ? "" : `<span class="ap-slot">${check}</span>`}<span class="ap-ic">${appIconHTML(apPath(r.process))}<i class="ap-dot ${s.dot}" title="${esc(s.error || (s.flows ? "Трафик идёт через прокси" : s.line))}"></i></span>
-      <div class="ap-name"><div class="nm"><span>${esc(apLabel(r.process))}</span>${s.badge ? `<em class="bad">${esc(s.badge)}</em>` : ""}${apVersionBadge(r) ? `<em class="ver" title="Путь содержит папку версии: после обновления приложения правило перестанет совпадать. Обобщить — в меню правила.">версия</em>` : ""}</div>
+      <div class="ap-name"><div class="nm"><span>${esc(apLabel(r.process))}</span>${s.badge ? `<em class="bad">${esc(s.badge)}</em>` : ""}${apVersionBadge(r) ? `<em class="ver" title="Путь содержит папку версии: после обновления приложения правило перестанет совпадать. Обобщить — в меню правила.">версия</em>` : ""}${pill}</div>
       <div class="sub"><span class="path">${esc(apPath(r.process))}</span></div></div></div>
     <div class="ap-tele" data-tele="r${i}"></div>
     <div class="ap-routecell">${route}</div>
     <div class="ap-right">${apSwitch("ap-toggle", `data-i="${i}"`, apOn(r.enabled), apOn(r.enabled) ? "Выключить правило" : "Включить правило")}
     <div class="ap-pop-wrap"><button class="ap-more" type="button" data-act="ap-menu" data-target="r${i}" aria-label="Параметры правила" title="Дополнительные параметры правила">${icon("more")}</button>${apOpen === "menu:r" + i ? apRuleMenu(i, inGroup) : ""}</div></div>
   </div>`;
+  const sub = open && members.length ? apSubListHTML(i, members) : "";
+  const hint = apRuleHintHTML(i, key);
+  return `<div class="ap-unit-wrap${open && members.length ? " open" : ""}" data-key="${esc(key)}">${card}${sub}${hint}</div>`;
+}
+
+// apSubListHTML is the drawer under a rule: its saved companions and the
+// processes it catches. It is a view of live data, not part of config.
+function apSubListHTML(i, members) {
+  return `<div class="ap-sublist">${members.map((m) => apSubRowHTML(i, m)).join("")}
+    <button type="button" class="ap-sub-add" data-act="ap-companions" data-i="${i}">${icon("plus", 14)}Подключить процесс / Найти трафик…</button></div>`;
+}
+function apSubRowHTML(i, m) {
+  const kind = m.kind === "companion" || m.kind === "folder" ? m.kind : "child";
+  const origin = kind === "companion" ? "привязан" : kind === "folder" ? "папка" : "дочерний";
+  const label = m.name || apLabel(m.path || m.pattern || "");
+  const full = m.path || m.pattern || m.name || "";
+  let stateText;
+  if (m.flows > 0 || (m.up || 0) + (m.down || 0) > 0) {
+    stateText = `${m.flows ? m.flows + " пот. · " : ""}${fmtBytes((m.up || 0) + (m.down || 0))}`;
+  } else stateText = m.alive ? "запущен" : "не запущен";
+  const maskBtn = kind === "companion" && m.mask
+    ? `<button type="button" class="ap-sub-mask" data-act="ap-sub-mask" data-i="${i}" data-pat="${esc(m.pattern || m.path || m.name || "")}" data-mask="${esc(m.mask)}" title="Обобщить путь для обновлений: ${esc(m.mask)}">версия</button>`
+    : "";
+  const remove = kind === "companion"
+    ? `<button type="button" class="ap-sub-remove" data-act="ap-sub-remove" data-i="${i}" data-pat="${esc(m.pattern || m.path || m.name || "")}" title="Отвязать процесс" aria-label="Отвязать процесс">${icon("close", 12)}</button>`
+    : "";
+  return `<div class="ap-sub-row">
+    <span class="ap-sub-ic">${appIconHTML(full, "width:20px;height:20px;border-radius:6px;font-size:9px")}</span>
+    <span class="ap-sub-nm" title="${esc(full)}">${esc(label)}</span>
+    <em class="ap-origin ${kind === "companion" ? "bound" : kind === "folder" ? "folder" : "child"}">${origin}</em>
+    <span class="ap-sub-traffic">${esc(stateText)}</span>
+    ${maskBtn}${remove}
+  </div>`;
+}
+
+// apRuleHintHTML is the proactive bar under a rule whose app runs but sends
+// no traffic: a likely missing companion in one click, or a quiet mark.
+function apRuleHintHTML(i, key) {
+  if (!key || apDismissedHints.has(key)) return "";
+  const hints = state && state.ruleHints;
+  const hint = hints && hints[key];
+  if (!hint) return "";
+  const dismiss = `<button type="button" class="ap-hint-x" data-act="ap-hint-dismiss" data-i="${i}" title="Скрыть подсказку" aria-label="Скрыть подсказку">${icon("close", 12)}</button>`;
+  const c = hint.topCandidate;
+  if (c) {
+    const name = c.name || apLabel(c.path || c.name || "");
+    const size = c.bytes ? ` (${fmtBytes(c.bytes)})` : "";
+    const reason = c.reasons && c.reasons.length ? ` · ${esc(c.reasons[0])}` : "";
+    return `<div class="ap-hint-bar">${icon("info", 14)}<span class="txt">Нет трафика, но <b>${esc(name)}</b> идёт напрямую${size}${reason}</span>
+      <button class="btn sm pri" type="button" data-act="ap-hint-attach" data-i="${i}" data-pat="${esc(c.mask || c.path || c.name || "")}">Подключить</button>
+      <button class="btn sm" type="button" data-act="ap-companions" data-i="${i}">Другие…</button>${dismiss}</div>`;
+  }
+  if (!hint.quiet) return "";
+  return `<div class="ap-hint-bar">${icon("info", 14)}<span class="txt">Программа запущена, но трафик через прокси не идёт</span>
+    <button class="btn sm" type="button" data-act="ap-companions" data-i="${i}">Найти трафик…</button>${dismiss}</div>`;
 }
 
 function apRuleMenu(i, inGroup) {
@@ -328,6 +507,7 @@ function apRuleMenu(i, inGroup) {
   return `<div class="ap-pop menu"><div class="cap">Параметры правила</div>
     ${g ? `<button type="button" data-act="ap-ungroup-one" data-i="${i}">${icon("folder", 14)}<span class="txt"><span class="nm">Исключить из группы «${esc(g.name)}»</span></span></button><div class="sep"></div>` : ""}
     <button type="button" data-act="ap-children" data-i="${i}"><span class="txt"><span class="nm">Проксировать дочерние процессы</span><span class="sub">Помощники, обновления, игры из лаунчера</span></span>${box(r.children !== false)}</button>
+    <button type="button" data-act="ap-companions" data-i="${i}">${icon("branch", 14)}<span class="txt"><span class="nm">Связанные процессы / Найти трафик…</span><span class="sub">Привязать помощника, который ходит в сеть напрямую</span></span></button>
     <button type="button" data-act="ap-ks" data-i="${i}"><span class="txt"><span class="nm">Kill switch</span><span class="sub">${ksDefault ? "Как в настройках" : "Своя настройка"} · без прокси — без сети</span></span>${box(apRuleKS(r))}</button>
     <div class="ap-proto"><span>Протокол маршрутизации</span><div class="seg"><button type="button" class="${r.tcpOnly ? "" : "on"}" data-act="ap-proto" data-i="${i}" data-value="all">TCP + UDP</button><button type="button" class="${r.tcpOnly ? "on" : ""}" data-act="ap-proto" data-i="${i}" data-value="tcp">Только TCP</button></div></div>
     <div class="sep"></div>
@@ -493,6 +673,26 @@ function appsClick(id, act) {
       r.enabled = !apOn(r.enabled);
       return apSave(`${apLabel(r.process)}: ${r.enabled ? "включено" : "выключено"}`);
     }
+    case "ap-sub-toggle": {
+      const r = rules[i];
+      if (!r) return;
+      const key = apKey(r.process);
+      if (apExpanded.has(key)) apExpanded.delete(key); else apExpanded.add(key);
+      return fillApps();
+    }
+    case "ap-sub-mask":
+      return apGeneralizeCompanion(i, act.dataset.pat || "", act.dataset.mask || "");
+    case "ap-sub-remove":
+      return apRemoveCompanion(i, act.dataset.pat || "");
+    case "ap-companions":
+      return apOpenCompanions(i);
+    case "ap-hint-attach":
+      return apAttachCompanion(i, act.dataset.pat || "");
+    case "ap-hint-dismiss": {
+      const r = rules[i];
+      if (r) apDismissedHints.add(apKey(r.process));
+      return fillApps();
+    }
     case "ap-gtoggle": {
       const g = apGroup(gname);
       if (!g) return;
@@ -650,7 +850,7 @@ function apLoadApps(m) {
 
 function apOpenAdd() {
   const route = apDefaultRoute();
-  modal = { kind: "ap-add", q: "", path: "", exact: "", family: "", auto: false, action: route.action, proxy: route.proxy, children: true, ks: apGlobalKS(), tcpOnly: false, apps: [], installed: null };
+  modal = { kind: "ap-add", q: "", path: "", exact: "", auto: false, action: route.action, proxy: route.proxy, children: true, ks: apGlobalKS(), tcpOnly: false, apps: [], installed: null };
   apLoadApps(modal);
   renderModal();
 }
@@ -690,7 +890,7 @@ function apCandidates(m, q, limit) {
     const score = pickMatch(q, name, path);
     if (q && !score) return;
     seen.add(k);
-    out.push({ name, path, src, score: score + (src === "run" && extra && extra.window ? 0.5 : 0), extra, mask: (extra && extra.mask) || "", family: (extra && extra.family) || "" });
+    out.push({ name, path, src, score: score + (src === "run" && extra && extra.window ? 0.5 : 0), extra, mask: (extra && extra.mask) || "" });
   };
   (m.apps || []).forEach((a) => push(a.name.replace(/\.exe$/i, ""), a.path, "run", a));
   (m.installed || []).forEach((a) => push(a.name, a.path, "inst"));
@@ -710,12 +910,10 @@ function apAutoPath(m) {
   if (best && best.score >= 3) {
     m.exact = best.mask ? best.path : "";
     m.path = apGeneralized(best.path, best.mask);
-    m.family = best.family;
     m.auto = true;
   } else if (m.auto) {
     m.path = "";
     m.exact = "";
-    m.family = "";
   }
 }
 
@@ -726,7 +924,7 @@ function apAddHTML() {
   const pick = (c) => {
     const proc = apGeneralized(c.path, c.mask);
     const exact = c.mask ? c.path : "";
-    return `<button type="button" class="ap-pick${cur === String(proc).toLowerCase() ? " on" : ""}" data-act="ap-pick" data-name="${esc(c.name)}" data-path="${esc(proc)}" data-exact="${esc(exact)}" data-family="${esc(c.family || "")}">${appIconHTML(c.path, "width:22px;height:22px;border-radius:5px;font-size:11px")}<span class="txt"><span class="nm">${esc(c.name)}</span><span class="sub">${esc(c.extra && c.extra.title ? c.extra.title : c.path)}</span></span><span class="src">${c.src === "run" ? "запущено" : "установлено"}</span></button>`;
+    return `<button type="button" class="ap-pick${cur === String(proc).toLowerCase() ? " on" : ""}" data-act="ap-pick" data-name="${esc(c.name)}" data-path="${esc(proc)}" data-exact="${esc(exact)}">${appIconHTML(c.path, "width:22px;height:22px;border-radius:5px;font-size:11px")}<span class="txt"><span class="nm">${esc(c.name)}</span><span class="sub">${esc(c.extra && c.extra.title ? c.extra.title : c.path)}</span></span><span class="src">${c.src === "run" ? "запущено" : "установлено"}</span></button>`;
   };
   const chips = list.map(pick).join("");
   const empty = m.q.trim()
@@ -741,7 +939,6 @@ function apAddHTML() {
       <div class="ap-pathline"><span class="lbl">Путь (.exe)</span>${m.auto && m.path ? `<span class="auto">найден автоматически</span>` : ""}${m.exact ? `<button type="button" class="auto link" data-act="ap-exact">обобщено для обновлений — использовать точный путь</button>` : ""}</div>
       <div class="proc-line"><div class="field"><input class="mono" id="ap-add-path" value="${esc(m.path)}" placeholder="Подставится при вводе названия" autocomplete="off"></div><button class="btn" type="button" data-act="ap-browse">${icon("folder")}Обзор…</button></div>
       <div class="help">Пусто — правило по имени файла. Знак * — любые символы в пути: *\\Discord\\app-*\\Discord.exe</div>
-      ${apFamilyHint(m)}
       <div class="ap-or"><span>${m.q.trim() ? "совпадения" : "или выберите открытое окно"}</span></div>
       <div class="ap-picks">${chips || `<div class="ap-none">${esc(empty)}</div>`}</div>
       <label class="lbl" style="margin-top:14px">Маршрутизировать через</label>
@@ -755,22 +952,6 @@ function apAddHTML() {
   </form></div>`;
 }
 
-// apFamilyHint explains what else a rule for a known emulator or launcher
-// covers, since its network process is started by a service rather than by
-// the launcher itself.
-const AP_FAMILY_HINT = {
-  ldplayer: "Ld9BoxHeadless.exe и другие процессы LDPlayer",
-  bluestacks: "HD-Player.exe и другие процессы BlueStacks",
-  nox: "NoxVMHandle.exe и другие процессы Nox",
-  memu: "MEmuHeadless.exe и другие процессы MEmu",
-};
-function apFamilyHint(m) {
-  const fam = m.family || "";
-  const what = AP_FAMILY_HINT[fam];
-  if (!what) return "";
-  return `<div class="help ap-fam">Правило учтёт также ${esc(what)}: сетевой процесс эмулятора запускает служба, а не сам лаунчер.</div>`;
-}
-
 function apWindowsHTML() {
   const m = modal;
   const have = new Set((cfg().rules || []).map((r) => apKey(r.process)));
@@ -779,7 +960,7 @@ function apWindowsHTML() {
     const proc = apGeneralized(a.path, a.mask);
     const added = have.has(apKey(a.path)) || have.has(apKey(a.name)) || have.has(apKey(proc));
     return `<div class="ap-win">${appIconHTML(a.path, "width:28px;height:28px;border-radius:7px;font-size:12px")}<span class="txt"><span class="nm">${esc(a.title || a.name)}</span><span class="sub">${esc(a.name)} · PID ${a.pid} · ${esc(a.path)}</span></span>
-      ${added ? `<span class="done">${icon("check", 14)}Уже в правилах</span>` : `<button class="btn sm pri" type="button" data-act="ap-win-add" data-name="${esc(a.name)}" data-path="${esc(proc)}" data-family="${esc(a.family || "")}">Добавить</button>`}</div>`;
+      ${added ? `<span class="done">${icon("check", 14)}Уже в правилах</span>` : `<button class="btn sm pri" type="button" data-act="ap-win-add" data-name="${esc(a.name)}" data-path="${esc(proc)}">Добавить</button>`}</div>`;
   }).join("");
   const none = m.error ? "Не удалось получить список окон: " + m.error : "Открытых окон не найдено.";
   const body = m.apps === null ? `<div class="ap-none">Загружаю окна…</div>` : rows || `<div class="ap-none">${esc(none)}</div>`;
@@ -793,11 +974,13 @@ function apWindowsHTML() {
 function apEditHTML() {
   const m = modal;
   const r = cfg().rules[m.index] || {};
+  const n = (r.companions || []).length || apRuleMembers(r).length;
   return `<div class="scrim"><form class="dialog narrow ap-dlg" id="dlg">
     <div class="ap-dlg-h"><span class="ic">${icon("edit", 16)}</span><div><h2>Путь процесса</h2><div class="dsub">${esc(apLabel(r.process))}</div></div></div>
     <div class="body"><label class="lbl" for="ap-edit-v">Имя файла, путь или маска</label>
     <div class="field"><input class="mono" id="ap-edit-v" value="${esc(m.value)}" autocomplete="off" autofocus></div>
-    <div class="help">Знак * — любое количество символов в пути, например *\\Discord\\app-*\\Discord.exe. Имя без расширения (chrome) значит chrome.exe.</div></div>
+    <div class="help">Знак * — любое количество символов в пути, например *\\Discord\\app-*\\Discord.exe. Имя без расширения (chrome) значит chrome.exe.</div>
+    <button type="button" class="ap-edit-comp link" data-act="ap-companions" data-i="${m.index}">Связанные процессы (${n})…</button></div>
     <div class="footer"><button class="btn pri" type="submit">Сохранить</button><button class="btn" type="button" data-act="cancel">Отмена</button></div>
   </form></div>`;
 }
@@ -827,7 +1010,214 @@ function apGroupNameHTML() {
   </form></div>`;
 }
 
-const AP_MODALS = { "ap-add": apAddHTML, "ap-windows": apWindowsHTML, "ap-edit": apEditHTML, "ap-group": apGroupNewHTML, "ap-gname": apGroupNameHTML };
+// ---------- companions dialog and traffic radar ----------
+
+function apStopCompTimer() {
+  if (apCompTimer) { clearInterval(apCompTimer); apCompTimer = null; }
+}
+// apOpenCompanions shows the saved companions, live DIRECT candidates and a
+// manual field. It refreshes the radar every 1.5 s until the dialog closes.
+function apOpenCompanions(i) {
+  const r = (cfg().rules || [])[i];
+  if (!r) return;
+  apStopCompTimer();
+  const m = {
+    kind: "ap-companions",
+    i,
+    loading: !DEMO,
+    fetching: false,
+    error: "",
+    candidates: [],
+    showAll: false,
+    capture: false,
+    baseline: null,
+    manualQ: "",
+  };
+  modal = m;
+  apOpen = "";
+  renderModal();
+  if (DEMO) { m.loading = false; return; }
+  apLoadCompanions(m);
+  apCompTimer = setInterval(() => {
+    if (modal !== m) { apStopCompTimer(); return; }
+    // In the tray nobody sees the radar; resume when the window returns.
+    if (document.hidden || (state && state.hidden)) return;
+    apLoadCompanions(m);
+  }, 1500);
+}
+function apLoadCompanions(m) {
+  if (!m || m.kind !== "ap-companions" || m.fetching || DEMO) return;
+  const r = (cfg().rules || [])[m.i];
+  if (!r) return;
+  m.fetching = true;
+  getJSON("/api/companions/candidates?rule=" + encodeURIComponent(apKey(r.process)))
+    .then((res) => {
+      if (modal !== m) return;
+      m.candidates = res && Array.isArray(res.candidates) ? res.candidates : [];
+      m.loading = false;
+      m.error = "";
+      renderModal();
+    })
+    .catch((err) => {
+      if (modal !== m) return;
+      m.loading = false;
+      m.error = err.message || "Не удалось получить список";
+      renderModal();
+    })
+    .finally(() => { m.fetching = false; });
+}
+function apBaselineOf(cands) {
+  const out = {};
+  for (const c of cands || []) out[apProcKey(c.path, c.name)] = { bytes: c.bytes || 0, conns: c.conns || 0 };
+  return out;
+}
+// apRadarCandidates adds deltas to the server order and puts processes that
+// sent new direct traffic during the measurement first.
+function apRadarCandidates(m) {
+  const base = m.baseline || {};
+  const list = (m.candidates || []).map((c) => {
+    const b = base[apProcKey(c.path, c.name)] || { bytes: 0, conns: 0 };
+    const dBytes = m.capture ? Math.max(0, (c.bytes || 0) - b.bytes) : 0;
+    const dConns = m.capture ? Math.max(0, (c.conns || 0) - b.conns) : 0;
+    return Object.assign({}, c, { dBytes, dConns });
+  }).filter((c) => {
+    if (m.showAll) return true;
+    if (c.system) return false;
+    const active = c.dBytes > 0 || c.dConns > 0;
+    return !(c.score === 0 && !c.conns && !c.bytes && !active);
+  });
+  if (!m.capture) return list;
+  const hot = (c) => (c.dBytes > 0 || c.dConns > 0 ? 1 : 0);
+  return list.sort((a, b) => hot(b) - hot(a) || b.dBytes - a.dBytes || b.dConns - a.dConns ||
+    (b.score || 0) - (a.score || 0) || (b.bytes || 0) - (a.bytes || 0));
+}
+function apCompanionModalClick(id, act) {
+  const m = modal;
+  if (!m || m.kind !== "ap-companions") return;
+  switch (id) {
+    case "ap-radar-capture":
+      m.capture = !m.capture;
+      m.baseline = m.capture ? apBaselineOf(m.candidates || []) : null;
+      return renderModal();
+    case "ap-radar-all":
+      m.showAll = !m.showAll;
+      return renderModal();
+    case "ap-radar-attach": {
+      const p = apAttachCompanion(m.i, act.dataset.pat || "");
+      if (p && p.then) p.then(() => { if (modal === m) apLoadCompanions(m); });
+      return;
+    }
+    case "ap-comp-del": {
+      const p = apRemoveCompanion(m.i, act.dataset.pat || "");
+      if (p && p.then) p.then(() => { if (modal === m) apLoadCompanions(m); });
+      return;
+    }
+    case "ap-comp-mask": {
+      const p = apGeneralizeCompanion(m.i, act.dataset.pat || "", act.dataset.mask || "");
+      if (p && p.then) p.then(() => { if (modal === m) apLoadCompanions(m); });
+      return;
+    }
+    case "ap-comp-browse": {
+      if (DEMO) return;
+      return post("/api/browse").then((res) => {
+        if (!res || !res.path || modal !== m) return;
+        m.manualQ = res.mask || res.path;
+        renderModal();
+      }).catch((err) => showToast(err.message));
+    }
+    case "ap-comp-manual":
+      return apManualCompanion();
+    default:
+  }
+}
+// apManualCompanion validates and attaches the path or mask typed in the
+// companions dialog.
+function apManualCompanion() {
+  const m = modal;
+  if (!m || m.kind !== "ap-companions") return;
+  const raw = String(m.manualQ || "").trim();
+  const err = apCompanionError(raw);
+  if (err) { showToast(err); return; }
+  const p = apAttachCompanion(m.i, raw);
+  if (!p) return;
+  m.manualQ = "";
+  renderModal();
+  if (p.then) p.then(() => { if (modal === m) apLoadCompanions(m); });
+}
+function apCompanionsHTML() {
+  const m = modal;
+  const r = (cfg().rules || [])[m.i] || {};
+  const name = apLabel(r.process || "");
+  return `<div class="scrim"><form class="dialog ap-comp-dlg" id="dlg" autocomplete="off">
+    <div class="ap-dlg-h"><div><h2>Связанные процессы</h2><div class="dsub">Правило «${esc(name)}» · их трафик идёт вместе с программой</div></div><button class="iconbtn ap-comp-close" type="button" data-act="cancel" aria-label="Закрыть" title="Закрыть">${icon("close", 16)}</button></div>
+    <div class="body">
+      ${apAttachedHTML(m, r)}
+      ${apRadarHTML(m)}
+      ${apManualHTML(m)}
+    </div>
+    <div class="footer"><button class="btn" type="button" data-act="cancel">Закрыть</button></div>
+  </form></div>`;
+}
+function apAttachedHTML(m, r) {
+  const members = (state && state.ruleMembers && state.ruleMembers[apKey(r.process)]) || [];
+  const list = r.companions || [];
+  const rows = list.map((comp) => {
+    const mem = members.find((x) => apKey(x.pattern || "") === apKey(comp)) || {};
+    const path = mem.path || (apIsPath(comp) ? comp : "");
+    const mask = mem.mask || apVersionMask(comp);
+    const maskBtn = mask
+      ? `<button type="button" class="ap-comp-mask" data-act="ap-comp-mask" data-pat="${esc(comp)}" data-mask="${esc(mask)}" title="Обобщить путь для обновлений: ${esc(mask)}">${icon("edit", 12)}app-*</button>`
+      : "";
+    return `<div class="ap-comp-item">${appIconHTML(path || comp, "width:24px;height:24px;border-radius:6px;font-size:10px")}
+      <div class="txt"><span class="nm">${esc(baseName(comp) || comp)}</span><span class="sub" title="${esc(comp)}">${esc(path || "по имени файла")}</span></div>
+      ${maskBtn}<button type="button" class="ap-sub-remove" data-act="ap-comp-del" data-pat="${esc(comp)}" title="Отвязать процесс" aria-label="Отвязать процесс">${icon("close", 12)}</button></div>`;
+  }).join("");
+  return `<div class="ap-comp-sec"><div class="ap-sec-h"><span class="t">Привязанные процессы</span><span class="c">${list.length}</span></div>
+    ${rows || `<div class="ap-none">Пока нет привязанных процессов</div>`}</div>`;
+}
+function apRadarHTML(m) {
+  const cands = apRadarCandidates(m);
+  let rows;
+  if (m.loading && !(m.candidates || []).length) rows = `<div class="ap-none">Ищу программы, которые ходят напрямую…</div>`;
+  else if (m.error) rows = `<div class="ap-none">${esc(m.error)}</div>`;
+  else if (!cands.length) {
+    rows = `<div class="ap-none">Ничего не найдено. Включите «Показать системные и без трафика» или нажмите «Засечь новый трафик» и откройте программу.</div>`;
+  } else {
+    rows = cands.map((c) => apRadarItemHTML(m, c)).join("");
+  }
+  return `<div class="ap-comp-sec"><div class="ap-sec-h"><span class="t">Радар: идут напрямую сейчас</span><span class="c">${cands.length}</span></div>
+    <div class="ap-radar-head">
+      <button type="button" class="btn sm${m.capture ? " pri ap-capture-on" : ""}" data-act="ap-radar-capture">${icon(m.capture ? "pause" : "activity", 14)}${m.capture ? "Остановить замер" : "Засечь новый трафик"}</button>
+      <button type="button" class="ap-radar-check${m.showAll ? " on" : ""}" data-act="ap-radar-all" role="checkbox" aria-checked="${m.showAll ? "true" : "false"}">${icon(m.showAll ? "checkbox" : "square", 16)}<span>Показать системные и без трафика</span></button>
+    </div>
+    <div class="ap-radar-list">${rows}</div>
+  </div>`;
+}
+function apRadarItemHTML(m, c) {
+  const name = c.name || apLabel(c.path || "");
+  const full = c.path || c.name || "";
+  const reasons = (c.reasons || []).slice(0, 3).map((r) => `<span class="ap-reason">${esc(r)}</span>`).join("");
+  const delta = m.capture && (c.dBytes > 0 || c.dConns > 0)
+    ? `<span class="ap-delta">${c.dBytes > 0 ? "+" + fmtBytes(c.dBytes) : ""}${c.dBytes > 0 && c.dConns > 0 ? " · " : ""}${c.dConns > 0 ? "+" + c.dConns + " соед." : ""}</span>`
+    : "";
+  return `<div class="ap-radar-item${c.system ? " sys" : ""}${m.capture && (c.dBytes > 0 || c.dConns > 0) ? " hot" : ""}">
+    ${appIconHTML(full || name, "width:28px;height:28px;border-radius:7px;font-size:11px")}
+    <div class="txt"><span class="nm">${esc(name)}</span>${full ? `<span class="sub" title="${esc(full)}">${esc(full)}</span>` : ""}
+      ${reasons ? `<span class="ap-reasons ap-comp-chips">${reasons}</span>` : ""}
+      ${c.otherRule ? `<span class="ap-other">уже в правиле «${esc(apLabel(c.otherRule))}»</span>` : ""}</div>
+    <div class="ap-radar-tr">${c.conns || 0} соед. · ${fmtBytes(c.bytes || 0)}${delta}</div>
+    <button type="button" class="btn sm pri" data-act="ap-radar-attach" data-pat="${esc(c.mask || c.path || c.name || "")}">+ Подключить</button>
+  </div>`;
+}
+function apManualHTML(m) {
+  return `<div class="ap-comp-sec"><div class="ap-sec-h"><span class="t">Добавить вручную</span></div>
+    <div class="proc-line"><div class="field"><input class="mono" id="ap-comp-manual" value="${esc(m.manualQ || "")}" placeholder="Имя, путь или маска: *\\App\\app-*\\App.exe" autocomplete="off"></div>
+    <button class="btn" type="button" data-act="ap-comp-browse">${icon("folder")}Обзор…</button>
+    <button class="btn pri" type="button" data-act="ap-comp-manual">Добавить</button></div>
+  </div>`;
+}
+
+const AP_MODALS = { "ap-add": apAddHTML, "ap-windows": apWindowsHTML, "ap-edit": apEditHTML, "ap-group": apGroupNewHTML, "ap-gname": apGroupNameHTML, "ap-companions": apCompanionsHTML };
 
 // apInput copies a typed or chosen value into the open dialog's model at
 // once, so a redraw (lists arriving, a chip picked) never brings back older
@@ -847,6 +1237,7 @@ function apInput(el) {
     case "ap-gnew-name": m.name = el.value; return false;
     case "ap-edit-v": m.value = el.value; return false;
     case "ap-gname-v": m.name = el.value; return false;
+    case "ap-comp-manual": m.manualQ = el.value; return false;
     default: return false;
   }
 }
@@ -871,17 +1262,23 @@ function apReadModal() {
   } else if (modal.kind === "ap-gname") {
     const n = v("ap-gname-v");
     if (n !== null) modal.name = n;
+  } else if (modal.kind === "ap-companions") {
+    const n = v("ap-comp-manual");
+    if (n !== null) modal.manualQ = n;
   }
 }
 
 function appsModalClick(id, act) {
   if (!modal) return;
+  if (id === "ap-radar-capture" || id === "ap-radar-all" || id === "ap-radar-attach" ||
+      id === "ap-comp-manual" || id === "ap-comp-browse" || id === "ap-comp-del" || id === "ap-comp-mask") {
+    return apCompanionModalClick(id, act);
+  }
   switch (id) {
     case "ap-pick":
       modal.q = act.dataset.name;
       modal.path = act.dataset.path;
       modal.exact = act.dataset.exact || "";
-      modal.family = act.dataset.family || "";
       modal.auto = false;
       return renderModal();
     case "ap-exact":
@@ -901,7 +1298,6 @@ function appsModalClick(id, act) {
         m.exact = res.mask ? res.path : "";
         m.path = apGeneralized(res.path, res.mask);
         m.auto = false;
-        m.family = "";
         if (!m.q.trim()) m.q = apLabel(res.path);
         renderModal();
       }).catch((err) => showToast(err.message));
@@ -938,6 +1334,7 @@ function apAddRule(rule) {
 function appsSubmit() {
   apReadModal();
   const m = modal;
+  if (m.kind === "ap-companions") { apManualCompanion(); return; }
   if (m.kind === "ap-add") {
     let process = String(m.path || "").trim().replace(/^"+|"+$/g, "");
     if (!process) {

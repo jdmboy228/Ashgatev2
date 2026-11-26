@@ -231,6 +231,10 @@ type Rule struct {
 	// Group names the group this rule belongs to. The group's switch and
 	// route (action and proxy) apply to all its rules.
 	Group string `json:"group,omitempty"`
+	// Companions are extra executables, paths, or glob masks attached to the
+	// same application rule (for example, a service-started VM process outside
+	// the app's process tree and install folder).
+	Companions []string `json:"companions,omitempty"`
 }
 
 // Group is a named set of rules with one switch and one route.
@@ -265,6 +269,7 @@ func (c *Config) EffectiveRules() []Rule {
 			ks = *r.KillSwitch
 		}
 		r.KillSwitch = &ks
+		r.Companions = cloneStrings(r.Companions)
 		out[i] = r
 	}
 	return out
@@ -466,16 +471,23 @@ func (c *Config) Validate() error {
 		if strings.TrimSpace(r.Process) == "" {
 			return fmt.Errorf("rules[%d]: process is required", i)
 		}
-		base := strings.ToLower(r.Process)
-		base = strings.ReplaceAll(base, "/", `\`)
-		if idx := strings.LastIndex(base, `\`); idx >= 0 {
-			base = base[idx+1:]
-		}
 		if matchesEverything(r.Process) {
 			return fmt.Errorf("rules[%d]: mask %q matches every program", i, r.Process)
 		}
-		if base == "svchost.exe" {
+		if maskBase(r.Process) == "svchost.exe" {
 			return fmt.Errorf("rules[%d]: do not match svchost.exe; system DNS follows dns.systemResolver", i)
+		}
+		for j, comp := range r.Companions {
+			c := strings.Trim(strings.TrimSpace(comp), `"`)
+			if c == "" {
+				return fmt.Errorf("rules[%d]: companions[%d] is empty", i, j)
+			}
+			if matchesEverything(c) {
+				return fmt.Errorf("rules[%d]: companions[%d]: mask %q matches every program", i, j, comp)
+			}
+			if maskBase(c) == "svchost.exe" {
+				return fmt.Errorf("rules[%d]: companions[%d]: do not match svchost.exe; system DNS follows dns.systemResolver", i, j)
+			}
 		}
 		if r.Group != "" {
 			continue // the group's route applies and is checked above
@@ -730,6 +742,7 @@ func deepCopy(cfg *Config) Config {
 				v := *r.KillSwitch
 				r.KillSwitch = &v
 			}
+			r.Companions = cloneStrings(r.Companions)
 			cp.Rules[i] = r
 		}
 	}
@@ -942,4 +955,15 @@ func matchesEverything(process string) bool {
 	}
 	p = strings.NewReplacer("*", "", "?", "", ".exe", "", `\`, "", "/", "", ".", "").Replace(p)
 	return p == ""
+}
+
+// maskBase is the lower-case file name at the end of a process mask, so a
+// full path and a bare name are checked the same way.
+func maskBase(process string) string {
+	base := strings.ToLower(process)
+	base = strings.ReplaceAll(base, "/", `\`)
+	if idx := strings.LastIndex(base, `\`); idx >= 0 {
+		base = base[idx+1:]
+	}
+	return base
 }

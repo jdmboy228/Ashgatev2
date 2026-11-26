@@ -10,14 +10,13 @@ import (
 )
 
 // Installed is an application found on disk, for the rule dialog's search.
-// Mask is the path generalized for versioned (Squirrel) folders, and Family
-// names the emulator or launcher it belongs to; both are empty when they do
-// not apply, so the dialog can offer them without asking the engine again.
+// Mask is the path generalized for versioned (Squirrel) folders; it is empty
+// when it does not apply, so the dialog can offer it without asking the
+// engine again.
 type Installed struct {
-	Name   string `json:"name"`
-	Path   string `json:"path"`
-	Mask   string `json:"mask,omitempty"`
-	Family string `json:"family,omitempty"`
+	Name string `json:"name"`
+	Path string `json:"path"`
+	Mask string `json:"mask,omitempty"`
 }
 
 const installedTTL = 2 * time.Minute
@@ -60,7 +59,6 @@ func mergeInstalled(in []Installed) []Installed {
 			it.Name = strings.TrimSuffix(baseOf(it.Path), ".exe")
 		}
 		it.Mask, _ = rules.VersionMask(it.Path)
-		it.Family = rules.Family(it.Path)
 		out = append(out, it)
 	}
 	sort.SliceStable(out, func(i, j int) bool { return strings.ToLower(out[i].Name) < strings.ToLower(out[j].Name) })

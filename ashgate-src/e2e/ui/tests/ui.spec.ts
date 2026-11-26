@@ -8,6 +8,9 @@ import { App, OUT, cleanupPolicy, desktop, fixtures, readConfig, type Problem } 
 
 const fx = fixtures();
 const CLIENT = "C:\\ashgate-e2e\\apps\\ashgate-e2e-client.exe";
+// A path companion that never runs here: it only has to be a valid path the
+// page and the server accept, so the drawer and the dialog can be driven.
+const COMPANION = "C:\\Program Files\\ldplayer9box\\Ld9BoxHeadless.exe";
 const SIZES: [number, number][] = [[1100, 720], [760, 520]];
 const findings: Problem[] = [];
 let app: App;
@@ -104,6 +107,48 @@ async function toast(re: RegExp) {
   await expect(page.locator("#toast")).toHaveText(re);
 }
 
+// The wrapper holds the rule card and its companion drawer as siblings, so
+// the drawer is found from the wrapper, not from the card.
+function clientUnit() {
+  return page.locator(".ap-unit-wrap", {
+    has: page.locator(".ap-card:not(.group)", { hasText: "ashgate-e2e-client" }),
+  }).first();
+}
+function clientRule(): any {
+  return readConfig().rules.find((r: any) => /ashgate-e2e-client/i.test(String(r.process)));
+}
+async function openCompanions() {
+  const card = clientUnit().locator(".ap-card:not(.group)").first();
+  await expect(card, "the ashgate-e2e-client rule card is missing").toBeVisible();
+  if (!(await card.locator(".ap-pop.menu").count())) {
+    await card.locator('[data-act="ap-menu"]').click();
+  }
+  const item = card.locator('.ap-pop.menu [data-act="ap-companions"]');
+  await expect(item, "the rule menu has no «Связанные процессы / Найти трафик…» item").toBeVisible();
+  await item.click();
+  await expect(dlg()).toBeVisible();
+  await expect(dlg().locator(".ap-dlg-h h2")).toHaveText("Связанные процессы");
+}
+// addCompanion types a path into the open dialog and waits for the save.
+async function addCompanion(path: string) {
+  const field = dlg().locator("#ap-comp-manual");
+  await expect(field, "the companions dialog has no manual field").toBeVisible();
+  await field.fill(path);
+  await dlg().locator('button[data-act="ap-comp-manual"]').click();
+  await expect.poll(() => (clientRule()?.companions || []), {
+    timeout: 15_000,
+    message: "the companion was not saved to config.json",
+  }).toContain(path);
+  await expect(dlg().locator(".ap-comp-item", { hasText: "Ld9BoxHeadless" })).toBeVisible();
+}
+// companionGone waits until the save removing the companion has landed.
+async function companionGone(path: string) {
+  await expect.poll(() => (clientRule()?.companions || []), {
+    timeout: 15_000,
+    message: "the companion was not removed from config.json",
+  }).not.toContain(path);
+}
+
 // liveness clicks every visible button in scope and checks that each one
 // does something: a DOM change, a request, a dialog, a menu or a toast.
 async function liveness(scope: string, label: string) {
@@ -111,6 +156,10 @@ async function liveness(scope: string, label: string) {
     "#side-power", "#win-min", "#win-max", "#win-close", "[data-nav]",
     '[data-act="open-folder"]', '[data-act="update-open"]', '[data-act="ap-browse"]',
     '[data-act="paste-vless"]', '[data-act="proxy-del"]', '[data-act="ap-del"]',
+    // Companion controls change config or only exist inside the dialog:
+    // expanding a drawer must not let a shifted index hit «Отвязать».
+    '[data-act="ap-sub-remove"]', '[data-act="ap-sub-mask"]',
+    '[data-act="ap-comp-del"]', '[data-act="ap-radar-capture"]',
   ].join(",");
   const buttons = page.locator(`${scope} button:visible`);
   const n = await buttons.count();
@@ -415,6 +464,76 @@ test.describe.serial("Ashgate window", () => {
     await screens("page-rules-filled");
   });
 
+  // A companion is a process whose traffic follows the rule although it is
+  // not the rule's own exe. The drawer and the dialog are the only ways to
+  // see and change it, and the config must keep it across a restart.
+  test("companions: attach, drawer, radar, remove", async () => {
+    await nav("rules");
+    const consoleBefore = app.problems.length;
+
+    // Open from the rule menu.
+    await openCompanions();
+    await screens("dialog-ap-companions");
+
+    // «Засечь новый трафик» starts and stops the measurement in place.
+    const radar = dlg().locator('button[data-act="ap-radar-capture"]');
+    await expect(radar).toContainText("Засечь новый трафик");
+    await radar.click();
+    await expect(radar).toContainText("Остановить замер");
+    await expect(radar).toHaveClass(/ap-capture-on/);
+    await radar.click();
+    await expect(radar).toContainText("Засечь новый трафик");
+
+    // Attach a path by hand; it appears in the attached list at once.
+    await addCompanion(COMPANION);
+    await closeDialog();
+
+    // The rule shows a collapsed pill; expanding lists the companion.
+    const unit = clientUnit();
+    const pill = unit.locator('[data-act="ap-sub-toggle"]');
+    await expect(pill, "the rule has no companion pill").toContainText("+1 процесс");
+    await expect(unit.locator(".ap-sublist"), "the drawer starts open").toHaveCount(0);
+    await pill.click();
+    const sub = unit.locator(".ap-sublist");
+    await expect(sub).toBeVisible();
+    const row = sub.locator(".ap-sub-row", { hasText: "Ld9BoxHeadless" });
+    await expect(row.locator(".ap-origin"), "the drawer row is not marked «привязан»").toHaveText("привязан");
+    await screens("rules-companion-open");
+
+    // Collapse it again.
+    await pill.click();
+    await expect(unit.locator(".ap-sublist")).toHaveCount(0);
+    await expect(pill).not.toHaveClass(/\bopen\b/);
+
+    // Remove it from the drawer with «×».
+    await pill.click();
+    await expect(unit.locator(".ap-sublist")).toBeVisible();
+    await unit.locator(".ap-sub-row", { hasText: "Ld9BoxHeadless" })
+      .locator('button[data-act="ap-sub-remove"]').click();
+    await companionGone(COMPANION);
+    await expect(unit.locator('[data-act="ap-sub-toggle"]'), "the pill stayed after the companion was removed").toHaveCount(0);
+    await expect(unit.locator(".ap-sublist")).toHaveCount(0);
+
+    // Attach and remove it from the dialog too.
+    await openCompanions();
+    await addCompanion(COMPANION);
+    await dlg().locator('.ap-comp-item [data-act="ap-comp-del"]').first().click();
+    await companionGone(COMPANION);
+    await expect(dlg().locator(".ap-none", { hasText: "Пока нет привязанных процессов" })).toBeVisible();
+    await closeDialog();
+
+    // Leave one attached for the restart check, collapsed.
+    await openCompanions();
+    await addCompanion(COMPANION);
+    await closeDialog();
+    const pill2 = clientUnit().locator('[data-act="ap-sub-toggle"]');
+    await expect(pill2).toContainText("+1 процесс");
+    if (await clientUnit().locator(".ap-sublist").count()) await pill2.click();
+    await expect(clientUnit().locator(".ap-sublist")).toHaveCount(0);
+
+    expect(app.problems.slice(consoleBefore), "console errors while driving the companions dialog").toEqual([]);
+  });
+
   test("settings change and save", async () => {
     await nav("settings");
     const toggle = (k: string) => page.locator(`button.toggle[data-act="toggle"][data-key="${k}"]`);
@@ -466,6 +585,24 @@ test.describe.serial("Ashgate window", () => {
     await expect(dlg()).toBeVisible();
     await closeDialog();
     await page.locator("#log-filter").fill("");
+  });
+
+  // «Без правила» swaps the live feed for the programs bypassing the rules;
+  // its extra strip and chip buttons must not spill or log errors.
+  test("log: «Без правила» mode", async () => {
+    await nav("log");
+    const consoleBefore = app.problems.length;
+    const btn = page.locator("#log-unmatched-btn");
+    await expect(btn).toBeVisible();
+    await btn.click();
+    await expect(btn).toHaveClass(/\bon\b/);
+    await expect(page.locator('[data-act="clear"]')).toContainText("Очистить ленту");
+    await screens("page-log-unmatched");
+    await btn.click();
+    await expect(btn).not.toHaveClass(/\bon\b/);
+    await expect(page.locator('[data-act="clear"]')).toContainText("Очистить экран");
+    await screens("page-log");
+    expect(app.problems.slice(consoleBefore), "console errors in «Без правила»").toEqual([]);
   });
 
   test("start and stop capture", async () => {
@@ -520,6 +657,12 @@ test.describe.serial("Ashgate window", () => {
     }
     await nav("rules");
     await expect(page.locator(".ap-card", { hasText: "ashgate-e2e-client" })).toBeVisible();
+    // The companion attached in the previous test is still there, in the
+    // config and on the rule.
+    const saved = readConfig().rules.find((r: any) => /ashgate-e2e-client/i.test(String(r.process)));
+    expect(saved?.companions || [], "the companion did not survive the restart").toContain(COMPANION);
+    await expect(clientUnit().locator('[data-act="ap-sub-toggle"]'), "the companion pill did not survive the restart")
+      .toContainText("+1 процесс");
     await nav("settings");
     await expect(page.locator('button.toggle[data-key="verbose"]')).toHaveAttribute("aria-pressed", "true");
     await expect(page.locator('button.toggle[data-key="auto"]')).toHaveAttribute("aria-pressed", "true");

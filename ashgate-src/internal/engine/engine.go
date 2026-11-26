@@ -140,13 +140,18 @@ type Engine struct {
 	noRelay6     atomic.Bool
 	relay6Logged atomic.Bool
 
-	mu        sync.Mutex
-	byClient  map[tcpKey]*tcpFlow
-	byAlloc   map[allocKey]*tcpFlow
-	directTCP ageSet[tcpKey]
-	directUDP ageSet[udpKey]
+	mu       sync.Mutex
+	byClient map[tcpKey]*tcpFlow
+	byAlloc  map[allocKey]*tcpFlow
+	// directTCP and directUDP cache direct decisions with the unmatched
+	// program behind them (nil for an explicit direct rule), so their bytes
+	// keep counting; see direct.go.
+	directTCP ageMap[tcpKey, *directProcEntry]
+	directUDP ageMap[udpKey, *directProcEntry]
 	// directPorts indexes directUDP by source port; see udpport.go.
 	directPorts map[uint16]map[udpKey]struct{}
+	// direct lists the programs whose traffic went direct without a rule.
+	direct directTracker
 	blockTCP    ageSet[tcpKey]
 	blockUDP    ageSet[udpKey]
 	// closedTCP holds the app side of proxied TCP flows that ended. Their
@@ -258,8 +263,8 @@ func New(cfg *config.Config, opt Options) (*Engine, error) {
 		now:        opt.Now,
 		byClient:   map[tcpKey]*tcpFlow{},
 		byAlloc:    map[allocKey]*tcpFlow{},
-		directTCP:  newAgeSet[tcpKey](),
-		directUDP:  newAgeSet[udpKey](),
+		directTCP:  newAgeMap[tcpKey, *directProcEntry](),
+		directUDP:  newAgeMap[udpKey, *directProcEntry](),
 		blockTCP:   newAgeSet[tcpKey](),
 		blockUDP:   newAgeSet[udpKey](),
 		closedTCP:  newAgeSet[tcpKey](),
@@ -270,6 +275,7 @@ func New(cfg *config.Config, opt Options) (*Engine, error) {
 		dnsSem:     make(chan struct{}, httpDNSParallel),
 		stats:      map[string]*ruleStat{},
 	}
+	e.direct.init()
 	if e.alloc == nil {
 		e.alloc = OSAllocator{}
 	}
@@ -327,10 +333,12 @@ func (e *Engine) Apply(cfg *config.Config) error {
 		return err
 	}
 	e.snap.Store(snap)
+	// A process the new rules cover leaves the unmatched list at once.
+	e.direct.pruneMatched(snap.rules)
 	e.verbose.Store(strings.EqualFold(cfg.Log.Level, "debug"))
 	e.mu.Lock()
-	e.directTCP = newAgeSet[tcpKey]()
-	e.directUDP = newAgeSet[udpKey]()
+	e.directTCP = newAgeMap[tcpKey, *directProcEntry]()
+	e.directUDP = newAgeMap[udpKey, *directProcEntry]()
 	e.directPorts = nil
 	e.blockTCP = newAgeSet[tcpKey]()
 	e.blockUDP = newAgeSet[udpKey]()
@@ -674,7 +682,10 @@ func (e *Engine) fastPath(pkt []byte, h *packet.Header) (Result, bool) {
 			return e.rewriteForward(pkt, h, flow, snap), true
 		} else if e.closedTCP.has(key) {
 			return Result{Action: ActionDrop}, true
-		} else if e.directTCP.has(key) {
+		} else if dp, ok := e.directTCP.get(key); ok {
+			if dp != nil {
+				dp.addBytes(int64(len(pkt)), e.now().UnixMilli())
+			}
 			return Result{Action: ActionPass}, true
 		} else if e.blockTCP.has(key) {
 			return Result{Action: ActionDrop}, true
@@ -702,9 +713,16 @@ func (e *Engine) fastPath(pkt []byte, h *packet.Header) (Result, bool) {
 			if flow.stat != nil {
 				flow.stat.up.Add(n)
 			}
+			if flow.owner != nil {
+				flow.owner.up.Add(n)
+				flow.owner.lastSeen.Store(e.now().UnixMilli())
+			}
 			return Result{Action: ActionUDP, UDP: datagram(pkt, h, flow)}, true
 		}
-		if e.directUDP.has(key) {
+		if dp, ok := e.directUDP.get(key); ok {
+			if dp != nil {
+				dp.addBytes(int64(len(pkt)), e.now().UnixMilli())
+			}
 			return Result{Action: ActionPass}, true
 		}
 		if e.blockUDP.has(key) {
@@ -727,7 +745,7 @@ func (e *Engine) decide(pkt []byte, h *packet.Header, meta Meta, proc rules.Proc
 	// program's query.
 	dns := h.Dst.Port == 53
 	if destinationBypass(h.Dst, snap.bypassPrivate && !dns, dns) {
-		e.rememberDirectExceptDNS(h)
+		e.rememberDirectExceptDNS(h, nil)
 		return Result{Action: ActionPass}
 	}
 	if !found {
@@ -735,7 +753,7 @@ func (e *Engine) decide(pkt []byte, h *packet.Header, meta Meta, proc rules.Proc
 			return Result{Action: ActionUnknown}
 		}
 		if e.proxyServer(h.Dst) {
-			e.rememberDirectExceptDNS(h)
+			e.rememberDirectExceptDNS(h, nil)
 			return Result{Action: ActionPass}
 		}
 		if dns {
@@ -766,11 +784,11 @@ func (e *Engine) decide(pkt []byte, h *packet.Header, meta Meta, proc rules.Proc
 			e.unknownDropLocked()
 			return Result{Action: ActionDrop}
 		}
-		e.rememberDirect(h)
+		e.rememberDirect(h, nil)
 		return Result{Action: ActionPass}
 	}
 	if e.selfPID != 0 && proc.PID == e.selfPID {
-		e.rememberDirectExceptDNS(h)
+		e.rememberDirectExceptDNS(h, nil)
 		return Result{Action: ActionPass}
 	}
 
@@ -796,9 +814,10 @@ func (e *Engine) decide(pkt []byte, h *packet.Header, meta Meta, proc rules.Proc
 	}
 	switch action {
 	case "direct":
-		e.rememberDirectExceptDNS(h)
+		e.rememberDirectExceptDNS(h, nil)
 		e.log(logbuf.Event{
 			Process: display(proc),
+			Path:    proc.Path,
 			PID:     proc.PID,
 			Proto:   protoName(h.Proto),
 			Dest:    h.Dst.String(),
@@ -812,6 +831,7 @@ func (e *Engine) decide(pkt []byte, h *packet.Header, meta Meta, proc rules.Proc
 		e.dropFragment(h)
 		e.log(logbuf.Event{
 			Process: display(proc),
+			Path:    proc.Path,
 			PID:     proc.PID,
 			Proto:   protoName(h.Proto),
 			Dest:    h.Dst.String(),
@@ -823,7 +843,7 @@ func (e *Engine) decide(pkt []byte, h *packet.Header, meta Meta, proc rules.Proc
 		p, ok := snap.proxies[proxyName]
 		if !ok {
 			e.rememberBlock(h)
-			e.log(logbuf.Event{Process: display(proc), PID: proc.PID, Proto: protoName(h.Proto), Dest: h.Dst.String(), Via: proxyName, Status: "error", Error: "unknown proxy"})
+			e.log(logbuf.Event{Process: display(proc), Path: proc.Path, PID: proc.PID, Proto: protoName(h.Proto), Dest: h.Dst.String(), Via: proxyName, Status: "error", Error: "unknown proxy"})
 			return Result{Action: ActionDrop}
 		}
 		if h.Proto == packet.ProtoTCP {
@@ -831,31 +851,35 @@ func (e *Engine) decide(pkt []byte, h *packet.Header, meta Meta, proc rules.Proc
 				if dec.KillSwitch {
 					return e.resetExisting(h, meta, proc, p, parent)
 				}
-				e.rememberDirect(h)
+				e.rememberDirect(h, nil)
 				return Result{Action: ActionPass}
 			}
-			return e.startTCP(pkt, h, meta, proc, p, snap, parent, stat, false)
+			return e.startTCP(pkt, h, meta, proc, p, snap, parent, stat, dec.MatchKind, false)
 		}
 		if dec.TCPOnly && h.Dst.Port != 53 {
 			// "Only TCP": drop UDP so QUIC and the like fall back to TCP,
 			// which goes through the proxy. DNS still goes via the proxy.
 			e.rememberBlock(h)
 			e.dropFragment(h)
-			e.log(logbuf.Event{Process: display(proc), PID: proc.PID, Proto: "UDP", Dest: h.Dst.String(), Via: p.Name, Status: "blocked", Error: "только TCP: UDP отброшен", Parent: parent})
+			e.log(logbuf.Event{Process: display(proc), Path: proc.Path, PID: proc.PID, Proto: "UDP", Dest: h.Dst.String(), Via: p.Name, Status: "blocked", Error: "только TCP: UDP отброшен", Parent: parent})
 			return Result{Action: ActionDrop}
 		}
-		return e.startUDP(pkt, h, meta, proc, p, snap, parent, stat, dec.KillSwitch, false)
+		return e.startUDP(pkt, h, meta, proc, p, snap, parent, stat, dec.MatchKind, dec.KillSwitch, false)
 	default:
 		if dns {
 			e.debugDNS(h, proc, "программа без правила: DNS напрямую")
 		}
-		e.rememberDirectExceptDNS(h)
+		// A known program with no matching rule: remember it for the window,
+		// so it can be attached to an application as a companion.
+		dp := e.direct.record(proc, protoName(h.Proto), h.Dst.String(), len(pkt), e.now())
+		e.rememberDirectExceptDNS(h, dp)
 		return Result{Action: ActionPass}
 	}
 }
 
-// startTCP maps a new connection to the relay. sys marks system DNS.
-func (e *Engine) startTCP(pkt []byte, h *packet.Header, meta Meta, proc rules.Process, p config.Proxy, snap *snapshot, parent string, stat *ruleStat, sys bool) Result {
+// startTCP maps a new connection to the relay. sys marks system DNS; kind is
+// the rule match that routed the process (see rules.Decision.MatchKind).
+func (e *Engine) startTCP(pkt []byte, h *packet.Header, meta Meta, proc rules.Process, p config.Proxy, snap *snapshot, parent string, stat *ruleStat, kind string, sys bool) Result {
 	if h.Ver == 6 && e.noRelay6.Load() {
 		if !e.relay6Logged.Swap(true) {
 			e.log(logbuf.Event{Process: display(proc), PID: proc.PID, Proto: "TCP", Dest: h.Dst.String(), Via: p.Name, Status: "blocked",
@@ -873,6 +897,10 @@ func (e *Engine) startTCP(pkt []byte, h *packet.Header, meta Meta, proc rules.Pr
 		e.log(logbuf.Event{Process: display(proc), PID: proc.PID, Proto: "TCP", Dest: h.Dst.String(), Via: p.Name, Status: "error", Error: err.Error()})
 		return Result{Action: ActionDrop}
 	}
+	var sub *subProcStat
+	if !sys {
+		sub = stat.procFor(proc, kind)
+	}
 	flow := &tcpFlow{
 		ver:      h.Ver,
 		app:      h.Src,
@@ -881,6 +909,7 @@ func (e *Engine) startTCP(pkt []byte, h *packet.Header, meta Meta, proc rules.Pr
 		release:  release,
 		proxy:    p,
 		proc:     proc,
+		sub:      sub,
 		ifIdx:    meta.IfIdx,
 		subIfIdx: meta.SubIfIdx,
 		created:  e.now(),
@@ -898,6 +927,9 @@ func (e *Engine) startTCP(pkt []byte, h *packet.Header, meta Meta, proc rules.Pr
 	if stat != nil {
 		stat.flows.Add(1)
 	}
+	if sub != nil {
+		sub.flows.Add(1)
+	}
 	e.byClient[tcpKey{Src: h.Src, Dst: h.Dst}] = flow
 	e.byAlloc[allocKey{ver: h.Ver, port: port}] = flow
 	e.active.Add(1)
@@ -910,7 +942,7 @@ func (e *Engine) startTCP(pkt []byte, h *packet.Header, meta Meta, proc rules.Pr
 // it reconnect through the proxy instead of staying direct.
 func (e *Engine) resetExisting(h *packet.Header, _ Meta, proc rules.Process, p config.Proxy, parent string) Result {
 	res := e.reset(h)
-	e.log(logbuf.Event{Process: display(proc), PID: proc.PID, Proto: "TCP", Dest: h.Dst.String(), Via: p.Name, Status: "blocked",
+	e.log(logbuf.Event{Process: display(proc), Path: proc.Path, PID: proc.PID, Proto: "TCP", Dest: h.Dst.String(), Via: p.Name, Status: "blocked",
 		Error: "kill switch: соединение открыто до запуска перехвата, сброшено", Parent: parent})
 	return res
 }
@@ -966,9 +998,14 @@ func (e *Engine) unknownDropLocked() {
 	e.unknownDrops = 0
 }
 
-// startUDP opens a proxied UDP flow. sys marks system DNS (see dns.go).
-func (e *Engine) startUDP(pkt []byte, h *packet.Header, meta Meta, proc rules.Process, p config.Proxy, snap *snapshot, parent string, stat *ruleStat, killSwitch, sys bool) Result {
+// startUDP opens a proxied UDP flow. sys marks system DNS (see dns.go); kind
+// is the rule match that routed the process.
+func (e *Engine) startUDP(pkt []byte, h *packet.Header, meta Meta, proc rules.Process, p config.Proxy, snap *snapshot, parent string, stat *ruleStat, kind string, killSwitch, sys bool) Result {
 	key := udpKey{Src: h.Src, Dst: h.Dst}
+	var sub *subProcStat
+	if !sys {
+		sub = stat.procFor(proc, kind)
+	}
 	if h.Frag {
 		e.blockUDP.add(key)
 		e.dropFragment(h)
@@ -977,7 +1014,7 @@ func (e *Engine) startUDP(pkt []byte, h *packet.Header, meta Meta, proc rules.Pr
 	}
 	if p.Type != "socks5" && p.Type != "vless" && h.Dst.Port != 53 {
 		if snap.udpUnsupported == "direct" && !killSwitch {
-			e.addDirectUDP(key)
+			e.addDirectUDP(key, nil)
 			e.log(logbuf.Event{Process: display(proc), PID: proc.PID, Proto: "UDP", Dest: h.Dst.String(), Via: "direct", Status: "direct", Error: "http proxy has no udp; sent direct"})
 			return Result{Action: ActionPass}
 		}
@@ -1003,11 +1040,17 @@ func (e *Engine) startUDP(pkt []byte, h *packet.Header, meta Meta, proc rules.Pr
 		live:   true,
 		parent: parent,
 		stat:   stat,
+		owner:  sub,
 		sys:    sys,
 	}
 	if stat != nil {
 		stat.flows.Add(1)
 		stat.up.Add(int64(h.PayloadLen))
+	}
+	if sub != nil {
+		sub.flows.Add(1)
+		sub.up.Add(int64(h.PayloadLen))
+		sub.lastSeen.Store(e.now().UnixMilli())
 	}
 	flow.touch(e.now())
 	n := int64(h.PayloadLen)
@@ -1089,20 +1132,22 @@ func (e *Engine) rewriteForward(pkt []byte, h *packet.Header, flow *tcpFlow, sna
 	return Result{Action: ActionModified, IfIdx: flow.ifIdx, SubIfIdx: flow.subIfIdx}
 }
 
-func (e *Engine) rememberDirect(h *packet.Header) {
+// rememberDirect caches a direct decision. dp is the unmatched program behind
+// it, nil for a program with an explicit direct rule or no program at all.
+func (e *Engine) rememberDirect(h *packet.Header, dp *directProcEntry) {
 	if h.Proto == packet.ProtoTCP {
-		e.directTCP.add(tcpKey{Src: h.Src, Dst: h.Dst})
+		e.directTCP.set(tcpKey{Src: h.Src, Dst: h.Dst}, dp)
 		return
 	}
-	e.addDirectUDP(udpKey{Src: h.Src, Dst: h.Dst})
+	e.addDirectUDP(udpKey{Src: h.Src, Dst: h.Dst}, dp)
 }
 
 // rememberDirectExceptDNS is rememberDirect for anything but UDP to port
 // 53. A DNS socket's port is soon another program's, and the cache is keyed
 // by address. TCP is safe: a new connection's SYN clears the entry.
-func (e *Engine) rememberDirectExceptDNS(h *packet.Header) {
+func (e *Engine) rememberDirectExceptDNS(h *packet.Header, dp *directProcEntry) {
 	if h.Proto != packet.ProtoUDP || h.Dst.Port != 53 {
-		e.rememberDirect(h)
+		e.rememberDirect(h, dp)
 	}
 }
 

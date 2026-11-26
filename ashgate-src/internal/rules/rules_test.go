@@ -1,6 +1,7 @@
 package rules
 
 import (
+	"strings"
 	"testing"
 
 	"ashgate/internal/config"
@@ -210,23 +211,128 @@ func TestCompanionRespectsChildrenSwitch(t *testing.T) {
 	}
 }
 
-func TestCompanionByFamily(t *testing.T) {
-	s := Compile([]config.Rule{{Process: "dnplayer", Action: "proxy", Proxy: "v"}})
-	head := Process{Name: "Ld9BoxHeadless.exe", Path: `D:\Somewhere\Ld9BoxHeadless.exe`}
-	if d := s.Match(head); d.Action != "proxy" || d.Parent != "dnplayer.exe" {
-		t.Fatalf("family companion: %+v", d)
+func TestCompanionMatch(t *testing.T) {
+	s := Compile([]config.Rule{{
+		Process:    `C:\LDPlayer\LDPlayer9\dnplayer.exe`,
+		Companions: []string{"Ld9BoxHeadless.exe", `D:\Other\helper.exe`, `C:\LDPlayer\LDPlayer9\*.vmm`},
+		Action:     "proxy", Proxy: "v",
+	}})
+	// The rule's own process matches exactly.
+	if d := s.Match(Process{Name: "dnplayer.exe", Path: `C:\LDPlayer\LDPlayer9\dnplayer.exe`}); d.Action != "proxy" || d.MatchKind != MatchExact || d.Parent != "" {
+		t.Fatalf("exact: %+v", d)
 	}
-	if d := s.Match(Process{Name: "chrome.exe", Path: `D:\Somewhere\chrome.exe`}); d.Action != "" {
-		t.Fatalf("family caught another program: %+v", d)
+	// A bare companion name matches anywhere on disk.
+	if d := s.Match(Process{Name: "Ld9BoxHeadless.exe", Path: `D:\Somewhere\Ld9BoxHeadless.exe`}); d.Action != "proxy" || d.MatchKind != MatchCompanion || d.Parent != "" {
+		t.Fatalf("companion by name: %+v", d)
 	}
-	if got := Family("Ld9BoxHeadless.exe"); got != "ldplayer" {
-		t.Fatalf("Family = %q", got)
+	// A companion path matches only that path.
+	if d := s.Match(Process{Name: "helper.exe", Path: `D:\Other\helper.exe`}); d.MatchKind != MatchCompanion {
+		t.Fatalf("companion by path: %+v", d)
 	}
-	if got := Family(`C:\Program Files\BlueStacks_nxt\HD-Player.exe`); got != "bluestacks" {
-		t.Fatalf("Family = %q", got)
+	if d := s.Match(Process{Name: "helper.exe", Path: `D:\Other2\helper.exe`}); d.Action != "" {
+		t.Fatalf("companion path too wide: %+v", d)
 	}
-	if got := Family("curl.exe"); got != "" {
-		t.Fatalf("Family of curl = %q", got)
+	// A companion mask matches by glob.
+	if d := s.Match(Process{Name: "engine.vmm", Path: `C:\LDPlayer\LDPlayer9\engine.vmm`}); d.MatchKind != MatchCompanion {
+		t.Fatalf("companion mask: %+v", d)
+	}
+	if d := s.Match(Process{Name: "chrome.exe", Path: `C:\Chrome\chrome.exe`}); d.Action != "" {
+		t.Fatalf("companions caught another program: %+v", d)
+	}
+}
+
+func TestChildOfCompanionInherits(t *testing.T) {
+	s := Compile([]config.Rule{{
+		Process:    `C:\VM\Main\main.exe`,
+		Companions: []string{"vmhelper.exe"},
+		Action:     "proxy", Proxy: "v",
+	}})
+	child := Process{Name: "worker.exe", Parents: []Process{{Name: "vmhelper.exe", Path: `D:\Elsewhere\vmhelper.exe`}}}
+	if d := s.Match(child); d.Action != "proxy" || d.MatchKind != MatchChild || d.Parent != "vmhelper.exe" {
+		t.Fatalf("child of a companion: %+v", d)
+	}
+	// A companion's children do not inherit when the rule leaves children off.
+	off := false
+	s = Compile([]config.Rule{{
+		Process:    `C:\VM\Main\main.exe`,
+		Companions: []string{"vmhelper.exe"},
+		Action:     "proxy", Proxy: "v", Children: &off,
+	}})
+	if d := s.Match(child); d.Action != "" {
+		t.Fatalf("children off still inherited: %+v", d)
+	}
+}
+
+func TestCompanionFolder(t *testing.T) {
+	s := Compile([]config.Rule{{
+		Process:    `C:\VM\Main\main.exe`,
+		Companions: []string{`C:\VM\Service\svc.exe`},
+		Action:     "proxy", Proxy: "v",
+	}})
+	// A process in a companion's install folder is a companion by folder,
+	// even when the service started it outside the app's process tree.
+	if d := s.Match(Process{Name: "worker.exe", Path: `C:\VM\Service\worker.exe`}); d.Action != "proxy" || d.MatchKind != MatchFolder || d.Parent != "main.exe" {
+		t.Fatalf("companion folder: %+v", d)
+	}
+	if d := s.Match(Process{Name: "worker.exe", Path: `C:\VM\Service\bin\worker.exe`}); d.Action != "proxy" {
+		t.Fatalf("companion subfolder: %+v", d)
+	}
+	if d := s.Match(Process{Name: "other.exe", Path: `C:\VM\Other\other.exe`}); d.Action != "" {
+		t.Fatalf("unrelated folder matched: %+v", d)
+	}
+	// svchost is never caught, even inside a companion folder.
+	if d := s.Match(Process{Name: "svchost.exe", Path: `C:\VM\Service\svchost.exe`}); d.Action != "" {
+		t.Fatalf("svchost caught by a companion folder: %+v", d)
+	}
+}
+
+func TestMatchKindFolderAndChild(t *testing.T) {
+	s := Compile([]config.Rule{{Process: `C:\Games\Launcher\launcher.exe`, Action: "proxy", Proxy: "v"}})
+	if d := s.Match(Process{Name: "engine.exe", Path: `C:\Games\Launcher\engine.exe`}); d.MatchKind != MatchFolder {
+		t.Fatalf("folder kind: %+v", d)
+	}
+	if d := s.Match(Process{Name: "game.exe", Parents: []Process{{Name: "launcher.exe", Path: `C:\Games\Launcher\launcher.exe`}}}); d.MatchKind != MatchChild {
+		t.Fatalf("child kind: %+v", d)
+	}
+}
+
+func TestPathTokens(t *testing.T) {
+	cases := []struct {
+		in   string
+		want []string
+	}{
+		// "Program", "Files", "exe", "box", "headless" are stop words; "9" is
+		// numeric and "ld" is too short.
+		{`C:\Program Files\ldplayer9box\Ld9BoxHeadless.exe`, []string{"ldplayer"}},
+		{`C:\LDPlayer\ldmutiplayer\dnmultiplayerex.exe`, []string{"dnmultiplayerex", "ldmutiplayer", "ldplayer"}},
+		// Letter/digit and camelCase boundaries, with the path's own words.
+		{`C:\Apps\Foo9BarBaz.exe`, []string{"bar", "baz", "foo"}},
+		// Lower-case is applied before duplicates are dropped.
+		{`C:\Work\work\WORK.exe`, []string{"work"}},
+		{`C:\Program Files\App\bin\12345.exe`, nil},
+		{`C:\Tools\_my-tool.helper_.exe`, []string{"tool", "tools"}},
+		{`  "C:/Some/Folder/MyTool.exe"  `, []string{"folder", "some", "tool"}},
+	}
+	for _, c := range cases {
+		got := PathTokens(c.in)
+		if strings.Join(got, ",") != strings.Join(c.want, ",") {
+			t.Fatalf("PathTokens(%q) = %v; want %v", c.in, got, c.want)
+		}
+	}
+	// The two LDPlayer programs share the "ldplayer" token although their
+	// names, folders and process trees differ.
+	a := PathTokens(`C:\LDPlayer\ldmutiplayer\dnmultiplayerex.exe`)
+	b := PathTokens(`C:\Program Files\ldplayer9box\Ld9BoxHeadless.exe`)
+	shared := false
+	for _, x := range a {
+		for _, y := range b {
+			if x == y && x == "ldplayer" {
+				shared = true
+			}
+		}
+	}
+	if !shared {
+		t.Fatalf("no shared token: %v vs %v", a, b)
 	}
 }
 
