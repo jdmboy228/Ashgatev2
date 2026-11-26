@@ -22,8 +22,6 @@ sealed class QrPayload {
  * ZERO android.* and ZERO org.json.* imports so it runs in JVM unit tests without stubs.
  */
 object ProfileQr {
-    typealias QrPayload = io.ashgate.android.QrPayload
-
     fun encode(
         kind: String,
         link: String,
