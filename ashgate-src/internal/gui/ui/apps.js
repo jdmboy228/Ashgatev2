@@ -1067,7 +1067,11 @@ function apLoadCompanions(m) {
       m.error = "";
       if (m.capture && m.baseline === null) m.baseline = apBaselineOf(next);
       const sig = JSON.stringify(next);
-      if (!wasLoading && !hadErr && sig === m.candSig) return;
+      if (!wasLoading && !hadErr && sig === m.candSig) {
+        const att = document.querySelector("#dlg [data-attached-sec]");
+        if (att) setHTML(att, apAttachedInnerHTML(m, (cfg().rules || [])[m.i] || {}));
+        return;
+      }
       m.candSig = sig;
       if (!apPatchRadar(m)) renderModal();
     })
@@ -1079,8 +1083,8 @@ function apLoadCompanions(m) {
     })
     .finally(() => { m.fetching = false; });
 }
-// apPatchRadar updates only the radar list and counter inside the open
-// companions dialog so 1.5 s refreshes never destroy the manual input field.
+// apPatchRadar updates only the radar list, counter, and attached list inside
+// the open companions dialog so 1.5 s refreshes never destroy the manual input.
 function apPatchRadar(m) {
   const dlg = document.getElementById("dlg");
   if (!dlg || !dlg.classList.contains("ap-comp-dlg")) return false;
@@ -1092,6 +1096,9 @@ function apPatchRadar(m) {
   const capBtn = dlg.querySelector('[data-act="ap-radar-capture"]');
   if (capBtn) capBtn.disabled = !!(m.loading && !(m.candidates || []).length);
   setHTML(list, apRadarRowsHTML(m, cands));
+  const att = dlg.querySelector("[data-attached-sec]");
+  const r = (cfg().rules || [])[m.i] || {};
+  if (att) setHTML(att, apAttachedInnerHTML(m, r));
   return true;
 }
 function apBaselineOf(cands) {
@@ -1133,17 +1140,23 @@ function apCompanionModalClick(id, act) {
       return renderModal();
     case "ap-radar-attach": {
       const p = apAttachCompanion(m.i, act.dataset.pat || "");
-      if (p && p.then) p.then(() => { if (modal === m) apLoadCompanions(m); });
+      if (!p) return;
+      renderModal();
+      if (p.then) p.then(() => { if (modal === m) apLoadCompanions(m); });
       return;
     }
     case "ap-comp-del": {
       const p = apRemoveCompanion(m.i, act.dataset.pat || "");
-      if (p && p.then) p.then(() => { if (modal === m) apLoadCompanions(m); });
+      if (!p) return;
+      renderModal();
+      if (p.then) p.then(() => { if (modal === m) apLoadCompanions(m); });
       return;
     }
     case "ap-comp-mask": {
       const p = apGeneralizeCompanion(m.i, act.dataset.pat || "", act.dataset.mask || "");
-      if (p && p.then) p.then(() => { if (modal === m) apLoadCompanions(m); });
+      if (!p) return;
+      renderModal();
+      if (p.then) p.then(() => { if (modal === m) apLoadCompanions(m); });
       return;
     }
     case "ap-comp-browse": {
@@ -1187,7 +1200,7 @@ function apCompanionsHTML() {
     <div class="footer"><button class="btn" type="button" data-act="cancel">Закрыть</button></div>
   </form></div>`;
 }
-function apAttachedHTML(m, r) {
+function apAttachedInnerHTML(m, r) {
   const members = (state && state.ruleMembers && state.ruleMembers[apKey(r.process)]) || [];
   const list = r.companions || [];
   const rows = list.map((comp) => {
@@ -1201,8 +1214,11 @@ function apAttachedHTML(m, r) {
       <div class="txt"><span class="nm">${esc(baseName(comp) || comp)}</span><span class="sub" title="${esc(comp)}">${esc(path || "по имени файла")}</span></div>
       ${maskBtn}<button type="button" class="ap-sub-remove" data-act="ap-comp-del" data-pat="${esc(comp)}" title="Отвязать процесс" aria-label="Отвязать процесс">${icon("close", 12)}</button></div>`;
   }).join("");
-  return `<div class="ap-comp-sec"><div class="ap-sec-h"><span class="t">Привязанные процессы</span><span class="c">${list.length}</span></div>
-    ${rows || `<div class="ap-none">Пока нет привязанных процессов</div>`}</div>`;
+  return `<div class="ap-sec-h"><span class="t">Привязанные процессы</span><span class="c">${list.length}</span></div>
+    ${rows || `<div class="ap-none">Пока нет привязанных процессов</div>`}`;
+}
+function apAttachedHTML(m, r) {
+  return `<div class="ap-comp-sec" data-attached-sec>${apAttachedInnerHTML(m, r)}</div>`;
 }
 function apRadarRowsHTML(m, cands) {
   if (m.loading && !(m.candidates || []).length) return `<div class="ap-none">Ищу программы, которые ходят напрямую…</div>`;
