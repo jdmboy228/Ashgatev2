@@ -97,9 +97,9 @@ func DialTCP(addr, host string, port uint16) (net.Conn, error) {
 	if host == "" || port == 0 {
 		return nil, errors.New("VLESS: неверный адрес назначения")
 	}
-	// The connection's context lives until Close: Xray runs the whole
-	// session in the dispatch context.
-	ctx, cancel := context.WithCancel(context.Background())
+	// The connection's context lives until Close or until the bridge itself
+	// closes (for example on failover), so replaced-server relays end at once.
+	ctx, cancel := context.WithCancel(b.parentCtx())
 	c := &tcpConn{cancel: cancel, ob: &session.Outbound{}}
 	ctx = b.inboundContext(ctx, "http", "tls", "quic")
 	ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{c.ob})
@@ -394,8 +394,8 @@ func DialUDP(addr string) (*UDPSession, error) {
 	if err != nil {
 		return nil, err
 	}
-	// The session lives until Close, not as long as one request.
-	ctx, cancel := context.WithCancel(context.Background())
+	// The session lives until Close or until the bridge closes.
+	ctx, cancel := context.WithCancel(b.parentCtx())
 	return newUDPSession(b.inboundContext(ctx, "quic"), cancel, d), nil
 }
 

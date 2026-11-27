@@ -292,8 +292,22 @@ func (m *autoMatcher) run() {
 	}
 }
 
+// stopping reports whether stop has been called so pass can exit between
+// candidates without waiting for remaining inspector calls.
+func (m *autoMatcher) stopping() bool {
+	select {
+	case <-m.stopCh:
+		return true
+	default:
+		return false
+	}
+}
+
 // pass classifies this generation's candidates against the live rules.
 func (m *autoMatcher) pass() {
+	if m.stopping() {
+		return
+	}
 	m.mu.Lock()
 	st := m.st
 	m.mu.Unlock()
@@ -451,6 +465,9 @@ drained:
 		}
 	}
 	for _, p := range pending {
+		if m.stopping() {
+			return
+		}
 		classify(p)
 	}
 	// A candidate is decided once per generation, so a service process is only
@@ -459,6 +476,9 @@ drained:
 	// ever being attributed after the application starts.
 	if len(profiles) > 0 {
 		for _, p := range procs {
+			if m.stopping() {
+				return
+			}
 			if !rules.IsServiceOrCOMAncestor(p) {
 				continue
 			}
@@ -468,7 +488,7 @@ drained:
 
 	m.mu.Lock()
 	current := m.st
-	if current == nil || current.gen != st.gen {
+	if current == nil || current.gen != st.gen || m.stopping() {
 		m.mu.Unlock()
 		return
 	}
@@ -476,6 +496,9 @@ drained:
 	m.mu.Unlock()
 
 	for _, am := range added {
+		if m.stopping() {
+			return
+		}
 		if m.onMatch != nil {
 			m.onMatch(am)
 		}

@@ -80,14 +80,15 @@ const (
 // Gate sits in front of one Xray inbound and can cut it off the way a
 // censor or a dead network would.
 type Gate struct {
-	Name     string
-	Addr     string
-	target   string
-	ln       net.Listener
-	mode     atomic.Int32
-	mu       sync.Mutex
-	conns    map[net.Conn]struct{}
-	Accepted atomic.Int64
+	Name       string
+	Addr       string
+	target     string
+	ln         net.Listener
+	mode       atomic.Int32
+	mu         sync.Mutex
+	conns      map[net.Conn]struct{}
+	blackholed map[net.Conn]struct{}
+	Accepted   atomic.Int64
 }
 
 func newGate(name, target string) (*Gate, error) {
@@ -95,12 +96,21 @@ func newGate(name, target string) (*Gate, error) {
 	if err != nil {
 		return nil, err
 	}
-	g := &Gate{Name: name, Addr: ln.Addr().String(), target: target, ln: ln, conns: map[net.Conn]struct{}{}}
+	g := &Gate{
+		Name:       name,
+		Addr:       ln.Addr().String(),
+		target:     target,
+		ln:         ln,
+		conns:      map[net.Conn]struct{}{},
+		blackholed: map[net.Conn]struct{}{},
+	}
 	go g.accept()
 	return g, nil
 }
 
-// Set changes the mode. Refuse also resets the open connections.
+// Set changes the mode. Refuse resets all open connections; leaving Blackhole
+// closes connections that were accepted in Blackhole (they never dialed target
+// and can never resume).
 func (g *Gate) Set(mode int32) {
 	g.mode.Store(mode)
 	if mode == GateRefuse {
@@ -109,6 +119,14 @@ func (g *Gate) Set(mode int32) {
 			if tc, ok := c.(*net.TCPConn); ok {
 				_ = tc.SetLinger(0)
 			}
+			_ = c.Close()
+		}
+		g.mu.Unlock()
+		return
+	}
+	if mode == GatePass {
+		g.mu.Lock()
+		for c := range g.blackholed {
 			_ = c.Close()
 		}
 		g.mu.Unlock()
@@ -148,9 +166,15 @@ func (g *Gate) serve(c net.Conn) {
 		_ = c.Close()
 		return
 	case GateBlackhole:
-		g.track(c, true)
+		g.mu.Lock()
+		g.conns[c] = struct{}{}
+		g.blackholed[c] = struct{}{}
+		g.mu.Unlock()
 		_, _ = io.Copy(io.Discard, c)
-		g.track(c, false)
+		g.mu.Lock()
+		delete(g.conns, c)
+		delete(g.blackholed, c)
+		g.mu.Unlock()
 		_ = c.Close()
 		return
 	}

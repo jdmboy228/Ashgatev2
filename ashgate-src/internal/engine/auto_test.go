@@ -686,3 +686,49 @@ func TestAutoReevaluatesWhenChildFolderAppears(t *testing.T) {
 		return ok && am.RuleIndex == 0 && am.Reason == "загружает модуль из папки программы"
 	})
 }
+
+type slowAutoInspector struct {
+	started chan struct{}
+	once    sync.Once
+	delay   time.Duration
+}
+
+func (s *slowAutoInspector) FileMetadata(string) process.FileMeta { return process.FileMeta{} }
+func (s *slowAutoInspector) CommandLine(uint32, int64) string     { return "" }
+func (s *slowAutoInspector) HasModuleInDirs(uint32, int64, []string) bool {
+	s.once.Do(func() { close(s.started) })
+	time.Sleep(s.delay)
+	return false
+}
+
+// TestAutoCloseIsFastWhileBusy checks that Engine.Close aborts an active
+// background pass between candidates instead of waiting for all queued
+// processes to finish slow WinAPI inspections.
+func TestAutoCloseIsFastWhileBusy(t *testing.T) {
+	ins := &slowAutoInspector{started: make(chan struct{}), delay: 40 * time.Millisecond}
+	procs := append([]rules.Process(nil), ldLiveProcs()...)
+	for i := 0; i < 60; i++ {
+		procs = append(procs, rules.Process{
+			PID:     uint32(1000 + i),
+			Name:    "svc.exe",
+			Path:    `C:\Other\svc.exe`,
+			Started: autoBase + int64(i),
+			Parents: []rules.Process{{PID: 500, Name: "svchost.exe"}},
+		})
+	}
+	snap := newAutoSnapshot()
+	snap.set(procs...)
+	e := newAutoEngine(t, autoConfig(config.Rule{Process: ldRuleExe, Action: "proxy", Proxy: "socks"}), ins, snap)
+
+	select {
+	case <-ins.started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("autoMatcher did not start inspecting candidates")
+	}
+
+	t0 := time.Now()
+	e.Close()
+	if elapsed := time.Since(t0); elapsed > 500*time.Millisecond {
+		t.Fatalf("Engine.Close took %s while busy, want <= 500ms", elapsed)
+	}
+}

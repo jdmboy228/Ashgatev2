@@ -5,6 +5,7 @@ package gui
 import (
 	"errors"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -56,6 +57,7 @@ func claimInstance() (release func(), already bool) {
 		}
 		return func() {}, true
 	}
+	quitPending.Store(false)
 	inst := &singleInstance{
 		mutex: mutex,
 		ev:    createEvent(eventSDDL, instanceEvent),
@@ -192,14 +194,38 @@ func watchEvent(ev windows.Handle, stop <-chan struct{}, fire func()) {
 	}
 }
 
-// requestQuit asks the window thread to exit as «Выход» does.
+// quitPending latches a Global\AshgateQuit signal that arrived before the
+// window existed (for example, while WebView2 was still starting). Because
+// the quit event is auto-reset, dropping it on hwnd == 0 would strand the
+// process until it is killed.
+var quitPending atomic.Bool
+
+// postQuitMessage posts wmQuitReq to hwnd; tests replace it.
+var postQuitMessage = func(hwnd uintptr) {
+	pPostMessage.Call(hwnd, wmQuitReq, 0, 0)
+}
+
+// requestQuit asks the window thread to exit as «Выход» does, or latches the
+// request until the window is created and subclassed.
 func requestQuit() {
+	quitPending.Store(true)
+	deliverPendingQuit()
+}
+
+// deliverPendingQuit posts a latched quit request once the window is ready to
+// handle wmQuitReq.
+func deliverPendingQuit() {
+	if !quitPending.Load() {
+		return
+	}
 	h := appHost.Load()
 	if h == nil {
 		return
 	}
 	if hwnd := h.hwnd.Load(); hwnd != 0 {
-		pPostMessage.Call(hwnd, wmQuitReq, 0, 0)
+		if quitPending.Swap(false) {
+			postQuitMessage(hwnd)
+		}
 	}
 }
 

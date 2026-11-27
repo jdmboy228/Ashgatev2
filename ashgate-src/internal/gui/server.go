@@ -217,7 +217,17 @@ func (c *controller) shutdown() {
 	c.startMu.Lock()
 	_ = c.stopLocked()
 	c.startMu.Unlock()
-	c.sessWg.Wait()
+	// Bound the watcher wait to match stopLocked's 8 s session stop limit so
+	// wmQuitDone is always posted even if driver teardown stalls.
+	wgDone := make(chan struct{})
+	go func() {
+		c.sessWg.Wait()
+		close(wgDone)
+	}()
+	select {
+	case <-wgDone:
+	case <-time.After(8 * time.Second):
+	}
 	if c.done != nil {
 		c.doneOnce.Do(func() { close(c.done) })
 	}
