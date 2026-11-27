@@ -539,6 +539,26 @@ func userHomeDir(p string) string {
 	return root + rest
 }
 
+// stripUserProfileName removes the `<username>` segment from paths under
+// `<drive>:\users\<username>\...` (or `\users\<username>\...`) while keeping
+// the original casing of the remaining path for camelCase splitting.
+func stripUserProfileName(s string) string {
+	const root = `\users\`
+	low := strings.ToLower(s)
+	off := 0
+	if len(low) >= 2 && low[1] == ':' {
+		off = 2
+	}
+	if !strings.HasPrefix(low[off:], root) {
+		return s
+	}
+	userStart := off + len(root)
+	if i := strings.IndexByte(s[userStart:], '\\'); i >= 0 {
+		return s[:userStart] + s[userStart+i+1:]
+	}
+	return s[:userStart]
+}
+
 // pathTokenStop are words too common in paths and program names to tell one
 // application family from another.
 var pathTokenStop = map[string]bool{
@@ -567,6 +587,7 @@ func PathTokens(path string) []string {
 	s = strings.ReplaceAll(s, "/", `\`)
 	s = strings.TrimPrefix(s, `\??\`)
 	s = strings.TrimPrefix(s, `\\?\`)
+	s = stripUserProfileName(s)
 
 	var b strings.Builder
 	var prev rune

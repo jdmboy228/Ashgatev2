@@ -540,7 +540,10 @@ function apRuleHintHTML(i, key) {
     const name = c.name || apLabel(c.path || c.name || "");
     const size = c.bytes ? ` (${fmtBytes(c.bytes)})` : "";
     const reason = c.reasons && c.reasons.length ? ` · ${esc(c.reasons[0])}` : "";
-    return `<div class="ap-hint-bar">${icon("info", 14)}<span class="txt">Нет трафика, но <b>${esc(name)}</b> идёт напрямую${size}${reason}</span>
+    const lead = hint.quiet
+      ? `Нет трафика, но <b>${esc(name)}</b> идёт напрямую${size}${reason}`
+      : `Возможно, связанный процесс: <b>${esc(name)}</b> идёт напрямую${size}${reason}`;
+    return `<div class="ap-hint-bar">${icon("info", 14)}<span class="txt">${lead}</span>
       <button class="btn sm pri" type="button" data-act="ap-hint-attach" data-i="${i}" data-pat="${esc(c.mask || c.path || c.name || "")}">Подключить</button>
       <button class="btn sm" type="button" data-act="ap-companions" data-i="${i}">Другие…</button>${dismiss}</div>`;
   }

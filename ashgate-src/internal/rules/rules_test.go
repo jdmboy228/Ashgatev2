@@ -312,11 +312,27 @@ func TestPathTokens(t *testing.T) {
 		{`C:\Program Files\App\bin\12345.exe`, nil},
 		{`C:\Tools\_my-tool.helper_.exe`, []string{"tool", "tools"}},
 		{`  "C:/Some/Folder/MyTool.exe"  `, []string{"folder", "some", "tool"}},
+		// The Windows user profile name right after \Users\ is stripped so
+		// unrelated apps installed under AppData never share the username token.
+		{`C:\Users\tanki\AppData\Local\Discord\app-1.0.9163\Discord.exe`, []string{"discord"}},
+		{`C:\Users\tanki\AppData\Local\Microsoft\OneDrive\OneDrive.exe`, []string{"drive", "microsoft", "one"}},
+		{`D:/Users/John.Doe_99/AppData/Roaming/Opera Software/Opera GX Stable/opera.exe`, []string{"opera", "software", "stable"}},
+		{`C:\Users\tanki`, nil},
 	}
 	for _, c := range cases {
 		got := PathTokens(c.in)
 		if strings.Join(got, ",") != strings.Join(c.want, ",") {
 			t.Fatalf("PathTokens(%q) = %v; want %v", c.in, got, c.want)
+		}
+	}
+	// Unrelated user-profile apps (Discord vs OneDrive) must share no tokens.
+	disc := PathTokens(`C:\Users\tanki\AppData\Local\Discord\app-1.0\Discord.exe`)
+	od := PathTokens(`C:\Users\tanki\AppData\Local\Microsoft\OneDrive\OneDrive.exe`)
+	for _, x := range disc {
+		for _, y := range od {
+			if x == y {
+				t.Fatalf("user-profile apps unexpectedly shared token %q (%v vs %v)", x, disc, od)
+			}
 		}
 	}
 	// The two LDPlayer programs share the "ldplayer" token although their

@@ -533,7 +533,9 @@ func TestRankCandidatesVendorTokenNotSubstring(t *testing.T) {
 }
 
 // Strong direct traffic is suggested even while the rule is not quiet: a
-// launcher may already have sent a burst of its own.
+// launcher may already have sent a burst of its own. Tiny background pings
+// (e.g. 248 B from OneDrive) must not pass just because Conns >= 2 unless
+// backed by a strong structural signal (DLL / CmdLine / uncommon signer).
 func TestStrongCandidateWhileRuleNotQuiet(t *testing.T) {
 	cands := []companionCandidate{
 		{Name: "Ld9BoxHeadless.exe", Score: 70, Conns: 3, Bytes: 864 * 1024},
@@ -545,7 +547,64 @@ func TestStrongCandidateWhileRuleNotQuiet(t *testing.T) {
 		t.Fatal("a below-threshold score must not be suggested")
 	}
 	if strongCandidate([]companionCandidate{{Name: "x", Score: 80, Conns: 1, Bytes: 1024}}, nil) != nil {
-		t.Fatal("too little traffic must not be suggested")
+		t.Fatal("too little traffic without structural signal must not be suggested")
+	}
+	if strongCandidate([]companionCandidate{{Name: "OneDrive.exe", Score: 70, Conns: 2, Bytes: 248}}, nil) != nil {
+		t.Fatal("248 B background traffic with Conns>=2 must not be suggested")
+	}
+	if got := strongCandidate([]companionCandidate{{Name: "helper.exe", Score: 65, Conns: 1, Bytes: 4096}}, nil); got == nil || got.Name != "helper.exe" {
+		t.Fatalf("4 KB direct traffic should pass, got %+v", got)
+	}
+	if strongCandidate([]companionCandidate{{Name: "idle.exe", Score: 85, strongSignal: true}}, nil) != nil {
+		t.Fatal("zero-traffic candidate must not be suggested even with strongSignal")
+	}
+
+	// End-to-end via rankCandidates: uncommon signer sets strongSignal so even
+	// a small active direct flow surfaces; meanwhile OneDrive under the same
+	// Windows username (C:\Users\tanki\...) gets no shared token and is ignored.
+	now := time.Now()
+	const discordExe = `C:\Users\tanki\AppData\Local\Discord\app-1.0\Discord.exe`
+	const oneDriveExe = `C:\Users\tanki\AppData\Local\Microsoft\OneDrive\OneDrive.exe`
+	const helperExe = `C:\Program Files\DiscordHelper\helper.exe`
+	ins := &fakeInspector{meta: map[string]process.FileMeta{
+		strings.ToLower(discordExe):  {Signer: "Discord Inc."},
+		strings.ToLower(helperExe):   {Signer: "Discord Inc."},
+		strings.ToLower(oneDriveExe): {Signer: "Microsoft Corporation"},
+	}}
+	rule := config.Rule{Process: discordExe, Action: "proxy"}
+	direct := []engine.DirectProc{
+		{Name: "OneDrive.exe", Path: oneDriveExe, PID: 101, Conns: 2, Bytes: 248, LastSeen: now.UnixMilli()},
+		{Name: "helper.exe", Path: helperExe, PID: 102, Conns: 1, Bytes: 248, LastSeen: now.UnixMilli()},
+	}
+	running := []rules.Process{
+		{Name: "OneDrive.exe", Path: oneDriveExe, PID: 101},
+		{Name: "helper.exe", Path: helperExe, PID: 102},
+	}
+	ranked := rankCandidates(rule, []config.Rule{rule}, nil, direct, running, ins, nil, now)
+	for _, c := range ranked {
+		if c.Name == "OneDrive.exe" && hasReason(c, "Похожий путь") {
+			t.Fatalf("OneDrive falsely matched username token: %+v", c)
+		}
+	}
+	if got := strongCandidate(ranked, nil); got == nil || got.Name != "helper.exe" {
+		t.Fatalf("strongCandidate(ranked) = %+v, want helper.exe", got)
+	}
+}
+
+func TestBuildRuleHintQuietFlag(t *testing.T) {
+	cand := []companionCandidate{{Name: "Ld9BoxHeadless.exe", Score: 70, Conns: 2, Bytes: 16384}}
+	if h, ok := buildRuleHint(true, cand, nil); !ok || !h.Quiet || h.TopCandidate == nil {
+		t.Fatalf("quiet with candidate = (%+v, %v), want Quiet=true and TopCandidate!=nil", h, ok)
+	}
+	if h, ok := buildRuleHint(true, nil, nil); !ok || !h.Quiet || h.TopCandidate != nil {
+		t.Fatalf("quiet without candidate = (%+v, %v), want Quiet=true and TopCandidate==nil", h, ok)
+	}
+	if h, ok := buildRuleHint(false, cand, nil); !ok || h.Quiet || h.TopCandidate == nil {
+		t.Fatalf("active with strong candidate = (%+v, %v), want Quiet=false and TopCandidate!=nil", h, ok)
+	}
+	tiny := []companionCandidate{{Name: "OneDrive.exe", Score: 70, Conns: 2, Bytes: 248}}
+	if h, ok := buildRuleHint(false, tiny, nil); ok {
+		t.Fatalf("active with 248 B candidate = (%+v, %v), want no hint", h, ok)
 	}
 }
 

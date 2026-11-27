@@ -50,8 +50,9 @@ type companionCandidate struct {
 	Score       int      `json:"score"`
 	Reasons     []string `json:"reasons,omitempty"`
 	System      bool     `json:"system,omitempty"`
-	Running     bool     `json:"running"`
-	OtherRule   string   `json:"otherRule,omitempty"`
+	Running      bool     `json:"running"`
+	OtherRule    string   `json:"otherRule,omitempty"`
+	strongSignal bool
 }
 
 // ruleHintView is the suggestion the Apps tab shows for a rule whose app is
@@ -555,6 +556,7 @@ func rankCandidates(rule config.Rule, allRules []config.Rule, ruleRunning []rule
 		v.Mask, _ = rules.VersionMask(v.Path)
 		if !v.System {
 			score, reasons := 0, []string(nil)
+			strong := false
 			var candMeta process.FileMeta
 			if v.Path != "" {
 				candMeta = ins.FileMetadata(v.Path)
@@ -574,12 +576,14 @@ func rankCandidates(rule config.Rule, allRules []config.Rule, ruleRunning []rule
 					}
 					if hit {
 						score += 60
+						strong = true
 						reasons = append(reasons, "Запущен с путём программы")
 					}
 				}
 			}
 			if len(ruleDirs) > 0 && v.PID > 4 && ins != nil && ins.HasModuleInDirs(v.PID, c.started, ruleDirs) {
 				score += 60
+				strong = true
 				reasons = append(reasons, "Загружает модуль программы")
 			}
 			signer := strings.TrimSpace(ruleMeta.Signer)
@@ -596,6 +600,7 @@ func rankCandidates(rule config.Rule, allRules []config.Rule, ruleRunning []rule
 					score += 10
 				} else {
 					score += 50
+					strong = true
 				}
 				reasons = append(reasons, "Тот же издатель")
 			} else {
@@ -649,7 +654,7 @@ func rankCandidates(rule config.Rule, allRules []config.Rule, ruleRunning []rule
 					reasons = append(reasons, "Запущен вместе с программой")
 				}
 			}
-			v.Score, v.Reasons = score, reasons
+			v.Score, v.Reasons, v.strongSignal = score, reasons, strong
 		}
 		if otherSet != nil {
 			dec := otherSet.Match(rules.Process{Name: v.Name, Path: v.Path, PID: v.PID, Started: c.started, Parents: c.parents})
@@ -719,9 +724,10 @@ func topCandidate(cands []companionCandidate, ruleSet *rules.Set) *companionCand
 
 // strongCandidate returns a candidate strong enough to suggest even while
 // the rule's own application still moves a little traffic (a launcher that
-// sent a burst before its child took over). It needs a high score and real
-// traffic, so a merely quiet rule does not turn every stray program into a
-// hint.
+// sent a burst before its child took over). It requires real traffic volume
+// (at least 4 KB) or a strong structural signal (loaded module, command line,
+// or uncommon signer match) alongside active direct traffic, so tiny
+// background pings (like OneDrive) never spam suggestions.
 func strongCandidate(cands []companionCandidate, ruleSet *rules.Set) *companionCandidate {
 	for i := range cands {
 		if cands[i].System {
@@ -734,11 +740,27 @@ func strongCandidate(cands []companionCandidate, ruleSet *rules.Set) *companionC
 		if c.OtherRule != "" || candidateExcluded(ruleSet, c) {
 			continue
 		}
-		if c.Conns >= 2 || c.Bytes >= 16384 {
+		if c.Conns == 0 && c.Bytes == 0 {
+			continue
+		}
+		if c.Bytes >= 4096 || c.strongSignal {
 			return &c
 		}
 	}
 	return nil
+}
+
+// buildRuleHint turns ranked candidates for one rule into the hint bar view.
+// Quiet rules always set Quiet: true (even when TopCandidate is present) so
+// the UI only says "Нет трафика..." when the rule truly has no traffic.
+func buildRuleHint(quiet bool, cands []companionCandidate, ruleSet *rules.Set) (ruleHintView, bool) {
+	if quiet {
+		return ruleHintView{Quiet: true, TopCandidate: topCandidate(cands, ruleSet)}, true
+	}
+	if best := strongCandidate(cands, ruleSet); best != nil {
+		return ruleHintView{TopCandidate: best}, true
+	}
+	return ruleHintView{}, false
 }
 
 // countDirect is the number of programs sending direct traffic right now;
@@ -845,19 +867,8 @@ func (c *controller) refreshHints() {
 				quiet := st.Flows == 0 && st.Up+st.Down < 4096
 				cands := rankCandidates(r, rs, ruleProcs[k], recent, recentRunning, ins, autoMatches, now)
 				set := rules.Compile([]config.Rule{r})
-				if quiet {
-					if best := topCandidate(cands, set); best != nil {
-						hints[k] = ruleHintView{TopCandidate: best}
-					} else {
-						hints[k] = ruleHintView{Quiet: true}
-					}
-					continue
-				}
-				// The rule is not quiet, but a launcher may already have sent a
-				// burst of its own before the child took over. A strong direct
-				// candidate is still worth suggesting; "quiet" never is.
-				if best := strongCandidate(cands, set); best != nil {
-					hints[k] = ruleHintView{TopCandidate: best}
+				if h, ok := buildRuleHint(quiet, cands, set); ok {
+					hints[k] = h
 				}
 			}
 		}
