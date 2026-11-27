@@ -14,8 +14,8 @@ android {
         applicationId = "io.ashgate.android"
         minSdk = 24
         targetSdk = 35
-        versionCode = (System.getenv("ASHGATE_VERSION_CODE") ?: "1").toInt()
-        versionName = System.getenv("ASHGATE_VERSION_NAME")?.takeIf { it.isNotBlank() } ?: "0.1.0"
+        versionCode = (System.getenv("ASHGATE_VERSION_CODE") ?: "2").toInt()
+        versionName = System.getenv("ASHGATE_VERSION_NAME")?.takeIf { it.isNotBlank() } ?: "0.1.1"
         // 64-bit ARM only: nearly every phone in use runs it (32-bit-only
         // phones are left out); a second copy of the Go core for
         // armeabi-v7a doubled the APK.
