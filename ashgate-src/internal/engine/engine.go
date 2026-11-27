@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -117,6 +118,15 @@ type Options struct {
 	SelfPID  uint32
 	Now      func() time.Time
 	SkipSelf bool
+	// Inspector enables the auto matcher (see auto.go). When nil the matcher
+	// is not created and the engine behaves as before.
+	Inspector AutoInspector
+	// Snapshot supplies the process list to the auto matcher; nil uses
+	// process.Snapshot. Tests replace it.
+	Snapshot func() []rules.Process
+	// AutoRefresh is how often the auto matcher re-reads the process list;
+	// zero uses defaultAutoRefresh. Tests shorten it.
+	AutoRefresh time.Duration
 }
 
 // Engine is safe for one packet goroutine plus the accept and UDP goroutines.
@@ -199,6 +209,10 @@ type Engine struct {
 	bytesUp   atomic.Int64
 	bytesDown atomic.Int64
 	dnsRR     atomic.Uint64
+
+	// auto attributes the processes rules cover indirectly (see auto.go). It
+	// is nil unless Options.Inspector was set.
+	auto *autoMatcher
 }
 
 type fragKey struct {
@@ -296,7 +310,81 @@ func New(cfg *config.Config, opt Options) (*Engine, error) {
 	if err := e.Apply(cfg); err != nil {
 		return nil, err
 	}
+	if opt.Inspector != nil {
+		e.auto = newAutoMatcher(opt.Inspector, opt.Snapshot, opt.AutoRefresh, e.onAutoMatchAdded)
+		if snap := e.snap.Load(); snap != nil {
+			e.auto.configure(cfg.EffectiveRules(), snap.rules, snap.ruleKeys)
+		}
+	}
 	return e, nil
+}
+
+// Close stops the auto matcher. It is safe to call more than once and safe
+// when the matcher was never created.
+func (e *Engine) Close() {
+	if e == nil || e.auto == nil {
+		return
+	}
+	e.auto.stop()
+}
+
+// AutoMatches copies the processes the auto matcher currently attributes to
+// rules. It is empty when no inspector was configured.
+func (e *Engine) AutoMatches() []AutoMatch {
+	if e == nil || e.auto == nil {
+		return nil
+	}
+	t := e.auto.table()
+	if t == nil || len(t.byPID) == 0 {
+		return nil
+	}
+	out := make([]AutoMatch, 0, len(t.byPID))
+	for _, am := range t.byPID {
+		out = append(out, am)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].RuleIndex != out[j].RuleIndex {
+			return out[i].RuleIndex < out[j].RuleIndex
+		}
+		if out[i].Proc.PID != out[j].Proc.PID {
+			return out[i].Proc.PID < out[j].Proc.PID
+		}
+		return out[i].Proc.Started < out[j].Proc.Started
+	})
+	return out
+}
+
+// onAutoMatchAdded forgets what the caches said about a process that just
+// became routed, so its DIRECT row disappears and the next packet follows
+// the rule. The address caches are cleared whole: they are small, hold no
+// process key, and the packet path will refill them.
+func (e *Engine) onAutoMatchAdded(am AutoMatch) {
+	if e == nil {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.directTCP.clear()
+	e.directUDP.clear()
+	e.directPorts = nil
+	e.direct.pruneKey(autoProcKey(am.Proc))
+}
+
+// autoCompatible reports that am still names the same rule in snap. The table
+// can lag one Apply behind, and an index that no longer points at the same
+// rule must not route traffic by its old action.
+func (e *Engine) autoCompatible(snap *snapshot, am AutoMatch) bool {
+	if snap == nil {
+		return false
+	}
+	if am.RuleIndex < 0 || am.RuleIndex >= len(snap.ruleKeys) {
+		return false
+	}
+	key := snap.ruleKeys[am.RuleIndex]
+	if key == "" || am.RuleKey == "" {
+		return true
+	}
+	return key == am.RuleKey
 }
 
 // SetInjector installs the reply path used by UDP.
@@ -358,6 +446,10 @@ func (e *Engine) Apply(cfg *config.Config) error {
 	e.mu.Unlock()
 	for _, f := range stale {
 		e.retireUDP(f)
+	}
+	// Outside e.mu: configure wakes the matcher, whose callback takes e.mu.
+	if e.auto != nil {
+		e.auto.configure(cfg.EffectiveRules(), snap.rules, snap.ruleKeys)
 	}
 	return nil
 }
@@ -803,6 +895,36 @@ func (e *Engine) decide(pkt []byte, h *packet.Header, meta Meta, proc rules.Proc
 	}
 
 	dec := snap.rules.Match(proc)
+	if e.auto != nil {
+		if dec.Action != "" {
+			// The rule matched this process; hand its folder to the matcher
+			// at once, so a candidate in a sibling folder is attributed
+			// without waiting for the next snapshot.
+			e.auto.noteRuleProc(dec.RuleIndex, proc)
+		} else if !rules.IsShellOrSystem(proc) && !rules.IsSystemDNS(proc.Name) && !rules.IsSystemPath(proc.Path) {
+			am, ok, decided, hasRules := e.auto.lookup(proc)
+			if ok && !snap.rules.IsExcluded(am.RuleIndex, proc) && e.autoCompatible(snap, am) {
+				dec = rules.Decision{
+					Action:     am.Action,
+					Proxy:      am.Proxy,
+					RuleIndex:  am.RuleIndex,
+					MatchKind:  rules.MatchAuto,
+					Parent:     am.RuleName,
+					KillSwitch: am.KillSwitch,
+					TCPOnly:    am.TCPOnly,
+				}
+			} else if hasRules && !decided {
+				// Ask the matcher to classify the process. Holding the first
+				// packet (ActionUnknown) gives the pass up to holdFor (50 ms)
+				// to finish, so the connection starts through the proxy rather
+				// than leaking out direct.
+				e.auto.enqueue(proc)
+				if !final && (h.Proto == packet.ProtoTCP || h.Proto == packet.ProtoUDP) {
+					return Result{Action: ActionUnknown}
+				}
+			}
+		}
+	}
 	parent := dec.Parent
 	var stat *ruleStat
 	if dec.RuleIndex >= 0 && dec.RuleIndex < len(snap.ruleKeys) {

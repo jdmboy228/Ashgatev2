@@ -4,12 +4,16 @@ package process
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"strings"
 	"sync"
 	"time"
 	"unsafe"
+
+	"ashgate/internal/rules"
 
 	"golang.org/x/sys/windows"
 )
@@ -18,10 +22,11 @@ import (
 // Used exclusively to rank companion suggestions in the UI — never for
 // automatic proxying and never called on the packet hot path.
 type FileMeta struct {
-	Signer      string
-	Company     string
-	Product     string
-	Description string
+	Signer         string
+	CertThumbprint string
+	Company        string
+	Product        string
+	Description    string
 }
 
 type metaCacheEntry struct {
@@ -40,12 +45,18 @@ type cmdCacheEntry struct {
 	at  time.Time
 }
 
+type modCacheEntry struct {
+	dirs []string
+	at   time.Time
+}
+
 // Inspector caches offline PE metadata (Authenticode signer and version info)
 // and running process command lines for companion candidate scoring.
 type Inspector struct {
 	mu    sync.Mutex
 	files map[string]metaCacheEntry
 	cmds  map[cmdCacheKey]cmdCacheEntry
+	mods  map[cmdCacheKey]modCacheEntry
 }
 
 // NewInspector creates a reusable metadata inspector with bounded in-memory caches.
@@ -53,6 +64,7 @@ func NewInspector() *Inspector {
 	return &Inspector{
 		files: make(map[string]metaCacheEntry),
 		cmds:  make(map[cmdCacheKey]cmdCacheEntry),
+		mods:  make(map[cmdCacheKey]modCacheEntry),
 	}
 }
 
@@ -60,6 +72,8 @@ const (
 	maxMetaCacheEntries = 512
 	maxCmdCacheEntries  = 512
 	cmdCacheTTL         = 30 * time.Second
+	maxModCacheEntries  = 512
+	modCacheTTL         = 30 * time.Second
 )
 
 // FileMetadata returns cached offline Authenticode signer and PE version info
@@ -84,9 +98,8 @@ func (ins *Inspector) FileMetadata(path string) FileMeta {
 	}
 	ins.mu.Unlock()
 
-	meta := FileMeta{
-		Signer: readAuthenticodeSigner(path),
-	}
+	meta := FileMeta{}
+	meta.Signer, meta.CertThumbprint = readAuthenticodeSigner(path)
 	meta.Company, meta.Product, meta.Description = readVersionStrings(path)
 
 	ins.mu.Lock()
@@ -140,6 +153,141 @@ func (ins *Inspector) CommandLine(pid uint32, started int64) string {
 	return cmd
 }
 
+// HasModuleInDirs reports whether the process pid has a loaded module whose
+// directory is dirs[i] or lies under it. The loaded-module list is cached for
+// modCacheTTL; access failures (protected process, exited PID) cache an empty
+// list so the WinAPI is not hammered.
+func (ins *Inspector) HasModuleInDirs(pid uint32, started int64, dirs []string) bool {
+	if pid <= 4 || len(dirs) == 0 {
+		return false
+	}
+	key := cmdCacheKey{pid: pid, started: started}
+	now := time.Now()
+
+	ins.mu.Lock()
+	if e, ok := ins.mods[key]; ok && now.Sub(e.at) < modCacheTTL {
+		modDirs := e.dirs
+		ins.mu.Unlock()
+		return matchModuleDirs(modDirs, dirs)
+	}
+	ins.mu.Unlock()
+
+	modDirs, _ := queryModuleDirsErr(pid, started)
+
+	ins.mu.Lock()
+	if ins.mods == nil {
+		ins.mods = make(map[cmdCacheKey]modCacheEntry)
+	}
+	if len(ins.mods) >= maxModCacheEntries {
+		for k, v := range ins.mods {
+			if now.Sub(v.at) >= modCacheTTL {
+				delete(ins.mods, k)
+			}
+		}
+		if len(ins.mods) >= maxModCacheEntries {
+			clear(ins.mods)
+		}
+	}
+	ins.mods[key] = modCacheEntry{dirs: modDirs, at: now}
+	ins.mu.Unlock()
+	return matchModuleDirs(modDirs, dirs)
+}
+
+// matchModuleDirs reports whether any module directory equals or is nested
+// under any of the wanted directories.
+func matchModuleDirs(modDirs, dirs []string) bool {
+	for _, d := range dirs {
+		d = normDir(d)
+		if d == "" {
+			continue
+		}
+		for _, md := range modDirs {
+			if md == d || strings.HasPrefix(md, d+`\`) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// normDir normalizes a directory path and strips a trailing separator
+// (keeping a lone `\` root intact).
+func normDir(p string) string {
+	p = rules.NormalizePath(p)
+	if len(p) > 1 && strings.HasSuffix(p, `\`) {
+		p = p[:len(p)-1]
+	}
+	return p
+}
+
+// moduleDirOf returns the normalized parent directory of a module path.
+func moduleDirOf(normalizedExe string) string {
+	i := strings.LastIndex(normalizedExe, `\`)
+	if i < 0 {
+		return ""
+	}
+	return normDir(normalizedExe[:i])
+}
+
+// queryModuleDirsErr lists the distinct normalized directories of the modules
+// loaded in pid. When started is non-zero the process creation time is checked
+// to guard against PID reuse. Access failures return the directories gathered
+// so far plus an error.
+func queryModuleDirsErr(pid uint32, started int64) ([]string, error) {
+	if pid <= 4 {
+		return nil, fmt.Errorf("system pid %d", pid)
+	}
+	if started != 0 {
+		h, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+		if err != nil {
+			return nil, fmt.Errorf("OpenProcess(%d): %w", pid, err)
+		}
+		var create, exit, kernel, user windows.Filetime
+		err = windows.GetProcessTimes(h, &create, &exit, &kernel, &user)
+		windows.CloseHandle(h)
+		if err != nil {
+			return nil, fmt.Errorf("GetProcessTimes(%d): %w", pid, err)
+		}
+		if ct := create.Nanoseconds(); ct != 0 && ct != started {
+			return nil, fmt.Errorf("pid %d reused (created=%d want=%d)", pid, ct, started)
+		}
+	}
+
+	// ERROR_BAD_LENGTH is the documented transient failure while the target
+	// process is loading modules; retry a few times as the docs suggest.
+	var snap windows.Handle
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		snap, err = windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPMODULE|windows.TH32CS_SNAPMODULE32, pid)
+		if err == nil {
+			break
+		}
+		if err != windows.ERROR_BAD_LENGTH {
+			return nil, fmt.Errorf("CreateToolhelp32Snapshot(%d): %w", pid, err)
+		}
+	}
+	if err != nil {
+		return nil, fmt.Errorf("CreateToolhelp32Snapshot(%d): %w", pid, err)
+	}
+	defer windows.CloseHandle(snap)
+
+	var me windows.ModuleEntry32
+	me.Size = uint32(unsafe.Sizeof(me))
+	seen := make(map[string]struct{}, 16)
+	dirs := make([]string, 0, 16)
+	for err = windows.Module32First(snap, &me); err == nil; {
+		if md := moduleDirOf(rules.NormalizePath(windows.UTF16ToString(me.ExePath[:]))); md != "" {
+			if _, dup := seen[md]; !dup {
+				seen[md] = struct{}{}
+				dirs = append(dirs, md)
+			}
+		}
+		me.Size = uint32(unsafe.Sizeof(me))
+		err = windows.Module32Next(snap, &me)
+	}
+	return dirs, nil
+}
+
 var (
 	modCrypt32                  = windows.NewLazySystemDLL("crypt32.dll")
 	procCryptQueryObject        = modCrypt32.NewProc("CryptQueryObject")
@@ -169,12 +317,13 @@ type cmsgSignerInfoHead struct {
 	SerialNumber windows.CryptIntegerBlob
 }
 
-// readAuthenticodeSigner reads the embedded PKCS#7 signer's display name
-// directly from the PE file without network revocation checks.
-func readAuthenticodeSigner(path string) string {
+// readAuthenticodeSigner reads the embedded PKCS#7 signer's display name and
+// the SHA-256 thumbprint of the signer certificate's raw DER bytes directly
+// from the PE file without network revocation checks.
+func readAuthenticodeSigner(path string) (signer, thumbprint string) {
 	pathPtr, err := windows.UTF16PtrFromString(path)
 	if err != nil {
-		return ""
+		return "", ""
 	}
 	var encoding, contentType, formatType uint32
 	var hStore windows.Handle
@@ -193,7 +342,7 @@ func readAuthenticodeSigner(path string) string {
 		0,
 	)
 	if r1 == 0 {
-		return ""
+		return "", ""
 	}
 	if hStore != 0 {
 		defer windows.CertCloseStore(hStore, 0)
@@ -202,7 +351,7 @@ func readAuthenticodeSigner(path string) string {
 		defer procCryptMsgClose.Call(hMsg)
 	}
 	if hStore == 0 || hMsg == 0 {
-		return ""
+		return "", ""
 	}
 
 	var siSize uint32
@@ -214,7 +363,7 @@ func readAuthenticodeSigner(path string) string {
 		uintptr(unsafe.Pointer(&siSize)),
 	)
 	if r1 == 0 || siSize < uint32(unsafe.Sizeof(cmsgSignerInfoHead{})) || siSize > 1<<20 {
-		return ""
+		return "", ""
 	}
 	buf := make([]byte, siSize)
 	r1, _, _ = procCryptMsgGetParam.Call(
@@ -225,13 +374,13 @@ func readAuthenticodeSigner(path string) string {
 		uintptr(unsafe.Pointer(&siSize)),
 	)
 	if r1 == 0 {
-		return ""
+		return "", ""
 	}
 	si := (*cmsgSignerInfoHead)(unsafe.Pointer(&buf[0]))
 	wantIssuer := blobBytes(si.Issuer.Data, si.Issuer.Size)
 	wantSerial := blobBytes(si.SerialNumber.Data, si.SerialNumber.Size)
 	if len(wantIssuer) == 0 || len(wantSerial) == 0 {
-		return ""
+		return "", ""
 	}
 	var certCtx *windows.CertContext
 	for {
@@ -251,9 +400,14 @@ func readAuthenticodeSigner(path string) string {
 		}
 	}
 	if certCtx == nil {
-		return ""
+		return "", ""
 	}
 	defer windows.CertFreeCertificateContext(certCtx)
+
+	if der := blobBytes(certCtx.EncodedCert, certCtx.Length); len(der) > 0 {
+		sum := sha256.Sum256(der)
+		thumbprint = hex.EncodeToString(sum[:])
+	}
 
 	var nameBuf [256]uint16
 	n, _, _ := procCertGetNameStringW.Call(
@@ -265,9 +419,9 @@ func readAuthenticodeSigner(path string) string {
 		uintptr(len(nameBuf)),
 	)
 	if n <= 1 {
-		return ""
+		return "", ""
 	}
-	return strings.TrimSpace(windows.UTF16ToString(nameBuf[:min(int(n), len(nameBuf))]))
+	return strings.TrimSpace(windows.UTF16ToString(nameBuf[:min(int(n), len(nameBuf))])), thumbprint
 }
 
 func blobBytes(data *byte, size uint32) []byte {

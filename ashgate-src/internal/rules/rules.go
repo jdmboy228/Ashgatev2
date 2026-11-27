@@ -48,6 +48,7 @@ const (
 	MatchCompanion = "companion"
 	MatchChild     = "child"
 	MatchFolder    = "folder"
+	MatchAuto      = "auto"
 )
 
 // Set is an immutable list of enabled rules in config order.
@@ -70,12 +71,15 @@ type compiled struct {
 	// paths, or masks attached to the same rule.
 	primary    matcher
 	companions []matcher
-	action     string
-	proxy      string
-	index      int
-	children   bool
-	ks         bool
-	tcpOnly    bool
+	// excludes are companions that must not be picked up by this rule's
+	// install folder.
+	excludes []matcher
+	action   string
+	proxy    string
+	index    int
+	children bool
+	ks       bool
+	tcpOnly  bool
 }
 
 // Compile keeps enabled rules in order. Disabled rules are skipped. Pass
@@ -96,6 +100,12 @@ func Compile(rules []config.Rule) *Set {
 				continue
 			}
 			c.companions = append(c.companions, compileMatcher(raw))
+		}
+		for _, raw := range r.ExcludeCompanions {
+			if strings.Trim(strings.TrimSpace(raw), `"`) == "" {
+				continue
+			}
+			c.excludes = append(c.excludes, compileMatcher(raw))
 		}
 		out.rules = append(out.rules, c)
 	}
@@ -152,6 +162,37 @@ func (s *Set) Match(p Process) Decision {
 	return s.companion(p)
 }
 
+// IsExcluded reports whether the rule at ruleIndex (an index into the slice
+// passed to Compile) excludes p: p matches one of the rule's
+// ExcludeCompanions. Only the install-folder companion match consults it;
+// explicit MatchExact and MatchCompanion matches are unaffected.
+func (s *Set) IsExcluded(ruleIndex int, p Process) bool {
+	if s == nil {
+		return false
+	}
+	name := NormalizeName(p.Name)
+	if name == "" {
+		name = Base(p.Path)
+	}
+	path := NormalizePath(p.Path)
+	for _, r := range s.rules {
+		if r.index == ruleIndex {
+			return r.isExcluded(name, path)
+		}
+	}
+	return false
+}
+
+// isExcluded reports that name or path matches one of the rule's excludes.
+func (r compiled) isExcluded(name, path string) bool {
+	for _, m := range r.excludes {
+		if m.matches(name, path) {
+			return true
+		}
+	}
+	return false
+}
+
 // companion returns the first rule whose install folder holds p, or whose
 // companion's install folder holds it. Only rules that cover children take
 // part, so the existing "proxy child processes" switch controls this too.
@@ -168,6 +209,9 @@ func (s *Set) companion(p Process) Decision {
 	path := NormalizePath(p.Path)
 	for _, r := range s.rules {
 		if !r.children {
+			continue
+		}
+		if r.isExcluded(name, path) {
 			continue
 		}
 		if r.primary.dir != "" && inDir(path, r.primary.dir) {
@@ -568,4 +612,124 @@ func allDigits(s string) bool {
 		}
 	}
 	return true
+}
+
+// commonVendorTokens name a large software vendor on their own. A match is by
+// whole token, so "Samd LLC" does not name AMD and "Intelligent Systems" does
+// not name Intel.
+var commonVendorTokens = map[string]bool{
+	"microsoft": true, "google": true, "apple": true, "oracle": true,
+	"nvidia": true, "intel": true, "amd": true, "valve": true,
+	"adobe": true, "jetbrains": true, "ubisoft": true, "mozilla": true,
+	"amazon": true, "opera": true, "blizzard": true, "activision": true,
+}
+
+// commonVendorPhrases are multi-word vendor names; their tokens must appear
+// next to each other.
+var commonVendorPhrases = [][]string{
+	{"advanced", "micro", "devices"},
+	{"electronic", "arts"},
+	{"riot", "games"},
+	{"epic", "games"},
+	{"meta", "platforms"},
+}
+
+// IsCommonVendor reports that name looks like a large, well-known software
+// vendor ("NVIDIA Corporation", "Advanced Micro Devices, Inc."). Tokens are
+// compared whole, never as substrings.
+func IsCommonVendor(name string) bool {
+	tokens := vendorTokens(name)
+	for _, t := range tokens {
+		if commonVendorTokens[t] {
+			return true
+		}
+	}
+	for _, phrase := range commonVendorPhrases {
+		if hasTokenSeq(tokens, phrase) {
+			return true
+		}
+	}
+	return false
+}
+
+// vendorTokens lower-cases name and splits it on every non-letter, non-digit
+// rune, keeping short words so multi-word vendor phrases match exactly.
+func vendorTokens(name string) []string {
+	return strings.FieldsFunc(strings.ToLower(name), func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+	})
+}
+
+// hasTokenSeq reports that seq appears as consecutive tokens of tokens.
+func hasTokenSeq(tokens, seq []string) bool {
+	if len(seq) == 0 || len(seq) > len(tokens) {
+		return false
+	}
+	for i := 0; i+len(seq) <= len(tokens); i++ {
+		ok := true
+		for j, s := range seq {
+			if tokens[i+j] != s {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			return true
+		}
+	}
+	return false
+}
+
+// IsSystemPath reports that path lies inside a Windows folder (x:\windows or
+// below it). Program Files and WindowsApps are not system paths.
+func IsSystemPath(path string) bool {
+	p := NormalizePath(path)
+	if len(p) < 2 || p[1] != ':' {
+		return false
+	}
+	rest := p[2:]
+	return rest == `\windows` || strings.HasPrefix(rest, `\windows\`)
+}
+
+// serviceOrCOMAncestors start programs on behalf of the system, the task
+// scheduler, or a COM server. explorer.exe is deliberately absent: a program
+// started from the desktop is not a service's companion.
+var serviceOrCOMAncestors = map[string]bool{
+	"svchost.exe": true, "services.exe": true, "dllhost.exe": true,
+	"taskeng.exe": true, "taskhostw.exe": true, "wmiprvse.exe": true,
+}
+
+// IsServiceOrCOMAncestor reports that p was started by a service host, the
+// task scheduler, or a COM server rather than by an application.
+func IsServiceOrCOMAncestor(p Process) bool {
+	for _, a := range p.Parents {
+		name := NormalizeName(a.Name)
+		if name == "" {
+			name = NormalizeName(a.Path)
+		}
+		if serviceOrCOMAncestors[name] {
+			return true
+		}
+	}
+	return false
+}
+
+// NonVendorTokens returns path's tokens without the ones that also appear in
+// signer, so a product token can be told from a vendor token.
+func NonVendorTokens(path, signer string) []string {
+	tokens := PathTokens(path)
+	if signer == "" {
+		return tokens
+	}
+	vendor := make(map[string]bool)
+	for _, t := range PathTokens(signer) {
+		vendor[t] = true
+	}
+	out := make([]string, 0, len(tokens))
+	for _, t := range tokens {
+		if !vendor[t] {
+			out = append(out, t)
+		}
+	}
+	return out
 }

@@ -279,6 +279,21 @@ func (t *directTracker) pruneMatched(rs *rules.Set) {
 	}
 }
 
+// pruneKey forgets one program by key, when an auto match attributes it to a
+// rule. It marks the entry evicted so a cached direct address stops using it.
+func (t *directTracker) pruneKey(key string) {
+	if t == nil || key == "" {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if e := t.procs[key]; e != nil {
+		e.evicted.Store(true)
+		delete(t.procs, key)
+		t.gen++
+	}
+}
+
 // sweep drops programs that sent nothing for directIdle.
 func (t *directTracker) sweep(now time.Time) {
 	if t == nil {

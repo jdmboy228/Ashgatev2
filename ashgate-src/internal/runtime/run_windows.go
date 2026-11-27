@@ -79,10 +79,16 @@ func start(parent context.Context, cfg *config.Config, logs *logbuf.Buffer, brid
 	}
 
 	res := process.New()
-	eng, err := engine.New(cp, engine.Options{Logs: logs, Resolver: res})
+	ins := process.NewInspector()
+	eng, err := engine.New(cp, engine.Options{Logs: logs, Resolver: res, Inspector: ins})
 	if err != nil {
 		return nil, err
 	}
+	defer func() {
+		if !ok {
+			eng.Close()
+		}
+	}()
 	port4, err := relayPort(cp.Relay.TCP4)
 	if err != nil {
 		return nil, err
@@ -189,6 +195,7 @@ func start(parent context.Context, cfg *config.Config, logs *logbuf.Buffer, brid
 		}
 		wg.Wait()
 		_ = netH.Shutdown(windivert.ShutdownBoth)
+		eng.Close()
 		eng.Wait()
 		res.Close()
 		_ = div.close()

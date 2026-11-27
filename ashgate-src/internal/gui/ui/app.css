@@ -876,6 +876,7 @@ table.table { min-width: 560px; }
 .ap-sub-nm { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--tx); font-size: 13px; }
 .ap-origin { flex: none; font-style: normal; font-size: 11px; line-height: 16px; height: 18px; padding: 0 7px; border-radius: 9px; white-space: nowrap; }
 .ap-origin.bound { color: var(--c-teal); background: #3DD6C41F; }
+.ap-origin.auto { color: var(--c-violet); background: #B794F61F; }
 .ap-origin.child { color: var(--c-blue); background: #4CC2FF1F; }
 .ap-origin.folder { color: var(--c-orange); background: #FF7A451F; }
 .ap-origin.sys { color: var(--tx3); background: var(--neutral); }
@@ -885,6 +886,11 @@ table.table { min-width: 560px; }
   background: var(--neutral); color: var(--tx2); font-size: 11px; white-space: nowrap;
 }
 .ap-sub-mask:hover { background: var(--sub-h); color: var(--tx); }
+.ap-sub-exclude {
+  flex: none; height: 20px; padding: 0 7px; border-radius: 8px; border: 1px solid var(--stroke);
+  background: var(--neutral); color: var(--tx2); font-size: 11px; white-space: nowrap;
+}
+.ap-sub-exclude:hover { color: var(--c-orange); background: #FF7A451F; }
 .ap-sub-remove {
   flex: none; width: 22px; height: 22px; padding: 0; border: 0; border-radius: 6px; background: transparent;
   color: var(--tx3); display: grid; place-items: center;
@@ -896,6 +902,16 @@ table.table { min-width: 560px; }
   color: var(--tx2); font-size: 12px;
 }
 .ap-sub-add:hover { background: var(--sub-h); color: var(--tx); }
+.ap-sub-excluded {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
+  padding: 4px 6px 0; font-size: 11px; line-height: 16px; color: var(--tx3);
+}
+.ap-sub-excluded .lbl { flex: none; }
+.ap-sub-excl-chip {
+  flex: none; height: 20px; padding: 0 8px; border-radius: 10px; border: 1px solid var(--stroke);
+  background: var(--neutral); color: var(--tx2); font-size: 11px; white-space: nowrap;
+}
+.ap-sub-excl-chip:hover { color: var(--tx); background: var(--sub-h); }
 @container page (max-width: 719.98px) {
   .ap-sub-traffic { display: none; }
 }

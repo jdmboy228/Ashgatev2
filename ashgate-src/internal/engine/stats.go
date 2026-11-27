@@ -61,12 +61,15 @@ func (s *subProcStat) seenCounter() *atomic.Int64 {
 }
 
 // kindRank orders match kinds: a rule's own process and its companions are
-// more specific than a child or a folder match.
+// more specific than a child or a folder match, and an inferred match is the
+// weakest of all.
 func kindRank(kind string) int {
 	switch kind {
 	case rules.MatchExact, rules.MatchCompanion:
-		return 2
+		return 3
 	case rules.MatchChild, rules.MatchFolder:
+		return 2
+	case rules.MatchAuto:
 		return 1
 	}
 	return 0

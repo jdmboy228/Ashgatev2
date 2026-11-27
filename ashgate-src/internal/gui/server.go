@@ -410,19 +410,25 @@ func (c *controller) api(w http.ResponseWriter, r *http.Request) {
 		procs := append([]rules.Process(nil), c.liveProcs...)
 		ruleProcs := append([]rules.Process(nil), c.liveRuleProcs[key]...)
 		ins := c.inspector
+		if ins == nil {
+			// Create the inspector once and keep it: it caches file metadata
+			// and module lists, which a per-request inspector would re-read
+			// for every candidate.
+			ins = process.NewInspector()
+			c.inspector = ins
+		}
 		sess := c.sess
 		c.mu.Unlock()
-		if ins == nil {
-			ins = process.NewInspector()
-		}
 		if len(procs) == 0 {
 			procs = snapshotProcs()
 		}
 		var direct []engine.DirectProc
+		var autoMatches []engine.AutoMatch
 		if sess != nil && sess.Running() {
 			direct, _, _ = sess.DirectSnapshot()
+			autoMatches = sess.AutoMatches()
 		}
-		cands := rankCandidates(*found, eff, ruleProcs, direct, procs, ins, time.Now())
+		cands := rankCandidates(*found, eff, ruleProcs, direct, procs, ins, autoMatches, time.Now())
 		if cands == nil {
 			cands = []companionCandidate{}
 		}
@@ -691,14 +697,16 @@ func (c *controller) snapshotSince(since uint64) stateView {
 	now := time.Now()
 	running := c.sess != nil && c.sess.Running()
 	var stats map[string]engine.RuleStat
+	var autoMatches []engine.AutoMatch
 	var directCount int
 	if c.sess != nil {
 		stats = c.sess.RuleStats()
 		if running {
+			autoMatches = c.sess.AutoMatches()
 			directCount = c.sess.DirectCount(now, directRecent)
 		}
 	}
-	members := buildRuleMembers(cfg, stats, c.liveMembers)
+	members := buildRuleMembers(cfg, stats, c.liveMembers, autoMatches)
 	hints := c.hintsCache
 	if !running {
 		hints = nil

@@ -427,3 +427,152 @@ func TestCompanionDirSharedAndNonCDrives(t *testing.T) {
 		t.Fatalf("case-insensitive folder match: %+v", d)
 	}
 }
+
+func TestMatchAutoConstant(t *testing.T) {
+	if MatchAuto != "auto" {
+		t.Fatalf("MatchAuto = %q", MatchAuto)
+	}
+}
+
+func TestExcludeCompanions(t *testing.T) {
+	s := Compile([]config.Rule{{
+		Process: `C:\Games\Launcher\launcher.exe`,
+		Action:  "proxy", Proxy: "v",
+		ExcludeCompanions: []string{"crashpad.exe", `C:\Games\Launcher\updater.exe`, `C:\Games\Launcher\tools\*.tmp`},
+	}})
+	// IsExcluded matches by name, path, and glob mask.
+	excluded := []Process{
+		{Name: "crashpad.exe", Path: `C:\Games\Launcher\crashpad.exe`},
+		{Name: "updater.exe", Path: `C:\Games\Launcher\updater.exe`},
+		{Name: "cache.tmp", Path: `C:\Games\Launcher\tools\cache.tmp`},
+	}
+	for _, p := range excluded {
+		if !s.IsExcluded(0, p) {
+			t.Errorf("IsExcluded(%+v) = false", p)
+		}
+	}
+	if s.IsExcluded(0, Process{Name: "helper.exe", Path: `C:\Games\Launcher\helper.exe`}) {
+		t.Fatal("a normal companion is excluded")
+	}
+	if s.IsExcluded(7, Process{Name: "crashpad.exe"}) {
+		t.Fatal("unknown rule index excludes")
+	}
+	// Folder matching skips an excluded process but still covers others.
+	if d := s.Match(Process{Name: "crashpad.exe", Path: `C:\Games\Launcher\crashpad.exe`}); d.Action != "" {
+		t.Fatalf("excluded process matched by folder: %+v", d)
+	}
+	if d := s.Match(Process{Name: "updater.exe", Path: `C:\Games\Launcher\updater.exe`}); d.Action != "" {
+		t.Fatalf("excluded path matched by folder: %+v", d)
+	}
+	if d := s.Match(Process{Name: "helper.exe", Path: `C:\Games\Launcher\helper.exe`}); d.Action != "proxy" || d.MatchKind != MatchFolder {
+		t.Fatalf("normal folder companion: %+v", d)
+	}
+	// An explicit companion match is not affected by an exclude.
+	s = Compile([]config.Rule{{
+		Process:           `C:\Games\Launcher\launcher.exe`,
+		Companions:        []string{"crashpad.exe"},
+		ExcludeCompanions: []string{"crashpad.exe"},
+		Action:            "proxy", Proxy: "v",
+	}})
+	if d := s.Match(Process{Name: "crashpad.exe", Path: `D:\Elsewhere\crashpad.exe`}); d.Action != "proxy" || d.MatchKind != MatchCompanion {
+		t.Fatalf("exclude suppressed an explicit companion: %+v", d)
+	}
+}
+
+func TestIsCommonVendor(t *testing.T) {
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{"NVIDIA Corporation", true},
+		{"Advanced Micro Devices, Inc.", true},
+		{"Electronic Arts", true},
+		{"Riot Games, Inc.", true},
+		{"Epic Games", true},
+		{"Meta Platforms", true},
+		{"AMD", true},
+		{"Microsoft", true},
+		{"Valve Corporation", true},
+		{"  JetBrains s.r.o.  ", true},
+		// Whole tokens only: no substring of a name matches a vendor.
+		{"Samd LLC", false},
+		{"Intelligent Systems", false},
+		{"Amdocs", false},
+		{"Advanced Devices Micro", false},
+		{"", false},
+		{"Acme Studio", false},
+	}
+	for _, c := range cases {
+		if got := IsCommonVendor(c.in); got != c.want {
+			t.Errorf("IsCommonVendor(%q) = %v, want %v", c.in, got, c.want)
+		}
+	}
+}
+
+func TestIsSystemPath(t *testing.T) {
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{`C:\Windows\System32\svchost.exe`, true},
+		{`D:\WINDOWS\foo.exe`, true},
+		{`C:\Windows`, true},
+		{`C:\Windows\`, true},
+		{`\\?\C:\Windows\System32\x.exe`, true},
+		{`C:/Windows/System32/x.exe`, true},
+		{`C:\WindowsApps\app.exe`, false},
+		{`C:\Program Files\Windows\app.exe`, false},
+		{`C:\Program Files\WindowsApps\app.exe`, false},
+		{`C:\Users\me\windows\app.exe`, false},
+		{`C:\Windows10\app.exe`, false},
+		{`\\server\share\Windows\app.exe`, false},
+		{``, false},
+	}
+	for _, c := range cases {
+		if got := IsSystemPath(c.in); got != c.want {
+			t.Errorf("IsSystemPath(%q) = %v, want %v", c.in, got, c.want)
+		}
+	}
+}
+
+func TestIsServiceOrCOMAncestor(t *testing.T) {
+	yes := []Process{
+		{Name: "app.exe", Parents: []Process{{Name: "services.exe"}}},
+		{Name: "app.exe", Parents: []Process{{Name: "svchost.exe"}}},
+		{Name: "app.exe", Parents: []Process{{Name: "helper.exe"}, {Name: "dllhost.exe"}}},
+		{Name: "app.exe", Parents: []Process{{Name: "taskeng.exe"}}},
+		{Name: "app.exe", Parents: []Process{{Name: "taskhostw.exe"}}},
+		{Name: "app.exe", Parents: []Process{{Name: "wmiprvse.exe"}}},
+		// A parent known only by its path.
+		{Name: "app.exe", Parents: []Process{{Path: `C:\Windows\System32\svchost.exe`}}},
+	}
+	for _, p := range yes {
+		if !IsServiceOrCOMAncestor(p) {
+			t.Errorf("IsServiceOrCOMAncestor(%+v) = false", p)
+		}
+	}
+	no := []Process{
+		{Name: "app.exe"},
+		{Name: "app.exe", Parents: []Process{{Name: "explorer.exe"}}},
+		{Name: "app.exe", Parents: []Process{{Name: "launcher.exe"}, {Name: "chrome.exe"}}},
+	}
+	for _, p := range no {
+		if IsServiceOrCOMAncestor(p) {
+			t.Errorf("IsServiceOrCOMAncestor(%+v) = true", p)
+		}
+	}
+}
+
+func TestNonVendorTokens(t *testing.T) {
+	got := NonVendorTokens(`C:\Program Files\NVIDIA Corporation\NVIDIA Overlay\overlay.exe`, "NVIDIA Corporation")
+	if strings.Join(got, ",") != "overlay" {
+		t.Fatalf("NonVendorTokens = %v, want [overlay]", got)
+	}
+	all := NonVendorTokens(`C:\Apps\Acme\Tool\tool.exe`, "")
+	if strings.Join(all, ",") != "acme,tool" {
+		t.Fatalf("NonVendorTokens without signer = %v", all)
+	}
+	if got := NonVendorTokens(`C:\Apps\Acme\Tool\tool.exe`, "Acme Tool"); len(got) != 0 {
+		t.Fatalf("all tokens are vendor tokens: %v", got)
+	}
+}

@@ -395,8 +395,40 @@ function apAttachCompanion(ruleIdx, rawPathOrMask, mask) {
   if (dup) { showToast(`${apLabel(pattern)} уже связан с этим правилом`); return false; }
   if (!Array.isArray(r.companions)) r.companions = [];
   r.companions.push(pattern);
+  // A process the user binds by hand is no longer excluded from auto-pickup.
+  if (Array.isArray(r.exclude_companions)) {
+    r.exclude_companions = r.exclude_companions.filter((c) => apKey(c) !== key);
+    if (!r.exclude_companions.length) delete r.exclude_companions;
+  }
   apDismissedHints.delete(apKey(r.process));
   return apSave(`${apLabel(pattern)} подключён к правилу «${apLabel(r.process)}»`);
+}
+// apExcludeCompanion keeps a process out of the rule's auto-pickup without
+// binding it: an auto-matched neighbor the user does not want routed here.
+function apExcludeCompanion(ruleIdx, rawPath) {
+  const r = (cfg().rules || [])[ruleIdx];
+  if (!r) return false;
+  const pattern = String(rawPath || "").trim().replace(/^"+|"+$/g, "");
+  if (!pattern) return false;
+  if (!Array.isArray(r.exclude_companions)) r.exclude_companions = [];
+  const key = apKey(pattern);
+  if (r.exclude_companions.some((c) => apKey(c) === key)) {
+    showToast(`${apLabel(pattern)} уже исключён из авто-подхвата`);
+    return false;
+  }
+  r.exclude_companions.push(pattern);
+  return apSave(`${apLabel(pattern)} исключён из авто-подхвата правила «${apLabel(r.process)}»`);
+}
+function apUnexcludeCompanion(ruleIdx, pattern) {
+  const r = (cfg().rules || [])[ruleIdx];
+  if (!r || !Array.isArray(r.exclude_companions)) return false;
+  const key = apKey(pattern);
+  const at = r.exclude_companions.findIndex((c) => apKey(c) === key);
+  if (at < 0) return false;
+  const name = apLabel(r.exclude_companions[at]);
+  r.exclude_companions.splice(at, 1);
+  if (!r.exclude_companions.length) delete r.exclude_companions;
+  return apSave(`${name} возвращён в авто-подхват правила «${apLabel(r.process)}»`);
 }
 function apRemoveCompanion(ruleIdx, pattern) {
   const r = (cfg().rules || [])[ruleIdx];
@@ -448,15 +480,22 @@ function apRuleHTML(i, inGroup) {
   return `<div class="ap-unit-wrap${open && members.length ? " open" : ""}" data-key="${esc(key)}">${card}${sub}${hint}</div>`;
 }
 
-// apSubListHTML is the drawer under a rule: its saved companions and the
-// processes it catches. It is a view of live data, not part of config.
+// apSubListHTML is the drawer under a rule: its saved companions, the
+// processes the auto matcher found, and those it catches. It is a view of
+// live data, not part of config, except the exclude list, which the user
+// edits here.
 function apSubListHTML(i, members) {
+  const r = (cfg().rules || [])[i];
+  const ex = r && Array.isArray(r.exclude_companions) ? r.exclude_companions : [];
+  const exHTML = ex.length
+    ? `<div class="ap-sub-excluded"><span class="lbl">Исключены:</span>${ex.map((pat) => `<button type="button" class="ap-sub-excl-chip" data-act="ap-sub-unexclude" data-i="${i}" data-pat="${esc(pat)}" title="Вернуть в авто-подхват: ${esc(pat)}">${esc(apLabel(pat))} ×</button>`).join("")}</div>`
+    : "";
   return `<div class="ap-sublist">${members.map((m, idx) => apSubRowHTML(i, m, idx)).join("")}
-    <button type="button" class="ap-sub-add" data-act="ap-companions" data-i="${i}">${icon("plus", 14)}Подключить процесс / Найти трафик…</button></div>`;
+    <button type="button" class="ap-sub-add" data-act="ap-companions" data-i="${i}">${icon("plus", 14)}Подключить процесс / Найти трафик…</button>${exHTML}</div>`;
 }
 function apSubRowHTML(i, m, idx) {
-  const kind = m.kind === "companion" || m.kind === "folder" ? m.kind : "child";
-  const origin = kind === "companion" ? "привязан" : kind === "folder" ? "папка" : "дочерний";
+  const kind = m.kind === "companion" || m.kind === "folder" || m.kind === "auto" ? m.kind : "child";
+  const origin = kind === "companion" ? "привязан" : kind === "folder" ? "папка" : kind === "auto" ? "авто" : "дочерний";
   const label = m.name || apLabel(m.path || m.pattern || "");
   const full = m.path || m.pattern || m.name || "";
   let stateText;
@@ -470,15 +509,21 @@ function apSubRowHTML(i, m, idx) {
   const maskBtn = kind === "companion" && m.mask
     ? `<button type="button" class="ap-sub-mask" data-act="ap-sub-mask" data-i="${i}" data-pat="${esc(m.pattern || m.path || m.name || "")}" data-mask="${esc(m.mask)}" title="Обобщить путь для обновлений: ${esc(m.mask)}">версия</button>`
     : "";
+  const exclude = kind === "auto"
+    ? `<button type="button" class="ap-sub-exclude" data-act="ap-sub-exclude" data-i="${i}" data-pat="${esc(m.path || m.name)}" title="Исключить из авто-подхвата для этого правила">Исключить</button>`
+    : "";
   const remove = kind === "companion"
     ? `<button type="button" class="ap-sub-remove" data-act="ap-sub-remove" data-i="${i}" data-pat="${esc(m.pattern || m.path || m.name || "")}" title="Отвязать процесс" aria-label="Отвязать процесс">${icon("close", 12)}</button>`
     : "";
+  const originHTML = kind === "auto"
+    ? `<em class="ap-origin auto" title="${esc(m.reason || "Найден автоматически")}">${origin}</em>`
+    : `<em class="ap-origin ${kind === "companion" ? "bound" : kind === "folder" ? "folder" : "child"}">${origin}</em>`;
   return `<div class="ap-sub-row">
     <span class="ap-sub-ic">${appIconHTML(full, "width:20px;height:20px;border-radius:6px;font-size:9px")}</span>
     <span class="ap-sub-nm" title="${esc(full)}">${esc(label)}</span>
-    <em class="ap-origin ${kind === "companion" ? "bound" : kind === "folder" ? "folder" : "child"}">${origin}</em>
+    ${originHTML}
     <span class="ap-sub-traffic" data-tele="${teleKey}"></span>
-    ${maskBtn}${remove}
+    ${maskBtn}${exclude}${remove}
   </div>`;
 }
 
@@ -689,6 +734,10 @@ function appsClick(id, act) {
       return apGeneralizeCompanion(i, act.dataset.pat || "", act.dataset.mask || "");
     case "ap-sub-remove":
       return apRemoveCompanion(i, act.dataset.pat || "");
+    case "ap-sub-exclude":
+      return apExcludeCompanion(i, act.dataset.pat || "");
+    case "ap-sub-unexclude":
+      return apUnexcludeCompanion(i, act.dataset.pat || "");
     case "ap-companions":
       return apOpenCompanions(i);
     case "ap-hint-attach":

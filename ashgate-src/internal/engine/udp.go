@@ -411,6 +411,22 @@ func (e *Engine) udpFlowMatchesLocked(flow *udpFlow, snap *snapshot) bool {
 		wantSys = true
 	} else {
 		dec := snap.rules.Match(flow.proc)
+		if dec.Action == "" && e.auto != nil && !rules.IsSystemDNS(flow.proc.Name) && flow.proc.PID != 4 && (flow.proc.Name != "" || flow.proc.Path != "") {
+			// The process reached the proxy through an auto match, not a rule
+			// of its own; keep the flow while the same rule/proxy still
+			// applies (see auto.go).
+			if am, ok, _, _ := e.auto.lookup(flow.proc); ok && !snap.rules.IsExcluded(am.RuleIndex, flow.proc) && e.autoCompatible(snap, am) {
+				dec = rules.Decision{
+					Action:     am.Action,
+					Proxy:      am.Proxy,
+					RuleIndex:  am.RuleIndex,
+					MatchKind:  rules.MatchAuto,
+					Parent:     am.RuleName,
+					KillSwitch: am.KillSwitch,
+					TCPOnly:    am.TCPOnly,
+				}
+			}
+		}
 		if dec.Action == "" && (rules.IsSystemDNS(flow.proc.Name) || flow.proc.PID == 4 || (flow.proc.Name == "" && flow.proc.Path == "")) {
 			switch {
 			case dns:

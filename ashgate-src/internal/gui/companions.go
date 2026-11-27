@@ -17,20 +17,23 @@ import (
 type metaInspector interface {
 	FileMetadata(path string) process.FileMeta
 	CommandLine(pid uint32, started int64) string
+	HasModuleInDirs(pid uint32, started int64, dirs []string) bool
 }
 
-// ruleMemberView is one companion, child, or folder member of a rule, as the
-// Apps tab shows it under the rule's row.
+// ruleMemberView is one companion, auto-matched, child, or folder member of a
+// rule, as the Apps tab shows it under the rule's row.
 type ruleMemberView struct {
 	Name    string `json:"name"`
 	Path    string `json:"path,omitempty"`
 	Pattern string `json:"pattern,omitempty"`
-	Kind    string `json:"kind"` // "companion" | "child" | "folder"
+	Kind    string `json:"kind"` // "companion" | "auto" | "child" | "folder"
 	Alive   bool   `json:"alive"`
 	Flows   int64  `json:"flows"`
 	Up      int64  `json:"up"`
 	Down    int64  `json:"down"`
 	Mask    string `json:"mask,omitempty"`
+	// Reason is the signal that auto-attributed the process, if it was.
+	Reason string `json:"reason,omitempty"`
 }
 
 // companionCandidate is a running or recently direct program the user can
@@ -70,10 +73,11 @@ const (
 	candidateLimit = 80
 )
 
-// buildRuleMembers merges what the config saved, what is running now, and
-// what the engine counted into one list per rule. The rule's own process is
-// not repeated in the list (the engine reports it as an exact match).
-func buildRuleMembers(cfg *config.Config, stats map[string]engine.RuleStat, live map[string][]liveMember) map[string][]ruleMemberView {
+// buildRuleMembers merges what the config saved, what the auto matcher
+// attributed, what is running now, and what the engine counted into one list
+// per rule. The rule's own process is not repeated in the list (the engine
+// reports it as an exact match).
+func buildRuleMembers(cfg *config.Config, stats map[string]engine.RuleStat, live map[string][]liveMember, auto []engine.AutoMatch) map[string][]ruleMemberView {
 	if cfg == nil {
 		return nil
 	}
@@ -120,6 +124,67 @@ func buildRuleMembers(cfg *config.Config, stats map[string]engine.RuleStat, live
 			}
 			return -1
 		}
+		// autoFor finds the auto row an auto match or a live/stat process
+		// still belongs to, so it is not listed twice.
+		autoFor := func(name, path string) int {
+			for i := range list {
+				if list[i].Kind != rules.MatchAuto {
+					continue
+				}
+				if sameProc(list[i].Path, list[i].Name, path, name) {
+					return i
+				}
+			}
+			return -1
+		}
+		autoReason := func(name, path string) string {
+			for _, am := range auto {
+				if am.RuleKey != key {
+					continue
+				}
+				if sameProc(am.Proc.Path, am.Proc.Name, path, name) {
+					return am.Reason
+				}
+			}
+			return ""
+		}
+		for _, am := range auto {
+			if am.RuleKey != key {
+				continue
+			}
+			p := am.Proc
+			if i := savedFor(p.Name, p.Path); i >= 0 {
+				v := &list[i]
+				v.Alive = true
+				if p.Path != "" {
+					v.Path = p.Path
+				}
+				if p.Name != "" {
+					v.Name = p.Name
+				}
+				continue
+			}
+			i := autoFor(p.Name, p.Path)
+			if i < 0 {
+				i = len(list)
+				list = append(list, ruleMemberView{Kind: rules.MatchAuto})
+			}
+			v := &list[i]
+			v.Kind = rules.MatchAuto
+			v.Alive = true
+			v.Reason = am.Reason
+			if p.Path != "" {
+				v.Path = p.Path
+				if mask, ok := rules.VersionMask(p.Path); ok {
+					v.Mask = mask
+				}
+			}
+			if p.Name != "" {
+				v.Name = p.Name
+			} else if v.Name == "" {
+				v.Name = displayBase(p.Path)
+			}
+		}
 		for _, m := range live[key] {
 			if i := savedFor(m.Name, m.Path); i >= 0 {
 				v := &list[i]
@@ -130,6 +195,12 @@ func buildRuleMembers(cfg *config.Config, stats map[string]engine.RuleStat, live
 				if m.Name != "" {
 					v.Name = m.Name
 				}
+				continue
+			}
+			// A process the auto matcher already attributed keeps its auto
+			// row; a live match only confirms it is running.
+			if i := autoFor(m.Name, m.Path); i >= 0 {
+				list[i].Alive = true
 				continue
 			}
 			name := m.Name
@@ -145,6 +216,9 @@ func buildRuleMembers(cfg *config.Config, stats map[string]engine.RuleStat, live
 			// Match against compiled saved companions first so glob companions
 			// (e.g. app-*\helper.exe) merge stats even when not currently live.
 			idx := savedFor(p.Name, p.Path)
+			if idx < 0 {
+				idx = autoFor(p.Name, p.Path)
+			}
 			if idx < 0 {
 				for i := range list {
 					if sameProc(list[i].Path, list[i].Name, p.Path, p.Name) {
@@ -163,14 +237,21 @@ func buildRuleMembers(cfg *config.Config, stats map[string]engine.RuleStat, live
 				if list[idx].Kind == "" {
 					list[idx].Kind = memberKind(p.Kind)
 				}
+				if list[idx].Reason == "" {
+					list[idx].Reason = autoReason(p.Name, p.Path)
+				}
 				continue
 			}
 			name := p.Name
 			if name == "" {
 				name = displayBase(p.Path)
 			}
+			var mask string
+			if p.Path != "" {
+				mask, _ = rules.VersionMask(p.Path)
+			}
 			list = append(list, ruleMemberView{
-				Name: name, Path: p.Path, Kind: memberKind(p.Kind),
+				Name: name, Path: p.Path, Kind: memberKind(p.Kind), Reason: autoReason(p.Name, p.Path), Mask: mask,
 				Flows: p.Flows, Up: p.Up, Down: p.Down,
 			})
 		}
@@ -189,23 +270,26 @@ func buildRuleMembers(cfg *config.Config, stats map[string]engine.RuleStat, live
 // memberKind normalizes an engine or live match kind for the page.
 func memberKind(kind string) string {
 	switch kind {
-	case "companion", "child", "folder":
+	case "companion", "child", "folder", rules.MatchAuto:
 		return kind
 	}
 	return "child"
 }
 
-// memberKindRank puts saved companions first; they are what the user chose.
+// memberKindRank puts saved companions first (what the user chose), then the
+// processes the auto matcher found unprompted, then the inherited children.
 func memberKindRank(kind string) int {
 	switch kind {
 	case "companion":
 		return 0
-	case "child":
+	case rules.MatchAuto:
 		return 1
-	case "folder":
+	case "child":
 		return 2
+	case "folder":
+		return 3
 	}
-	return 3
+	return 4
 }
 
 func sortRuleMembers(list []ruleMemberView) {
@@ -265,27 +349,11 @@ func sameProc(pathA, nameA, pathB, nameB string) bool {
 	return na != "" && na == nameKey(nameB)
 }
 
-// commonVendors sign platforms widely used by many programs; a shared
-// publisher there is weak evidence of the same application.
-var commonVendors = []string{"microsoft", "google", "apple", "oracle", "nvidia", "intel", "amd", "valve", "adobe"}
-
-func isCommonVendor(s string) bool {
-	s = strings.ToLower(s)
-	if s == "" {
-		return false
-	}
-	for _, v := range commonVendors {
-		if strings.Contains(s, v) {
-			return true
-		}
-	}
-	return false
-}
-
 // rankCandidates scores the programs that could be a missing companion of
 // rule. directProcs carried traffic no rule matched; runningProcs is the
-// whole process list. Processes the rule already covers are left out.
-func rankCandidates(rule config.Rule, allRules []config.Rule, ruleRunning []rules.Process, directProcs []engine.DirectProc, runningProcs []rules.Process, ins metaInspector, now time.Time) []companionCandidate {
+// whole process list. Processes the rule already covers, and those the auto
+// matcher already attributes to it, are left out.
+func rankCandidates(rule config.Rule, allRules []config.Rule, ruleRunning []rules.Process, directProcs []engine.DirectProc, runningProcs []rules.Process, ins metaInspector, autoMatches []engine.AutoMatch, now time.Time) []companionCandidate {
 	if ins == nil {
 		ins = process.NewInspector()
 	}
@@ -293,6 +361,21 @@ func rankCandidates(rule config.Rule, allRules []config.Rule, ruleRunning []rule
 	rc := rule
 	rc.Enabled, rc.Action, rc.Proxy = &on, "direct", ""
 	ruleSet := rules.Compile([]config.Rule{rc})
+	ruleKeyNow := ruleKey(rule.Process)
+	autoCovered := func(p rules.Process) bool {
+		for _, am := range autoMatches {
+			if am.RuleKey != ruleKeyNow {
+				continue
+			}
+			if am.Proc.PID != 0 && p.PID != 0 && am.Proc.PID == p.PID {
+				return true
+			}
+			if sameProc(am.Proc.Path, am.Proc.Name, p.Path, p.Name) {
+				return true
+			}
+		}
+		return false
+	}
 
 	var others []config.Rule
 	for _, r := range allRules {
@@ -320,7 +403,7 @@ func rankCandidates(rule config.Rule, allRules []config.Rule, ruleRunning []rule
 			continue
 		}
 		p := rules.Process{Name: dp.Name, Path: dp.Path, PID: dp.PID, Started: dp.Started}
-		if isSelf(dp.Path, dp.Name) || covered(p) {
+		if isSelf(dp.Path, dp.Name) || covered(p) || autoCovered(p) {
 			continue
 		}
 		key := procKey(dp.Path, dp.Name)
@@ -359,7 +442,7 @@ func rankCandidates(rule config.Rule, allRules []config.Rule, ruleRunning []rule
 		if p.Path == "" && p.Name == "" {
 			continue
 		}
-		if isSelf(p.Path, p.Name) || covered(p) {
+		if isSelf(p.Path, p.Name) || covered(p) || autoCovered(p) {
 			continue
 		}
 		key := procKey(p.Path, p.Name)
@@ -450,10 +533,14 @@ func rankCandidates(rule config.Rule, allRules []config.Rule, ruleRunning []rule
 	for _, p := range ruleRunning {
 		takeMeta(p.Path)
 	}
-	var ruleStarted int64
+	// Every start time the rule's processes have, the rule's own and its
+	// running children alike: a helper the launcher starts one second after
+	// itself is still "started with the program", even when the launcher has
+	// been up for hours.
+	var ruleStarts []int64
 	for _, p := range ruleRunning {
-		if p.Started != 0 && (ruleStarted == 0 || p.Started < ruleStarted) {
-			ruleStarted = p.Started
+		if p.Started != 0 {
+			ruleStarts = append(ruleStarts, p.Started)
 		}
 	}
 	ruleExe := nameKey(rule.Process)
@@ -491,10 +578,20 @@ func rankCandidates(rule config.Rule, allRules []config.Rule, ruleRunning []rule
 					}
 				}
 			}
+			if len(ruleDirs) > 0 && v.PID > 4 && ins != nil && ins.HasModuleInDirs(v.PID, c.started, ruleDirs) {
+				score += 60
+				reasons = append(reasons, "Загружает модуль программы")
+			}
 			signer := strings.TrimSpace(ruleMeta.Signer)
 			candSigner := strings.TrimSpace(candMeta.Signer)
-			common := isCommonVendor(ruleMeta.Signer) || isCommonVendor(ruleMeta.Company) || isCommonVendor(ruleMeta.Product)
-			if signer != "" && candSigner != "" && strings.EqualFold(signer, candSigner) {
+			common := rules.IsCommonVendor(ruleMeta.Signer) || rules.IsCommonVendor(ruleMeta.Company) || rules.IsCommonVendor(ruleMeta.Product)
+			// A shared certificate thumbprint is stronger than a shared
+			// publisher string: two programs may print the same vendor name
+			// without sharing a signing certificate.
+			sameCert := ruleMeta.CertThumbprint != "" && candMeta.CertThumbprint != "" &&
+				strings.EqualFold(ruleMeta.CertThumbprint, candMeta.CertThumbprint)
+			sameSigner := sameCert || (signer != "" && candSigner != "" && strings.EqualFold(signer, candSigner))
+			if sameSigner {
 				if common {
 					score += 10
 				} else {
@@ -536,12 +633,18 @@ func rankCandidates(rule config.Rule, allRules []config.Rule, ruleRunning []rule
 					reasons = append(reasons, "Недавний трафик напрямую")
 				}
 			}
-			if ruleStarted > 0 && c.started > 0 {
-				d := c.started - ruleStarted
-				if d < 0 {
-					d = -d
+			if c.started > 0 && len(ruleStarts) > 0 {
+				best := int64(-1)
+				for _, ts := range ruleStarts {
+					d := c.started - ts
+					if d < 0 {
+						d = -d
+					}
+					if best < 0 || d < best {
+						best = d
+					}
 				}
-				if d <= int64(90*time.Second) {
+				if best >= 0 && best <= int64(90*time.Second) {
 					score += 15
 					reasons = append(reasons, "Запущен вместе с программой")
 				}
@@ -580,13 +683,22 @@ func rankCandidates(rule config.Rule, allRules []config.Rule, ruleRunning []rule
 	return out
 }
 
+// candidateExcluded reports that the user excluded the candidate from this
+// rule's auto-pickup, so it must not be suggested again.
+func candidateExcluded(ruleSet *rules.Set, c companionCandidate) bool {
+	if ruleSet == nil {
+		return false
+	}
+	return ruleSet.IsExcluded(0, rules.Process{Name: c.Name, Path: c.Path, PID: c.PID})
+}
+
 // topCandidate returns the best non-system candidate when it is strong
 // enough to suggest, and nil otherwise. System entries are last, but are
 // skipped explicitly so they never become a suggestion. Candidates with
-// high affinity but zero traffic or already bound to another rule are
-// skipped rather than stopping the search, so the best active direct
-// candidate still surfaces.
-func topCandidate(cands []companionCandidate) *companionCandidate {
+// high affinity but zero traffic, already bound to another rule, or
+// excluded from this rule are skipped rather than stopping the search, so
+// the best active direct candidate still surfaces.
+func topCandidate(cands []companionCandidate, ruleSet *rules.Set) *companionCandidate {
 	for i := range cands {
 		if cands[i].System {
 			continue
@@ -595,7 +707,34 @@ func topCandidate(cands []companionCandidate) *companionCandidate {
 		if c.Score < 45 {
 			return nil
 		}
+		if candidateExcluded(ruleSet, c) {
+			continue
+		}
 		if (c.Conns > 0 || c.Bytes > 0) && c.OtherRule == "" {
+			return &c
+		}
+	}
+	return nil
+}
+
+// strongCandidate returns a candidate strong enough to suggest even while
+// the rule's own application still moves a little traffic (a launcher that
+// sent a burst before its child took over). It needs a high score and real
+// traffic, so a merely quiet rule does not turn every stray program into a
+// hint.
+func strongCandidate(cands []companionCandidate, ruleSet *rules.Set) *companionCandidate {
+	for i := range cands {
+		if cands[i].System {
+			continue
+		}
+		c := cands[i]
+		if c.Score < 65 {
+			return nil
+		}
+		if c.OtherRule != "" || candidateExcluded(ruleSet, c) {
+			continue
+		}
+		if c.Conns >= 2 || c.Bytes >= 16384 {
 			return &c
 		}
 	}
@@ -659,6 +798,7 @@ func (c *controller) refreshHints() {
 
 	go func() {
 		now := time.Now()
+		autoMatches := sess.AutoMatches()
 		directProcs, _, _ := sess.DirectSnapshot()
 		recent := make([]engine.DirectProc, 0, len(directProcs))
 		for _, dp := range directProcs {
@@ -702,14 +842,22 @@ func (c *controller) refreshHints() {
 					continue
 				}
 				st := stats[k]
-				if st.Flows != 0 || st.Up+st.Down >= 4096 {
+				quiet := st.Flows == 0 && st.Up+st.Down < 4096
+				cands := rankCandidates(r, rs, ruleProcs[k], recent, recentRunning, ins, autoMatches, now)
+				set := rules.Compile([]config.Rule{r})
+				if quiet {
+					if best := topCandidate(cands, set); best != nil {
+						hints[k] = ruleHintView{TopCandidate: best}
+					} else {
+						hints[k] = ruleHintView{Quiet: true}
+					}
 					continue
 				}
-				cands := rankCandidates(r, rs, ruleProcs[k], recent, recentRunning, ins, now)
-				if best := topCandidate(cands); best != nil {
+				// The rule is not quiet, but a launcher may already have sent a
+				// burst of its own before the child took over. A strong direct
+				// candidate is still worth suggesting; "quiet" never is.
+				if best := strongCandidate(cands, set); best != nil {
 					hints[k] = ruleHintView{TopCandidate: best}
-				} else {
-					hints[k] = ruleHintView{Quiet: true}
 				}
 			}
 		}

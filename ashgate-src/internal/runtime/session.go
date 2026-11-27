@@ -118,6 +118,15 @@ func (s *Session) RelayHealth(proxy string, since time.Time) engine.RelayHealth 
 	return s.eng.RelayHealth(proxy, since)
 }
 
+// AutoMatches returns the processes the auto matcher currently attributes to
+// rules. Empty when the engine has no inspector.
+func (s *Session) AutoMatches() []engine.AutoMatch {
+	if s == nil || s.eng == nil {
+		return nil
+	}
+	return s.eng.AutoMatches()
+}
+
 // DirectSnapshot returns the programs whose traffic went direct without a
 // matching rule, their event feed, and the feed's generation.
 func (s *Session) DirectSnapshot() ([]engine.DirectProc, []logbuf.Event, uint64) {

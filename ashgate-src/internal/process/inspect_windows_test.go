@@ -100,10 +100,12 @@ func TestInspectorZeroValueAndConcurrency(t *testing.T) {
 	pid := uint32(os.Getpid())
 	started := selfCreationTime(t)
 	cmdExe := filepath.Join(os.Getenv("SystemRoot"), "System32", "cmd.exe")
+	dirs := []string{`C:\Windows`}
 
 	if got := ins.CommandLine(pid, started); got == "" {
 		t.Fatal("zero-value Inspector.CommandLine returned empty")
 	}
+	_ = ins.HasModuleInDirs(pid, started, dirs)
 
 	// Verify concurrent reads/writes are race-free under -race.
 	var wg sync.WaitGroup
@@ -114,10 +116,126 @@ func TestInspectorZeroValueAndConcurrency(t *testing.T) {
 			for j := 0; j < 20; j++ {
 				_ = ins.CommandLine(pid, started)
 				_ = ins.FileMetadata(cmdExe)
+				_ = ins.HasModuleInDirs(pid, started, dirs)
 			}
 		}()
 	}
 	wg.Wait()
+}
+
+// findEmbeddedSignedSystemBinary returns a system binary that carries an
+// embedded Authenticode signature. Many Windows binaries are only
+// catalog-signed, so known candidates are tried first and a bounded scan of
+// System32 .exe files follows.
+func findEmbeddedSignedSystemBinary(t *testing.T) (string, FileMeta) {
+	t.Helper()
+	ins := NewInspector()
+	sys32 := filepath.Join(os.Getenv("SystemRoot"), "System32")
+	candidates := []string{
+		filepath.Join(sys32, "ApplicationFrameHost.exe"),
+		filepath.Join(sys32, "ApplyTrustOffline.exe"),
+		filepath.Join(sys32, "AuthHost.exe"),
+		filepath.Join(sys32, "notepad.exe"),
+		filepath.Join(sys32, "cmd.exe"),
+		filepath.Join(sys32, "WindowsPowerShell", "v1.0", "powershell.exe"),
+	}
+	tryPath := func(path string) (string, FileMeta, bool) {
+		if _, err := os.Stat(path); err != nil {
+			return "", FileMeta{}, false
+		}
+		if meta := ins.FileMetadata(path); meta.Signer != "" {
+			return path, meta, true
+		}
+		return "", FileMeta{}, false
+	}
+	for _, path := range candidates {
+		if p, meta, ok := tryPath(path); ok {
+			return p, meta
+		}
+	}
+	entries, err := os.ReadDir(sys32)
+	if err != nil {
+		return "", FileMeta{}
+	}
+	for i, e := range entries {
+		if i >= 250 {
+			break
+		}
+		if e.IsDir() || filepath.Ext(e.Name()) != ".exe" {
+			continue
+		}
+		if p, meta, ok := tryPath(filepath.Join(sys32, e.Name())); ok {
+			return p, meta
+		}
+	}
+	return "", FileMeta{}
+}
+
+func TestFileMetadataCertThumbprint(t *testing.T) {
+	ins := NewInspector()
+	path, meta := findEmbeddedSignedSystemBinary(t)
+	if path == "" {
+		t.Skip("no system binary with an embedded Authenticode signature found")
+	}
+	if meta.CertThumbprint == "" {
+		t.Fatalf("FileMetadata(%s).CertThumbprint is empty for signer %q", path, meta.Signer)
+	}
+	if len(meta.CertThumbprint) != 64 {
+		t.Fatalf("CertThumbprint length = %d, want 64 (%q)", len(meta.CertThumbprint), meta.CertThumbprint)
+	}
+	for _, c := range meta.CertThumbprint {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			t.Fatalf("CertThumbprint %q is not lowercase hex", meta.CertThumbprint)
+		}
+	}
+	// The cached repeat call must return the identical thumbprint.
+	if again := ins.FileMetadata(path); again.CertThumbprint != meta.CertThumbprint {
+		t.Errorf("cached CertThumbprint = %q, want %q", again.CertThumbprint, meta.CertThumbprint)
+	}
+}
+
+func TestHasModuleInDirsSelf(t *testing.T) {
+	ins := NewInspector()
+	pid := uint32(os.Getpid())
+	started := selfCreationTime(t)
+
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+		exe = resolved
+	}
+	selfDir := filepath.Dir(exe)
+	parentDir := filepath.Dir(selfDir)
+
+	if dirs, err := queryModuleDirsErr(pid, started); err != nil || len(dirs) == 0 {
+		t.Fatalf("queryModuleDirsErr(self) = (%v, %v), want a non-empty list", dirs, err)
+	}
+	// A wrong creation time (PID reuse guard) must reject the query.
+	if dirs, err := queryModuleDirsErr(pid, started+int64(time.Minute)); err == nil || len(dirs) != 0 {
+		t.Fatalf("mismatched started should fail, got (%v, %v)", dirs, err)
+	}
+
+	if !ins.HasModuleInDirs(pid, started, []string{selfDir}) {
+		t.Errorf("HasModuleInDirs(self, %q) = false, want true", selfDir)
+	}
+	// Cached path must still answer the same way.
+	if !ins.HasModuleInDirs(pid, started, []string{selfDir}) {
+		t.Errorf("cached HasModuleInDirs(self, %q) = false, want true", selfDir)
+	}
+	if !ins.HasModuleInDirs(pid, started, []string{parentDir}) {
+		t.Errorf("HasModuleInDirs(self, %q) = false, want true", parentDir)
+	}
+	if ins.HasModuleInDirs(pid, started, []string{`C:\does-not-exist-ashgate-dir`}) {
+		t.Error("HasModuleInDirs with a nonexistent dir = true, want false")
+	}
+	if ins.HasModuleInDirs(4, started, []string{`C:\Windows`}) {
+		t.Error("HasModuleInDirs(pid=4) = true, want false")
+	}
+	if ins.HasModuleInDirs(pid, started, nil) {
+		t.Error("HasModuleInDirs with no dirs = true, want false")
+	}
 }
 
 func TestInspectorNoHandleLeaks(t *testing.T) {
@@ -136,7 +254,8 @@ func TestInspectorNoHandleLeaks(t *testing.T) {
 	// Call underlying uncached functions repeatedly to ensure every handle/store/msg is closed.
 	for i := 0; i < 100; i++ {
 		_, _ = queryCommandLineErr(pid, 0)
-		_ = readAuthenticodeSigner(cmdExe)
+		_, _ = queryModuleDirsErr(pid, 0)
+		_, _ = readAuthenticodeSigner(cmdExe)
 		_, _, _ = readVersionStrings(cmdExe)
 	}
 	after, ok := getHandles()

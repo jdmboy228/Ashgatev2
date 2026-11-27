@@ -235,6 +235,9 @@ type Rule struct {
 	// same application rule (for example, a service-started VM process outside
 	// the app's process tree and install folder).
 	Companions []string `json:"companions,omitempty"`
+	// ExcludeCompanions are executables, paths, or glob masks that must not be
+	// picked up as companions of this rule by its install folder.
+	ExcludeCompanions []string `json:"exclude_companions,omitempty"`
 }
 
 // Group is a named set of rules with one switch and one route.
@@ -270,6 +273,7 @@ func (c *Config) EffectiveRules() []Rule {
 		}
 		r.KillSwitch = &ks
 		r.Companions = cloneStrings(r.Companions)
+		r.ExcludeCompanions = cloneStrings(r.ExcludeCompanions)
 		out[i] = r
 	}
 	return out
@@ -477,17 +481,11 @@ func (c *Config) Validate() error {
 		if maskBase(r.Process) == "svchost.exe" {
 			return fmt.Errorf("rules[%d]: do not match svchost.exe; system DNS follows dns.systemResolver", i)
 		}
-		for j, comp := range r.Companions {
-			c := strings.Trim(strings.TrimSpace(comp), `"`)
-			if c == "" {
-				return fmt.Errorf("rules[%d]: companions[%d] is empty", i, j)
-			}
-			if matchesEverything(c) {
-				return fmt.Errorf("rules[%d]: companions[%d]: mask %q matches every program", i, j, comp)
-			}
-			if maskBase(c) == "svchost.exe" {
-				return fmt.Errorf("rules[%d]: companions[%d]: do not match svchost.exe; system DNS follows dns.systemResolver", i, j)
-			}
+		if err := validateCompanionList("companions", r.Companions); err != nil {
+			return fmt.Errorf("rules[%d]: %w", i, err)
+		}
+		if err := validateCompanionList("exclude_companions", r.ExcludeCompanions); err != nil {
+			return fmt.Errorf("rules[%d]: %w", i, err)
 		}
 		if r.Group != "" {
 			continue // the group's route applies and is checked above
@@ -531,6 +529,24 @@ func checkRoute(action, proxy string, names map[string]struct{}) error {
 		}
 	default:
 		return fmt.Errorf("action must be proxy, direct or block, got %q", action)
+	}
+	return nil
+}
+
+// validateCompanionList checks the entries of a rule's companions or
+// exclude_companions list: each must name something specific.
+func validateCompanionList(field string, list []string) error {
+	for j, comp := range list {
+		c := strings.Trim(strings.TrimSpace(comp), `"`)
+		if c == "" {
+			return fmt.Errorf("%s[%d] is empty", field, j)
+		}
+		if matchesEverything(c) {
+			return fmt.Errorf("%s[%d]: mask %q matches every program", field, j, comp)
+		}
+		if maskBase(c) == "svchost.exe" {
+			return fmt.Errorf("%s[%d]: do not match svchost.exe; system DNS follows dns.systemResolver", field, j)
+		}
 	}
 	return nil
 }
@@ -743,6 +759,7 @@ func deepCopy(cfg *Config) Config {
 				r.KillSwitch = &v
 			}
 			r.Companions = cloneStrings(r.Companions)
+			r.ExcludeCompanions = cloneStrings(r.ExcludeCompanions)
 			cp.Rules[i] = r
 		}
 	}
