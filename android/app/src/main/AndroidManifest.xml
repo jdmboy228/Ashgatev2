@@ -64,11 +64,14 @@
             android:exported="false"
             android:label="@string/apps" />
 
+        <!-- Для активного VpnService допуск systemExempted даёт appop ACTIVATE_VPN;
+             права SCHEDULE_EXACT_ALARM / USE_EXACT_ALARM не требуются (ложное срабатывание Lint). -->
         <service
             android:name=".TunnelService"
             android:exported="false"
             android:foregroundServiceType="systemExempted"
-            android:permission="android.permission.BIND_VPN_SERVICE">
+            android:permission="android.permission.BIND_VPN_SERVICE"
+            tools:ignore="ForegroundServicePermission">
             <intent-filter>
                 <action android:name="android.net.VpnService" />
             </intent-filter>
