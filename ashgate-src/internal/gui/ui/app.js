@@ -152,13 +152,16 @@ function demoState() {
         { enabled: on, process: "Cursor.exe", action: "proxy", proxy: "aeza" },
         { enabled: on, process: "Spotify.exe", action: "proxy", proxy: "backup", killSwitch: true },
         { enabled: on, process: "curl.exe", action: "proxy", proxy: "local", tcpOnly: true },
+        { enabled: on, process: "obs64.exe", action: "proxy", proxy: "aeza" },
         { enabled: on, process: "telemetry.exe", action: "block" },
         { enabled: off, process: "chrome.exe", action: "proxy", proxy: "work-http" },
         { enabled: off, process: "steam.exe", action: "direct" },
       ],
       groups: [{ name: "Связь и звонки", enabled: on, action: "proxy", proxy: "aeza", collapsed: false }],
     },
-    alive: { "curl.exe": true, "spotify.exe": true, "cursor.exe": false, "telemetry.exe": false, "*\\discord\\app-*\\discord.exe": true, "c:\\users\\user\\appdata\\roaming\\telegram desktop\\telegram.exe": true },
+    // Three tiers in the demo: traffic now (Discord, Telegram), running and
+    // waiting (Cursor, curl), not running (obs64), plus an error and a block.
+    alive: { "curl.exe": true, "spotify.exe": true, "cursor.exe": true, "obs64.exe": false, "telemetry.exe": false, "*\\discord\\app-*\\discord.exe": true, "c:\\users\\user\\appdata\\roaming\\telegram desktop\\telegram.exe": true },
     ruleStats: {
       "*\\discord\\app-*\\discord.exe": { flows: 18, up: 9200000, down: 842000000, upRate: 122880, downRate: 2516582 },
       "c:\\users\\user\\appdata\\roaming\\telegram desktop\\telegram.exe": { flows: 6, up: 31000000, down: 1150000000, upRate: 12288, downRate: 184320 },
@@ -166,13 +169,20 @@ function demoState() {
       "spotify.exe": { flows: 0, up: 120000, down: 14200000, upRate: 0, downRate: 0, error: "SOCKS5: нет ответа от proxy.example.com:1080 (таймаут)" },
       "curl.exe": { flows: 0, up: 800, down: 4100, upRate: 0, downRate: 0 },
     },
+    // The Discord tree has a nested child (cmd.exe) with its own console,
+    // plus two dormant shells that fold into one summary line.
     ruleMembers: {
       "*\\discord\\app-*\\discord.exe": [
-        { name: "Discord Helper.exe", path: "C:\\Users\\user\\AppData\\Local\\Discord\\app-1.0.9187\\Discord Helper.exe", pattern: "C:\\Users\\user\\AppData\\Local\\Discord\\app-1.0.9187\\Discord Helper.exe", kind: "companion", alive: true, flows: 0, up: 0, down: 0, mask: "C:\\Users\\user\\AppData\\Local\\Discord\\app-*\\Discord Helper.exe" },
-        { name: "Discord Overlay.exe", kind: "child", alive: true, flows: 2, up: 15000, down: 430000 },
+        { name: "Discord.exe", path: "C:\\Users\\user\\AppData\\Local\\Discord\\app-1.0.9187\\Discord.exe", pid: 8120, ppid: 0, parentPid: 0, parentKey: "", kind: "child", alive: true, flows: 12, up: 820000, down: 39000000, count: 1 },
+        { name: "Discord Helper.exe", path: "C:\\Users\\user\\AppData\\Local\\Discord\\app-1.0.9187\\Discord Helper.exe", pattern: "C:\\Users\\user\\AppData\\Local\\Discord\\app-1.0.9187\\Discord Helper.exe", pid: 8200, ppid: 8120, parentPid: 8120, parentKey: "C:\\Users\\user\\AppData\\Local\\Discord\\app-1.0.9187\\Discord.exe", kind: "companion", alive: true, flows: 4, up: 90000, down: 4000000, count: 1, mask: "C:\\Users\\user\\AppData\\Local\\Discord\\app-*\\Discord Helper.exe" },
+        { name: "Discord Overlay.exe", pid: 8220, ppid: 8120, parentPid: 8120, parentKey: "C:\\Users\\user\\AppData\\Local\\Discord\\app-1.0.9187\\Discord.exe", kind: "child", alive: true, flows: 2, up: 15000, down: 430000, count: 1 },
+        { name: "cmd.exe", path: "C:\\Windows\\System32\\cmd.exe", pid: 9100, ppid: 8220, parentPid: 8220, parentKey: "discord overlay.exe", kind: "child", alive: true, flows: 0, up: 0, down: 0, count: 1 },
+        { name: "conhost.exe", path: "C:\\Windows\\System32\\conhost.exe", pid: 9102, ppid: 9100, parentPid: 9100, parentKey: "C:\\Windows\\System32\\cmd.exe", kind: "child", alive: true, flows: 0, up: 0, down: 0, count: 1 },
+        { name: "powershell.exe", path: "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe", pid: 9104, ppid: 8220, parentPid: 8220, parentKey: "discord overlay.exe", kind: "child", alive: true, flows: 0, up: 0, down: 0, count: 2 },
       ],
       "c:\\users\\user\\appdata\\roaming\\telegram desktop\\telegram.exe": [
-        { name: "Updater.exe", kind: "child", alive: true, flows: 1, up: 1200, down: 3400 },
+        { name: "Telegram.exe", path: "C:\\Users\\user\\AppData\\Roaming\\Telegram Desktop\\Telegram.exe", pid: 7788, ppid: 0, parentPid: 0, parentKey: "", kind: "child", alive: true, flows: 6, up: 31000000, down: 1150000000, count: 1 },
+        { name: "Updater.exe", pid: 7790, ppid: 7788, parentPid: 7788, parentKey: "C:\\Users\\user\\AppData\\Roaming\\Telegram Desktop\\Telegram.exe", kind: "child", alive: true, flows: 1, up: 1200, down: 3400, count: 2 },
       ],
     },
     ruleHints: {
@@ -684,6 +694,8 @@ function fillLog() {
 
 function render() {
   if (!state) return;
+  // The portal lives outside #page: leaving the Apps tab must close it.
+  if (page !== "rules" && apOpen) apClosePopover();
   if (page === "tray") {
     const appEl = document.getElementById("app");
     appEl.hidden = true;
@@ -1456,7 +1468,7 @@ function openAttachMenu(anchor, procPath, procName) {
 function openAttachNew(target, procName) {
   page = "rules";
   built = "";
-  apOpen = "";
+  apClosePopover();
   modal = null;
   render();
   apOpenAdd();
@@ -1878,6 +1890,7 @@ function onClick(e) {
   if (nav) {
     // Settings edits are saved whatever page comes next.
     if (settingsPending) flushSettings();
+    apClosePopover();
     page = nav.dataset.nav; built = ""; modal = null; closeMenu(); render(); return;
   }
   const act = e.target.closest("[data-act]");
@@ -1886,7 +1899,7 @@ function onClick(e) {
   const i = Number(act.dataset.i);
   if (id === "copy-text") { copyText(act.dataset.text || "", act.dataset.shown); return; }
   if (id.startsWith("ap-")) { appsClick(id, act); return; }
-  if (id === "goto") { apOpen = ""; closeMenu(); page = act.dataset.page; built = ""; render(); return; }
+  if (id === "goto") { apClosePopover(); closeMenu(); page = act.dataset.page; built = ""; render(); return; }
   if (id === "sel-proxy") { sel.proxy = i; fillProxies(); return; }
   if (id === "sel-log") {
     const key = act.dataset.key || "";
@@ -1898,7 +1911,7 @@ function onClick(e) {
   }
   if (id === "goto-rule") {
     const proc = (act.dataset.proc || "").toLowerCase();
-    apOpen = "";
+    apClosePopover();
     closeMenu();
     page = "rules";
     built = "";
@@ -2299,8 +2312,8 @@ function bootChrome() {
     if (page === "settings" && e.target.closest(".page") && (e.target.id === "dns-servers" || e.target.id === "sys-proxy" || e.target.id === "direct-domains")) queueSettings();
   });
   // A file or link dropped on the window would open in it, as a page from
-  // elsewhere. Rule cards take their own drags (apBindDrag).
-  const external = (e) => !apDrag && e.dataTransfer && Array.from(e.dataTransfer.types || []).some((t) => t === "Files" || t === "text/uri-list" || t === "text/html");
+  // elsewhere.
+  const external = (e) => e.dataTransfer && Array.from(e.dataTransfer.types || []).some((t) => t === "Files" || t === "text/uri-list" || t === "text/html");
   document.addEventListener("dragover", (e) => {
     if (!external(e)) return;
     e.preventDefault();
@@ -2318,7 +2331,7 @@ function bootChrome() {
     if (e.key === "Escape") {
       const menu = document.getElementById("menu");
       if (menu && !menu.hidden) { closeMenu(); return; }
-      if (apOpen) { apOpen = ""; if (page === "rules") fillApps(); return; }
+      if (apOpen) { apClosePopover(); return; }
       if (modal) { apStopCompTimer(); modal = (modal.kind === "qr" && modal.returnModal) ? modal.returnModal : null; renderModal(); }
     }
   });
@@ -2387,10 +2400,11 @@ async function main() {
 }
 // poll waits for each answer before asking again, so slow replies cannot
 // pile up; it goes on while a dialog is open. The live log needs 250 ms,
-// the other pages show figures that change once a second. In the tray or
-// minimized (the host reports it: WebView2 does not set document.hidden)
-// it stops: the tray icon gets its state from Go, and the host wakes the
-// page when it is shown again.
+// the Apps tab 500 ms (traffic tiers move cards), the other pages show
+// figures that change once a second. In the tray or minimized (the host
+// reports it: WebView2 does not set document.hidden) it stops: the tray
+// icon gets its state from Go, and the host wakes the page when it is
+// shown again.
 let polling = false;
 // wakeAsked: the window came back while a poll was in flight. That poll may
 // have read "hidden" before the wake, so it must not stop on it.
@@ -2404,6 +2418,7 @@ async function poll() {
   let wait = 1000;
   if (failedPolls) wait = 2000;
   else if (page === "log" && !paused) wait = 250;
+  else if (page === "rules") wait = 500;
   setTimeout(poll, wait);
 }
 function wakePoll() {

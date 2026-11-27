@@ -696,8 +696,8 @@ func (c *controller) snapshotSince(since uint64) stateView {
 	hidden := c.hooks.visible != nil && !c.hooks.visible()
 	c.refreshAuto()
 	if !hidden {
-		// The running-app scan opens every process. In the tray nobody
-		// sees its result, and the page still polls every 3 seconds.
+		// A tray window never shows the running-app scan or its hints, so
+		// skip both while hidden.
 		c.refreshAlive()
 		c.refreshHints()
 	}
@@ -1029,6 +1029,9 @@ func (c *controller) replaceLocked(next *config.Config) error {
 	c.hintsCache = nil
 	c.hintsAt = time.Time{}
 	c.hintsGen++
+	// Rules changed: the next poll must rescan processes right away instead of
+	// showing the old alive/member map until the interval passes.
+	c.aliveAt = time.Time{}
 	for name := range c.checks {
 		if _, ok := cp.ProxyByName(name); !ok {
 			delete(c.checks, name) // deleted or renamed

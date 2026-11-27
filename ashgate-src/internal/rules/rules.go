@@ -25,7 +25,9 @@ type Process struct {
 	Parents []Process
 }
 
-// Decision is the first matching rule, or Action == "" when nothing matched.
+// Decision is the winning rule, or Action == "" when nothing matched. The
+// winner is chosen by how specifically it names the process, never by its
+// position in the configuration; see Set.
 type Decision struct {
 	Action    string
 	Proxy     string
@@ -52,7 +54,11 @@ const (
 	MatchAuto      = "auto"
 )
 
-// Set is an immutable list of enabled rules in config order.
+// Set is an immutable collection of enabled rules. Matching is decided by
+// specificity: the rule that names the process most precisely wins, so the
+// order of the rules passed to Compile never changes Action, Proxy, MatchKind,
+// KillSwitch or TCPOnly. RuleIndex still reports the winner's original
+// position in that slice.
 type Set struct {
 	rules []compiled
 }
@@ -65,6 +71,11 @@ type matcher struct {
 	// dir is the install folder of the executable, "" when the mask names no
 	// folder of its own (or one too shallow or shared to mean an application).
 	dir string
+	// literals, fixedSegs and wildcards measure how specific the mask is;
+	// see rank.
+	literals  int
+	fixedSegs int
+	wildcards int
 }
 
 type compiled struct {
@@ -81,10 +92,15 @@ type compiled struct {
 	children bool
 	ks       bool
 	tcpOnly  bool
+	// canon orders rules independently of the order they were compiled in;
+	// it breaks ties between equally specific rules.
+	canon canonical
 }
 
-// Compile keeps enabled rules in order. Disabled rules are skipped. Pass
-// Config.EffectiveRules so groups and the kill-switch default apply.
+// Compile compiles the enabled rules; disabled rules are skipped. The order
+// of the slice is kept only so Decision.RuleIndex points at the caller's
+// rule — matching itself is independent of it. Pass Config.EffectiveRules so
+// groups and the kill-switch default apply.
 // A '*' in a rule matches any run of characters, '\' included, so
 // `*\Discord\app-*\Discord.exe` survives Discord's versioned folders.
 func Compile(rules []config.Rule) *Set {
@@ -108,6 +124,7 @@ func Compile(rules []config.Rule) *Set {
 			}
 			c.excludes = append(c.excludes, compileMatcher(raw))
 		}
+		c.canon = c.canonical()
 		out.rules = append(out.rules, c)
 	}
 	return out
@@ -129,24 +146,55 @@ func compileMatcher(raw string) matcher {
 	}
 	m.glob = strings.ContainsAny(m.match, "*?")
 	m.dir = companionDir(m.match)
+	m.literals, m.fixedSegs, m.wildcards = measureMask(m.match)
 	return m
 }
 
-// Match returns the first enabled rule for p. When no rule names p itself,
-// the nearest ancestor whose first matching rule covers children decides,
-// so helpers an application starts (updaters, Electron and browser helpers,
-// games started by a launcher) follow the application's rule. The climb
-// stops at shell and system processes; otherwise a rule could spread to
-// everything started from the desktop.
+// measureMask counts the literal (non-wildcard) runes, the path segments
+// without a wildcard, and the wildcards of a compiled mask. A mask with more
+// literals and more fixed segments, and fewer wildcards, is more specific.
+func measureMask(match string) (literals, fixedSegs, wildcards int) {
+	segments := strings.Split(match, `\`)
+	for _, seg := range segments {
+		fixed := true
+		for _, r := range seg {
+			switch r {
+			case '*', '?':
+				wildcards++
+				fixed = false
+			default:
+				literals++
+			}
+		}
+		if fixed && seg != "" {
+			fixedSegs++
+		}
+	}
+	return literals, fixedSegs, wildcards
+}
+
+// Match returns the most specific enabled rule for p, regardless of the order
+// of the rules. A rule naming p's exact path beats one naming a path mask,
+// which beats one naming the exe name, which beats one naming a name mask,
+// which beats one naming p as a companion; ties go to the mask with more
+// literal text and fixed segments, then to the canonical order (block, then
+// direct, then proxy).
+//
+// When no rule names p itself, the nearest ancestor whose most specific rule
+// covers children decides, so helpers an application starts (updaters,
+// Electron and browser helpers, games started by a launcher) follow the
+// application's rule. The climb stops at shell and system processes;
+// otherwise a rule could spread to everything started from the desktop.
 //
 // When there is no ancestor to inherit from, a companion decides: a process
 // that lives in the rule's install folder (or a subfolder of it), or one in
 // the install folder of a companion such as a service-started VM process.
+// The deepest matching folder wins.
 func (s *Set) Match(p Process) Decision {
 	if s == nil {
 		return Decision{RuleIndex: -1}
 	}
-	if r, kind, ok := s.first(p); ok {
+	if r, kind, ok := s.best(p); ok {
 		return r.decision("", kind)
 	}
 	if IsShellOrSystem(p) {
@@ -156,7 +204,7 @@ func (s *Set) Match(p Process) Decision {
 		if IsShellOrSystem(a) {
 			break
 		}
-		if r, _, ok := s.first(a); ok && r.children {
+		if r, _, ok := s.best(a); ok && r.children {
 			return r.decision(appName(a), MatchChild)
 		}
 	}
@@ -194,9 +242,14 @@ func (r compiled) isExcluded(name, path string) bool {
 	return false
 }
 
-// companion returns the first rule whose install folder holds p, or whose
+// companion returns the rule whose install folder holds p, or whose
 // companion's install folder holds it. Only rules that cover children take
 // part, so the existing "proxy child processes" switch controls this too.
+//
+// Every rule is considered, and the deepest (longest) matching folder wins,
+// so a rule for `C:\Apps\Suite\Tool` beats one for `C:\Apps\Suite`. On equal
+// depth a rule's own folder beats a companion's, and remaining ties use the
+// same canonical order as best, so the result never depends on rule order.
 func (s *Set) companion(p Process) Decision {
 	name := NormalizeName(p.Name)
 	if name == "" {
@@ -208,6 +261,23 @@ func (s *Set) companion(p Process) Decision {
 		return Decision{RuleIndex: -1}
 	}
 	path := NormalizePath(p.Path)
+	var (
+		win    compiled
+		winDir string
+		winOwn bool
+		found  bool
+	)
+	consider := func(r compiled, dir string, own bool) {
+		if dir == "" || !inDir(path, dir) {
+			return
+		}
+		if !found ||
+			len(dir) > len(winDir) ||
+			(len(dir) == len(winDir) && own && !winOwn) ||
+			(len(dir) == len(winDir) && own == winOwn && r.canon.less(win.canon)) {
+			win, winDir, winOwn, found = r, dir, own, true
+		}
+	}
 	for _, r := range s.rules {
 		if !r.children {
 			continue
@@ -215,16 +285,15 @@ func (s *Set) companion(p Process) Decision {
 		if r.isExcluded(name, path) {
 			continue
 		}
-		if r.primary.dir != "" && inDir(path, r.primary.dir) {
-			return r.decision(appName(Process{Name: r.primary.match}), MatchFolder)
-		}
+		consider(r, r.primary.dir, true)
 		for _, c := range r.companions {
-			if c.dir != "" && inDir(path, c.dir) {
-				return r.decision(appName(Process{Name: r.primary.match}), MatchFolder)
-			}
+			consider(r, c.dir, false)
 		}
 	}
-	return Decision{RuleIndex: -1}
+	if !found {
+		return Decision{RuleIndex: -1}
+	}
+	return win.decision(appName(Process{Name: win.primary.match}), MatchFolder)
 }
 
 // inDir reports that path lies in dir or below it. Both are normalized.
@@ -304,9 +373,10 @@ func Glob(pattern, s string) bool {
 	return px == len(pattern)
 }
 
-// first returns the first rule naming p, by its primary process (MatchExact)
-// or by one of its companions (MatchCompanion), and in rules order.
-func (s *Set) first(p Process) (compiled, string, bool) {
+// best returns the most specific rule naming p, by its primary process
+// (MatchExact) or by one of its companions (MatchCompanion). Every rule is
+// considered; see rank for how candidates are compared.
+func (s *Set) best(p Process) (compiled, string, bool) {
 	name := NormalizeName(p.Name)
 	if name == "" {
 		name = Base(p.Path)
@@ -317,17 +387,156 @@ func (s *Set) first(p Process) (compiled, string, bool) {
 		return compiled{}, "", false
 	}
 	path := NormalizePath(p.Path)
+	var (
+		win   compiled
+		kind  string
+		top   rank
+		found bool
+	)
+	consider := func(r compiled, m matcher, tier int, k string) {
+		rk := m.rank(tier)
+		if !found || rk.better(top) || (rk == top && r.canon.less(win.canon)) {
+			win, kind, top, found = r, k, rk, true
+		}
+	}
 	for _, r := range s.rules {
 		if r.primary.matches(name, path) {
-			return r, MatchExact, true
+			consider(r, r.primary, r.primary.tier(true), MatchExact)
 		}
 		for _, c := range r.companions {
 			if c.matches(name, path) {
-				return r, MatchCompanion, true
+				consider(r, c, c.tier(false), MatchCompanion)
 			}
 		}
 	}
-	return compiled{}, "", false
+	return win, kind, found
+}
+
+// tier ranks a matcher by how precisely it names a process: 8 is an exact
+// full path and 1 a companion's name mask. Primary matchers outrank
+// companions at the same shape.
+func (m matcher) tier(primary bool) int {
+	switch {
+	case primary && m.path && !m.glob:
+		return 8
+	case primary && m.path:
+		return 7
+	case primary && !m.glob:
+		return 6
+	case primary:
+		return 5
+	case m.path && !m.glob:
+		return 4
+	case m.path:
+		return 3
+	case !m.glob:
+		return 2
+	default:
+		return 1
+	}
+}
+
+// rank is the specificity of one matching candidate; a higher rank wins.
+type rank struct {
+	tier      int
+	literals  int
+	fixedSegs int
+	wildcards int
+}
+
+// rank returns the specificity of m at tier.
+func (m matcher) rank(tier int) rank {
+	return rank{tier: tier, literals: m.literals, fixedSegs: m.fixedSegs, wildcards: m.wildcards}
+}
+
+// better reports that r is more specific than o: a higher tier, then more
+// literal text, then more fixed path segments, then fewer wildcards.
+func (r rank) better(o rank) bool {
+	switch {
+	case r.tier != o.tier:
+		return r.tier > o.tier
+	case r.literals != o.literals:
+		return r.literals > o.literals
+	case r.fixedSegs != o.fixedSegs:
+		return r.fixedSegs > o.fixedSegs
+	default:
+		return r.wildcards < o.wildcards
+	}
+}
+
+// canonical orders rules independently of the order they were compiled in.
+type canonical struct {
+	action     int
+	primary    string
+	proxy      string
+	ks         bool
+	tcpOnly    bool
+	children   bool
+	companions string
+	excludes   string
+}
+
+// canonical returns the tie-breaking key of r. The first three fields are the
+// documented tie-breakers; the rest only order rules that are otherwise
+// identical, so even duplicate definitions resolve the same way in any order.
+func (r compiled) canonical() canonical {
+	return canonical{
+		action:     actionRank(r.action),
+		primary:    r.primary.match,
+		proxy:      r.proxy,
+		ks:         r.ks,
+		tcpOnly:    r.tcpOnly,
+		children:   r.children,
+		companions: matcherKey(r.companions),
+		excludes:   matcherKey(r.excludes),
+	}
+}
+
+// less reports that c comes before o in the canonical order.
+func (c canonical) less(o canonical) bool {
+	switch {
+	case c.action != o.action:
+		return c.action > o.action
+	case c.primary != o.primary:
+		return c.primary < o.primary
+	case c.proxy != o.proxy:
+		return c.proxy < o.proxy
+	case c.ks != o.ks:
+		return c.ks
+	case c.tcpOnly != o.tcpOnly:
+		return c.tcpOnly
+	case c.children != o.children:
+		return c.children
+	case c.companions != o.companions:
+		return c.companions < o.companions
+	default:
+		return c.excludes < o.excludes
+	}
+}
+
+// actionRank orders actions for tie-breaking: block beats direct beats proxy.
+func actionRank(action string) int {
+	switch action {
+	case "block":
+		return 2
+	case "direct":
+		return 1
+	default:
+		return 0
+	}
+}
+
+// matcherKey renders a matcher list as a canonical string.
+func matcherKey(ms []matcher) string {
+	if len(ms) == 0 {
+		return ""
+	}
+	keys := make([]string, len(ms))
+	for i, m := range ms {
+		keys[i] = m.match
+	}
+	sort.Strings(keys)
+	return strings.Join(keys, "\x00")
 }
 
 // shellOrSystem are processes that start unrelated programs. Rules are

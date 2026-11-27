@@ -713,3 +713,31 @@ func TestRuleExcludeCompanionsDeepCopy(t *testing.T) {
 		t.Fatalf("EffectiveRules lost exclude companions: %#v", eff[0].ExcludeCompanions)
 	}
 }
+
+// EffectiveRules keeps one entry per configured rule, in the configured
+// order: rules.Decision.RuleIndex indexes this slice. Matching is by
+// specificity now, so duplicate rules are kept as written.
+func TestEffectiveRulesKeepOrderAndDuplicates(t *testing.T) {
+	off := false
+	cfg := &Config{
+		KillSwitch: true,
+		Rules: []Rule{
+			{Process: "b.exe", Action: "proxy", Proxy: "v"},
+			{Process: "a.exe", Action: "direct"},
+			{Process: "b.exe", Action: "proxy", Proxy: "v", Enabled: &off},
+			{Process: "b.exe", Action: "proxy", Proxy: "v"},
+		},
+	}
+	eff := cfg.EffectiveRules()
+	if len(eff) != len(cfg.Rules) {
+		t.Fatalf("EffectiveRules returned %d rules, want %d", len(eff), len(cfg.Rules))
+	}
+	for i, want := range []string{"b.exe", "a.exe", "b.exe", "b.exe"} {
+		if eff[i].Process != want {
+			t.Fatalf("EffectiveRules[%d].Process = %q, want %q", i, eff[i].Process, want)
+		}
+	}
+	if !eff[0].IsEnabled() || eff[2].IsEnabled() || !eff[3].IsEnabled() {
+		t.Fatalf("EffectiveRules changed the switches: %+v", eff)
+	}
+}

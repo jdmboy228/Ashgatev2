@@ -1,12 +1,29 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64" fill="none">
   <defs>
-    <linearGradient id="g" x1="6" y1="2" x2="58" y2="62" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#FF9B5E"/>
-      <stop offset="1" stop-color="#E2452A"/>
+    <linearGradient id="ember" x1="4" y1="2" x2="60" y2="62" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFA05A"/>
+      <stop offset="0.48" stop-color="#FF6B35"/>
+      <stop offset="1" stop-color="#D8351C"/>
     </linearGradient>
+    <linearGradient id="sheen" x1="0" y1="0" x2="0" y2="30" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.14"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
+    </linearGradient>
+    <clipPath id="squircle">
+      <rect width="64" height="64" rx="15"/>
+    </clipPath>
+    <filter id="monogram-shadow" x="-25%" y="-25%" width="150%" height="150%">
+      <feDropShadow dx="0" dy="1.5" stdDeviation="1" flood-color="#6B1505" flood-opacity="0.2"/>
+    </filter>
   </defs>
-  <rect width="64" height="64" rx="15" fill="url(#g)"/>
-  <path d="M21 49V30.5a11 11 0 0 0 22 0V49" stroke="#FFFFFF" stroke-width="5" stroke-linecap="round"/>
-  <path d="M9 40.5h27" stroke="#2B1208" stroke-opacity="0.85" stroke-width="5" stroke-linecap="round"/>
-  <path d="M30.5 34l6.5 6.5-6.5 6.5" stroke="#2B1208" stroke-opacity="0.85" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect width="64" height="64" rx="15" fill="url(#ember)"/>
+  <g clip-path="url(#squircle)">
+    <rect width="64" height="30" fill="url(#sheen)"/>
+    <rect x="1" y="1" width="62" height="62" rx="14" fill="none" stroke="#FFFFFF" stroke-opacity="0.16" stroke-width="1"/>
+  </g>
+  <g filter="url(#monogram-shadow)">
+    <path d="M20 30.5V28.7A13 13 0 0 1 46 28.7V48.3" stroke="#FFFFFF" stroke-width="6.2" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M18 41.5H36" stroke="#FFFFFF" stroke-width="6.2" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M29.5 34.7L36 41.5L29.5 48.3" stroke="#FFFFFF" stroke-width="6.2" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
 </svg>

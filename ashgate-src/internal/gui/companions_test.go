@@ -1,6 +1,7 @@
 package gui
 
 import (
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -810,5 +811,213 @@ func TestEventsToViewsNewestFirst(t *testing.T) {
 	views := eventsToViews(evs)
 	if len(views) != 2 || views[0].Process != "second.exe" || views[1].Process != "first.exe" {
 		t.Fatalf("eventsToViews order = %+v, want newest first", views)
+	}
+}
+
+// Every member names the nearest ancestor of the same rule, so the page can
+// draw the real process tree: App -> cmd -> conhost and App -> helper -> worker.
+func TestScanRulesProcessTree(t *testing.T) {
+	const appExe = `C:\App\App.exe`
+	app := rules.Process{Name: "App.exe", Path: appExe, PID: 10, PPID: 4}
+	cmd := rules.Process{Name: "cmd.exe", Path: `C:\Windows\System32\cmd.exe`, PID: 20, PPID: 10,
+		Parents: []rules.Process{app}}
+	conhost := rules.Process{Name: "conhost.exe", Path: `C:\Windows\System32\conhost.exe`, PID: 30, PPID: 20,
+		Parents: []rules.Process{cmd, app}}
+	helper := rules.Process{Name: "helper.exe", Path: `C:\App\helper.exe`, PID: 40, PPID: 10,
+		Parents: []rules.Process{app}}
+	worker := rules.Process{Name: "worker.exe", Path: `C:\App\worker.exe`, PID: 50, PPID: 40,
+		Parents: []rules.Process{helper, app}}
+
+	rs := []config.Rule{{Process: appExe}}
+	alive, members, _ := scanRules(rs, []rules.Process{app, cmd, conhost, helper, worker})
+	key := ruleKey(appExe)
+	if !alive[key] {
+		t.Fatal("rule is not alive")
+	}
+	byName := map[string]liveMember{}
+	for _, m := range members[key] {
+		byName[m.Name] = m
+	}
+	cmdKey := procKey(cmd.Path, cmd.Name)
+	helperKey := procKey(helper.Path, helper.Name)
+	cases := []struct {
+		name      string
+		pid, ppid uint32
+		parentPID uint32
+		parentKey string
+	}{
+		{"cmd.exe", 20, 10, 10, ""},
+		{"conhost.exe", 30, 20, 20, cmdKey},
+		{"helper.exe", 40, 10, 10, ""},
+		{"worker.exe", 50, 40, 40, helperKey},
+	}
+	for _, c := range cases {
+		m, ok := byName[c.name]
+		if !ok {
+			t.Fatalf("%s missing from %+v", c.name, members[key])
+		}
+		if m.PID != c.pid || m.PPID != c.ppid || m.ParentPID != c.parentPID ||
+			m.ParentKey != c.parentKey || m.Count != 1 {
+			t.Fatalf("%s = %+v, want pid %d ppid %d parent %d key %q",
+				c.name, m, c.pid, c.ppid, c.parentPID, c.parentKey)
+		}
+	}
+}
+
+// One image spawning itself (worker.exe -> worker.exe) is one row with a
+// count; it must never become its own parent.
+func TestScanRulesSameImageChain(t *testing.T) {
+	const appExe = `C:\App\App.exe`
+	app := rules.Process{Name: "App.exe", Path: appExe, PID: 10, PPID: 4}
+	w1 := rules.Process{Name: "worker.exe", Path: `C:\App\worker.exe`, PID: 20, PPID: 10,
+		Parents: []rules.Process{app}}
+	w2 := rules.Process{Name: "worker.exe", Path: `C:\App\worker.exe`, PID: 21, PPID: 20,
+		Parents: []rules.Process{w1, app}}
+
+	rs := []config.Rule{{Process: appExe}}
+	_, members, _ := scanRules(rs, []rules.Process{app, w1, w2})
+	key := ruleKey(appExe)
+	if len(members[key]) != 1 {
+		t.Fatalf("want one worker row, got %+v", members[key])
+	}
+	m := members[key][0]
+	if m.Count != 2 {
+		t.Fatalf("Count = %d, want 2: %+v", m.Count, m)
+	}
+	if m.ParentKey != "" {
+		t.Fatalf("a same-image chain must not parent itself: %+v", m)
+	}
+	if m.ParentPID != 10 {
+		t.Fatalf("ParentPID = %d, want the root 10: %+v", m.ParentPID, m)
+	}
+}
+
+// A saved companion and an auto row take the live identity, so the page sees
+// their PID, parent and instance count even when the row already existed.
+func TestBuildRuleMembersInheritsLiveIdentity(t *testing.T) {
+	const ruleExe = `C:\App\app.exe`
+	const compExe = `C:\App\svc.exe`
+	const autoExe = `C:\App\auto.exe`
+	cfg := &config.Config{Rules: []config.Rule{{
+		Process:    ruleExe,
+		Companions: []string{compExe},
+	}}}
+	key := ruleKey(ruleExe)
+	auto := []engine.AutoMatch{{
+		RuleKey: key,
+		Reason:  "ссылка в командной строке",
+		Proc:    rules.Process{Name: "auto.exe", Path: autoExe, PID: 300, PPID: 12},
+	}}
+	live := map[string][]liveMember{key: {
+		{Name: "svc.exe", Path: compExe, Kind: "companion", PID: 100, PPID: 10,
+			ParentPID: 10, ParentKey: "", Count: 2},
+		{Name: "auto.exe", Path: autoExe, Kind: "child", PID: 300, PPID: 12,
+			ParentPID: 10, ParentKey: `C:\App\svc.exe`, Count: 1},
+	}}
+	got := buildRuleMembers(cfg, nil, live, auto)[key]
+	var comp, autoRow *ruleMemberView
+	for i := range got {
+		switch {
+		case got[i].Pattern == compExe:
+			comp = &got[i]
+		case got[i].Kind == rules.MatchAuto:
+			autoRow = &got[i]
+		}
+	}
+	if comp == nil {
+		t.Fatalf("saved companion missing: %+v", got)
+	}
+	if comp.PID != 100 || comp.PPID != 10 || comp.ParentPID != 10 || comp.ParentKey != "" || comp.Count != 2 {
+		t.Fatalf("saved companion did not inherit the live identity: %+v", comp)
+	}
+	if autoRow == nil {
+		t.Fatalf("auto row missing: %+v", got)
+	}
+	if autoRow.PID != 300 || autoRow.PPID != 12 || autoRow.ParentPID != 10 {
+		t.Fatalf("auto row identity = %+v", autoRow)
+	}
+	if autoRow.ParentKey != procKey(compExe, "svc.exe") {
+		t.Fatalf("auto row ParentKey = %q, want %q", autoRow.ParentKey, procKey(compExe, "svc.exe"))
+	}
+	if autoRow.Count != 0 {
+		t.Fatalf("a single instance must omit the count: %+v", autoRow)
+	}
+}
+
+// An auto match without live info still carries the PID and PPID it was seen
+// with.
+func TestBuildRuleMembersAutoIdentity(t *testing.T) {
+	const ruleExe = `C:\App\app.exe`
+	const autoExe = `C:\App\auto.exe`
+	cfg := &config.Config{Rules: []config.Rule{{Process: ruleExe}}}
+	key := ruleKey(ruleExe)
+	auto := []engine.AutoMatch{{
+		RuleKey: key,
+		Reason:  "загружает модуль из папки программы",
+		Proc:    rules.Process{Name: "auto.exe", Path: autoExe, PID: 500, PPID: 10},
+	}}
+	got := buildRuleMembers(cfg, nil, nil, auto)[key]
+	if len(got) != 1 {
+		t.Fatalf("got %+v", got)
+	}
+	if got[0].PID != 500 || got[0].PPID != 10 {
+		t.Fatalf("auto row lost the PID/PPID: %+v", got[0])
+	}
+}
+
+// The page must always receive a forest: dangling, self-referencing and
+// cyclic ParentKey values are cleared before the list is returned.
+func TestBuildRuleMembersSanitizesParents(t *testing.T) {
+	const ruleExe = `C:\App\app.exe`
+	cfg := &config.Config{Rules: []config.Rule{{Process: ruleExe}}}
+	key := ruleKey(ruleExe)
+	live := map[string][]liveMember{key: {
+		// a <-> b cycle.
+		{Name: "a.exe", Path: `C:\App\a.exe`, Kind: "child", PID: 1,
+			ParentKey: `C:\App\b.exe`, ParentPID: 2},
+		{Name: "b.exe", Path: `C:\App\b.exe`, Kind: "child", PID: 2,
+			ParentKey: `C:\App\a.exe`, ParentPID: 1},
+		// Names a row that does not exist.
+		{Name: "c.exe", Path: `C:\App\c.exe`, Kind: "child", PID: 3,
+			ParentKey: `C:\App\ghost.exe`, ParentPID: 9},
+		// Names itself.
+		{Name: "d.exe", Path: `C:\App\d.exe`, Kind: "child", PID: 4,
+			ParentKey: `C:\App\d.exe`, ParentPID: 4},
+	}}
+	got := buildRuleMembers(cfg, nil, live, nil)[key]
+	if len(got) != 4 {
+		t.Fatalf("got %+v", got)
+	}
+	for _, m := range got {
+		if m.ParentKey != "" || m.ParentPID != 0 {
+			t.Fatalf("bad parent survived sanitization: %+v", m)
+		}
+	}
+}
+
+// The incremental snapshotter must keep working across calls and stay fast
+// once the cache is warm. The real process table only exists on Windows.
+func TestSnapshotterCachedRepeatIsFast(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("needs the Windows process table")
+	}
+	s := process.NewSnapshotter()
+	start := time.Now()
+	first := s.Snapshot()
+	firstDur := time.Since(start)
+	if len(first) == 0 {
+		t.Fatal("snapshot returned no processes")
+	}
+	start = time.Now()
+	second := s.Snapshot()
+	secondDur := time.Since(start)
+	if len(second) == 0 {
+		t.Fatal("cached snapshot returned no processes")
+	}
+	if secondDur > 500*time.Millisecond {
+		t.Fatalf("cached snapshot took %v, want well under the poll interval", secondDur)
+	}
+	if secondDur > firstDur+50*time.Millisecond {
+		t.Fatalf("cached snapshot (%v) is not faster than the first (%v)", secondDur, firstDur)
 	}
 }

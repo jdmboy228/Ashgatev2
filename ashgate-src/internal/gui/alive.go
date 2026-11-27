@@ -9,12 +9,18 @@ import (
 	"ashgate/internal/rules"
 )
 
-// aliveEvery is how often the list of running rule apps is rebuilt. It opens
-// every process, which is too slow for each status poll.
-const aliveEvery = 3 * time.Second
+// aliveEvery is how often the list of running rule apps is rebuilt. The
+// snapshotter reads the process table cheaply and opens only new processes,
+// so a short interval is affordable and a launch or exit is seen in under a
+// second.
+const aliveEvery = 600 * time.Millisecond
 
-// Indirection so tests can run without a Windows process list.
-var snapshotProcs = process.Snapshot
+// defaultSnapshotter keeps the image cache across polls.
+var defaultSnapshotter = process.NewSnapshotter()
+
+// snapshotProcs is an indirection so tests can run without a Windows process
+// list; it is also swapped in tests that fake process snapshots.
+var snapshotProcs = defaultSnapshotter.Snapshot
 
 // ruleKey is how the page keys a rule: the process field, trimmed, without
 // quotes, lower case (apKey in apps.js).
@@ -68,11 +74,18 @@ func aliveRules(rs []config.Rule, procs []rules.Process) map[string]bool {
 
 // liveMember is a process a rule caught without naming it: a companion, a
 // child that inherited the rule, or one that lives in the rule's folder.
+// ParentKey names the nearest ancestor that is also a member of the same rule,
+// so the page can draw the process tree; it is empty for a direct child of the
+// rule's root process or when no member ancestor exists.
 type liveMember struct {
-	Name string
-	Path string
-	Kind string // "companion" | "child" | "folder"
-	PID  uint32
+	Name      string
+	Path      string
+	Kind      string // "companion" | "child" | "folder"
+	PID       uint32
+	PPID      uint32
+	ParentPID uint32
+	ParentKey string
+	Count     int // live instances collapsed into this image entry
 }
 
 // scanRules matches every running process against the rules, keeping a rule
@@ -110,29 +123,15 @@ func scanRules(rs []config.Rule, procs []rules.Process) (map[string]bool, map[st
 	}
 	set := rules.Compile(all)
 
-	// One dedup set per rule. A folder can catch many processes with the same
-	// image path; the row shows it once.
-	seen := map[string]map[string]bool{}
-	addMember := func(key string, p rules.Process, kind string) {
-		if key == "" || (p.Path == "" && p.Name == "") {
-			return
-		}
-		id := rules.NormalizePath(p.Path)
-		if id == "" {
-			id = rules.NormalizeName(p.Name)
-		}
-		byID := seen[key]
-		if byID == nil {
-			byID = map[string]bool{}
-			seen[key] = byID
-		}
-		if byID[id] {
-			return
-		}
-		byID[id] = true
-		members[key] = append(members[key], liveMember{Name: p.Name, Path: p.Path, Kind: kind, PID: p.PID})
+	// One hit list per rule, in process order, plus a PID index for walking
+	// ancestors. Every process matches at most one rule here.
+	type ruleHit struct {
+		proc  rules.Process
+		kind  string
+		exact bool
 	}
-
+	hits := map[string][]ruleHit{}
+	byPID := map[string]map[uint32]ruleHit{}
 	for _, p := range procs {
 		dec := set.Match(p)
 		if dec.Action == "" || dec.RuleIndex < 0 || dec.RuleIndex >= len(rs) {
@@ -144,8 +143,70 @@ func scanRules(rs []config.Rule, procs []rules.Process) (map[string]bool, map[st
 		}
 		alive[key] = true
 		running[key] = append(running[key], p)
-		if dec.MatchKind != rules.MatchExact {
-			addMember(key, p, dec.MatchKind)
+		h := ruleHit{proc: p, kind: dec.MatchKind, exact: dec.MatchKind == rules.MatchExact}
+		hits[key] = append(hits[key], h)
+		if p.PID != 0 {
+			if byPID[key] == nil {
+				byPID[key] = map[uint32]ruleHit{}
+			}
+			byPID[key][p.PID] = h
+		}
+	}
+	// Attach every caught process to the nearest ancestor that the same rule
+	// also caught, and collapse equal images into one row with a count.
+	for key, list := range hits {
+		idxByID := map[string]int{}
+		for _, h := range list {
+			if h.exact {
+				continue
+			}
+			p := h.proc
+			var parentKey string
+			var parentPID uint32
+			for _, a := range p.Parents {
+				if a.PID == 0 || rules.IsShellOrSystem(a) {
+					break
+				}
+				ah, ok := byPID[key][a.PID]
+				if !ok {
+					continue // not caught by this rule; keep climbing
+				}
+				if ah.exact {
+					parentPID = ah.proc.PID // a direct child of the rule's root
+					break
+				}
+				aKey := procKey(ah.proc.Path, ah.proc.Name)
+				if aKey != "" && aKey != procKey(p.Path, p.Name) {
+					parentKey, parentPID = aKey, ah.proc.PID
+					break
+				}
+				// The same image spawned itself (chrome.exe -> chrome.exe):
+				// keep climbing so the group attaches to the ancestor image.
+			}
+			id := procKey(p.Path, p.Name)
+			if id == "" {
+				continue
+			}
+			if i, ok := idxByID[id]; ok {
+				m := &members[key][i]
+				m.Count++
+				if m.PID == 0 {
+					m.PID, m.PPID = p.PID, p.PPID
+				}
+				// Prefer the shallower attachment: a second instance that is a
+				// direct child of the root must not hang off another image.
+				if m.ParentKey != "" && parentKey == "" {
+					m.ParentKey, m.ParentPID = "", parentPID
+					m.PID, m.PPID = p.PID, p.PPID
+				}
+				continue
+			}
+			idxByID[id] = len(members[key])
+			members[key] = append(members[key], liveMember{
+				Name: p.Name, Path: p.Path, Kind: h.kind,
+				PID: p.PID, PPID: p.PPID, ParentPID: parentPID, ParentKey: parentKey,
+				Count: 1,
+			})
 		}
 	}
 
@@ -167,7 +228,12 @@ func scanRules(rs []config.Rule, procs []rules.Process) (map[string]bool, map[st
 			alive[key] = true
 			running[key] = append(running[key], p)
 			if dec.MatchKind == rules.MatchCompanion {
-				addMember(key, p, rules.MatchCompanion)
+				if p.Path != "" || p.Name != "" {
+					members[key] = append(members[key], liveMember{
+						Name: p.Name, Path: p.Path, Kind: rules.MatchCompanion,
+						PID: p.PID, PPID: p.PPID, Count: 1,
+					})
+				}
 			}
 			break
 		}

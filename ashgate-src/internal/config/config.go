@@ -254,7 +254,9 @@ func (g Group) IsEnabled() bool { return g.Enabled == nil || *g.Enabled }
 
 // EffectiveRules returns the rules as the engine applies them: a grouped
 // rule takes its group's switch and route, and every rule's KillSwitch is
-// set (rule override or the global default).
+// set (rule override or the global default). The slice keeps the configured
+// order because rules.Decision.RuleIndex indexes it; matching itself is by
+// specificity and does not depend on that order.
 func (c *Config) EffectiveRules() []Rule {
 	groups := make(map[string]Group, len(c.Groups))
 	for _, g := range c.Groups {

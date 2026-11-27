@@ -1,13 +1,38 @@
 package rules
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
 	"ashgate/internal/config"
 )
 
-func TestMatchOrderAndShape(t *testing.T) {
+// permutations returns every ordering of rules, so a test can prove that
+// matching does not depend on the order of the slice passed to Compile.
+func permutations(rules []config.Rule) [][]config.Rule {
+	if len(rules) <= 1 {
+		return [][]config.Rule{rules}
+	}
+	var out [][]config.Rule
+	for i := range rules {
+		rest := make([]config.Rule, 0, len(rules)-1)
+		rest = append(rest, rules[:i]...)
+		rest = append(rest, rules[i+1:]...)
+		for _, p := range permutations(rest) {
+			out = append(out, append([]config.Rule{rules[i]}, p...))
+		}
+	}
+	return out
+}
+
+// decisionKey is every Decision field that must not depend on rule order.
+// RuleIndex is deliberately left out: it points at the caller's slice.
+func decisionKey(d Decision) string {
+	return fmt.Sprintf("%s|%s|%s|%s|%v|%v", d.Action, d.Proxy, d.MatchKind, d.Parent, d.KillSwitch, d.TCPOnly)
+}
+
+func TestMatchShape(t *testing.T) {
 	off := false
 	on := true
 	set := Compile([]config.Rule{
@@ -717,5 +742,184 @@ func TestNonVendorTokens(t *testing.T) {
 	}
 	if got := NonVendorTokens(`C:\Apps\Acme\Tool\tool.exe`, "Acme Tool"); len(got) != 0 {
 		t.Fatalf("all tokens are vendor tokens: %v", got)
+	}
+}
+
+// The hierarchy is decided by how specifically a rule names the process, not
+// by its position: exact path, version mask, broad path mask, exact exe name,
+// name mask, companion, then install folder. Every stage is tried in every
+// rule order.
+func TestSpecificityHierarchy(t *testing.T) {
+	const path = `C:\Users\u\AppData\Local\Discord\app-1.0.9187\Discord.exe`
+	p := Process{Name: "Discord.exe", Path: path}
+	nameMask := config.Rule{Process: "Discord*.exe", Action: "block"}
+	exactName := config.Rule{Process: "Discord.exe", Action: "direct"}
+	broad := config.Rule{Process: `*\Discord\app-*\Discord.exe`, Action: "proxy", Proxy: "broad"}
+	version := config.Rule{Process: `C:\Users\u\AppData\Local\Discord\app-*\Discord.exe`, Action: "proxy", Proxy: "ver"}
+	exactPath := config.Rule{Process: path, Action: "direct"}
+	companion := config.Rule{Process: `C:\Other\other.exe`, Action: "proxy", Proxy: "comp", Companions: []string{"Discord.exe"}}
+
+	stages := []struct {
+		name string
+		all  []config.Rule
+		want string
+	}{
+		{"exact path", []config.Rule{nameMask, exactName, broad, version, exactPath, companion}, "direct||exact||false|false"},
+		{"version mask", []config.Rule{nameMask, exactName, broad, version, companion}, "proxy|ver|exact||false|false"},
+		{"broad path mask", []config.Rule{nameMask, exactName, broad, companion}, "proxy|broad|exact||false|false"},
+		{"exact exe name", []config.Rule{nameMask, exactName, companion}, "direct||exact||false|false"},
+		{"name mask", []config.Rule{nameMask, companion}, "block||exact||false|false"},
+		{"companion", []config.Rule{companion}, "proxy|comp|companion||false|false"},
+	}
+	for _, st := range stages {
+		for _, perm := range permutations(st.all) {
+			got := decisionKey(Compile(perm).Match(p))
+			if got != st.want {
+				t.Fatalf("%s: order %v matched %q, want %q", st.name, ruleNames(perm), got, st.want)
+			}
+		}
+	}
+}
+
+// ruleNames renders a rule slice for failure messages.
+func ruleNames(rules []config.Rule) []string {
+	out := make([]string, len(rules))
+	for i, r := range rules {
+		out[i] = r.Process
+	}
+	return out
+}
+
+// A mask with more literal text is more specific even when the shorter one
+// names a stronger action; the action only breaks exact ties.
+func TestSpecificityLiteralsBeatAction(t *testing.T) {
+	p := Process{Name: "tool.exe", Path: `C:\Apps\Suite\Tool\tool.exe`}
+	long := config.Rule{Process: `C:\Apps\Suite\*\tool.exe`, Action: "proxy", Proxy: "long"}
+	short := config.Rule{Process: `*\Suite\*\tool.exe`, Action: "block"}
+	for _, perm := range permutations([]config.Rule{long, short}) {
+		if d := Compile(perm).Match(p); d.Action != "proxy" || d.Proxy != "long" {
+			t.Fatalf("order %v: %+v", ruleNames(perm), d)
+		}
+	}
+}
+
+// Equally specific rules resolve the same way in any order: block, then
+// direct, then proxy.
+func TestSpecificityIdenticalTieBreak(t *testing.T) {
+	p := Process{Name: "tool.exe", Path: `C:\Apps\Suite\Tool\tool.exe`}
+	proxy := config.Rule{Process: `C:\Apps\Suite\*\tool.exe`, Action: "proxy", Proxy: "p"}
+	direct := config.Rule{Process: `C:\Apps\Suite\*\tool.exe`, Action: "direct"}
+	block := config.Rule{Process: `C:\Apps\Suite\*\tool.exe`, Action: "block"}
+	stages := []struct {
+		all  []config.Rule
+		want string
+	}{
+		{[]config.Rule{proxy, direct, block}, "block||exact||false|false"},
+		{[]config.Rule{proxy, direct}, "direct||exact||false|false"},
+		{[]config.Rule{proxy}, "proxy|p|exact||false|false"},
+	}
+	for _, st := range stages {
+		for _, perm := range permutations(st.all) {
+			if got := decisionKey(Compile(perm).Match(p)); got != st.want {
+				t.Fatalf("order %v matched %q, want %q", ruleNames(perm), got, st.want)
+			}
+		}
+	}
+}
+
+// Companions rank below every primary shape and above install folders.
+func TestSpecificityCompanions(t *testing.T) {
+	p := Process{Name: "helper.exe", Path: `C:\Apps\Suite\bin\helper.exe`}
+	nameMask := config.Rule{Process: "main.exe", Companions: []string{"helper*.exe"}, Action: "block"}
+	exactName := config.Rule{Process: "main.exe", Companions: []string{"helper.exe"}, Action: "direct"}
+	pathMask := config.Rule{Process: "main.exe", Companions: []string{`C:\Apps\Suite\*\helper.exe`}, Action: "proxy", Proxy: "pmask"}
+	pathExact := config.Rule{Process: "main.exe", Companions: []string{`C:\Apps\Suite\bin\helper.exe`}, Action: "proxy", Proxy: "pexact"}
+	stages := []struct {
+		all  []config.Rule
+		want string
+	}{
+		{[]config.Rule{nameMask, exactName, pathMask, pathExact}, "proxy|pexact|companion||false|false"},
+		{[]config.Rule{nameMask, exactName, pathMask}, "proxy|pmask|companion||false|false"},
+		{[]config.Rule{nameMask, exactName}, "direct||companion||false|false"},
+		{[]config.Rule{nameMask}, "block||companion||false|false"},
+	}
+	for _, st := range stages {
+		for _, perm := range permutations(st.all) {
+			if got := decisionKey(Compile(perm).Match(p)); got != st.want {
+				t.Fatalf("order %v matched %q, want %q", ruleNames(perm), got, st.want)
+			}
+		}
+	}
+	// A companion match outranks the install folder of another rule.
+	folder := config.Rule{Process: `C:\Apps\Suite\suite.exe`, Action: "block"}
+	worker := Process{Name: "worker.exe", Path: `C:\Apps\Suite\worker.exe`}
+	companion := config.Rule{Process: "main.exe", Companions: []string{"worker.exe"}, Action: "direct"}
+	for _, perm := range permutations([]config.Rule{folder, companion}) {
+		if d := Compile(perm).Match(worker); d.Action != "direct" || d.MatchKind != MatchCompanion {
+			t.Fatalf("order %v: %+v", ruleNames(perm), d)
+		}
+	}
+}
+
+// The deepest install folder wins, so a rule for a subfolder beats the rule
+// for the suite that contains it, in any order.
+func TestFolderSpecificityDeepestWins(t *testing.T) {
+	suite := config.Rule{Process: `C:\Apps\Suite\suite.exe`, Action: "proxy", Proxy: "suite"}
+	tool := config.Rule{Process: `C:\Apps\Suite\Tool\tool.exe`, Action: "direct"}
+	deep := Process{Name: "helper.exe", Path: `C:\Apps\Suite\Tool\bin\helper.exe`}
+	shallow := Process{Name: "helper.exe", Path: `C:\Apps\Suite\bin\helper.exe`}
+	for _, perm := range permutations([]config.Rule{suite, tool}) {
+		s := Compile(perm)
+		if d := s.Match(deep); d.Action != "direct" || d.MatchKind != MatchFolder || d.Parent != "tool.exe" {
+			t.Fatalf("deep, order %v: %+v", ruleNames(perm), d)
+		}
+		if d := s.Match(shallow); d.Action != "proxy" || d.Proxy != "suite" || d.MatchKind != MatchFolder || d.Parent != "suite.exe" {
+			t.Fatalf("shallow, order %v: %+v", ruleNames(perm), d)
+		}
+	}
+}
+
+// At equal folder depth a rule's own folder beats a companion's folder, in
+// any order.
+func TestFolderSpecificityPrimaryBeatsCompanion(t *testing.T) {
+	own := config.Rule{Process: `C:\Apps\Suite\app.exe`, Action: "proxy", Proxy: "own"}
+	viaCompanion := config.Rule{Process: `D:\Other\b.exe`, Companions: []string{`C:\Apps\Suite\helper.exe`}, Action: "direct"}
+	p := Process{Name: "worker.exe", Path: `C:\Apps\Suite\worker.exe`}
+	for _, perm := range permutations([]config.Rule{own, viaCompanion}) {
+		d := Compile(perm).Match(p)
+		if d.Action != "proxy" || d.Proxy != "own" || d.MatchKind != MatchFolder || d.Parent != "app.exe" {
+			t.Fatalf("order %v: %+v", ruleNames(perm), d)
+		}
+	}
+}
+
+// An inherited ancestor rule is the most specific one for the ancestor, in
+// any order.
+func TestAncestorSpecificity(t *testing.T) {
+	nameRule := config.Rule{Process: "launcher.exe", Action: "direct"}
+	pathRule := config.Rule{Process: `C:\Apps\Launcher\launcher.exe`, Action: "proxy", Proxy: "v"}
+	child := Process{
+		Name: "game.exe", Path: `C:\Games\game.exe`,
+		Parents: []Process{{Name: "launcher.exe", Path: `C:\Apps\Launcher\launcher.exe`}},
+	}
+	for _, perm := range permutations([]config.Rule{nameRule, pathRule}) {
+		d := Compile(perm).Match(child)
+		if d.Action != "proxy" || d.Proxy != "v" || d.MatchKind != MatchChild || d.Parent != "launcher.exe" {
+			t.Fatalf("order %v: %+v", ruleNames(perm), d)
+		}
+	}
+}
+
+// RuleIndex still points at the winner's position in the slice given to
+// Compile, which the engine and the window use to look the rule up.
+func TestRuleIndexIsOriginalPosition(t *testing.T) {
+	exact := config.Rule{Process: `C:\Apps\a.exe`, Action: "direct"}
+	mask := config.Rule{Process: `C:\Apps\*.exe`, Action: "proxy", Proxy: "v"}
+	p := Process{Name: "a.exe", Path: `C:\Apps\a.exe`}
+	if d := Compile([]config.Rule{mask, exact}).Match(p); d.RuleIndex != 1 || d.Action != "direct" {
+		t.Fatalf("mask first: %+v", d)
+	}
+	if d := Compile([]config.Rule{exact, mask}).Match(p); d.RuleIndex != 0 || d.Action != "direct" {
+		t.Fatalf("exact first: %+v", d)
 	}
 }
