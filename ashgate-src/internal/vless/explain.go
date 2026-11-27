@@ -84,6 +84,8 @@ func Explain(err error) error {
 		return err
 	case strings.Contains(msg, "локальный мост не запущен"):
 		return err
+	case strings.Contains(msg, "отклонена авторизация прокси"):
+		return errors.New("VLESS: отклонена авторизация прокси")
 	case strings.Contains(blob, "reality") || (strings.Contains(blob, "handshake") && (strings.Contains(blob, "fail") || strings.Contains(blob, "не уда"))):
 		return errors.New("REALITY: рукопожатие не удалось. Проверьте публичный ключ, short id и SNI")
 	case strings.Contains(blob, "x509:") || strings.Contains(blob, "certificate signed by unknown authority") || strings.Contains(blob, "peer cert") || strings.Contains(blob, "bad certificate"):

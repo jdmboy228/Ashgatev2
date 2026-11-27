@@ -23,6 +23,7 @@ import java.io.File
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * The tunnel. Only the apps the user picked are routed into the TUN
@@ -51,22 +52,37 @@ class TunnelService : VpnService() {
         /** Changes that come together (a network flapping, quick taps) make one restart. */
         private const val RESTART_DELAY_MS = 1000L
 
-        /** How often a running tunnel is checked so a dropped VLESS connection leaves State.ON. */
+        /** Интервал проверки работающего туннеля (оптимизируется на Этапе 2). */
         private const val HEALTH_INTERVAL_MS = 15_000L
 
+        /** Экспоненциальные задержки автоповтора в состоянии BLOCKED. */
+        private val BLOCKED_RETRY_MS = longArrayOf(15_000L, 30_000L, 60_000L, 120_000L)
+
         /**
-         * One thread for every instance of the service, as the Go core is one
-         * per process: connects and disconnects never overlap, even when a
-         * new instance starts while the old one is being cleaned up.
+         * Один поток на все экземпляры сервиса (Go-ядро одно на процесс):
+         * подключения и отключения не пересекаются, даже при смене инстанса.
          */
         private val worker = Executors.newSingleThreadScheduledExecutor()
 
-        /** The executor would keep an exception to itself. Only its type is logged: messages may quote a server. */
+        /** Отдельный поток для немедленного Mobile.stop() без блокировки UI-потока. */
+        private val aborter = Executors.newSingleThreadExecutor()
+
+        private fun abortCore() {
+            aborter.execute {
+                try {
+                    Mobile.stop()
+                } catch (e: Throwable) {
+                    Log.e("Ashgate", "abort core failed: " + e.javaClass.name)
+                }
+            }
+        }
+
+        /** Логируем только класс исключения: текст ошибки может содержать адрес сервера. */
         private fun onWorker(block: () -> Unit) {
             worker.execute {
                 try {
                     block()
-                } catch (e: Exception) {
+                } catch (e: Throwable) {
                     Log.e("Ashgate", "tunnel task failed: " + e.javaClass.name)
                 }
             }
@@ -88,9 +104,8 @@ class TunnelService : VpnService() {
         @Volatile
         private var geoDir: File? = null
 
-        /** Incremented on every user/service command so an aborted in-flight start or check is ignored. */
-        @Volatile
-        private var commandSeq = 0
+        /** Атомарный счётчик команд, чтобы устаревшие запуски и проверки отбрасывались. */
+        private val commandSeq = AtomicInteger(0)
 
         /** The current active service instance; an older instance being destroyed must not touch global state. */
         @Volatile
@@ -123,8 +138,10 @@ class TunnelService : VpnService() {
     private var restart: ScheduledFuture<*>? = null
     private var restartFull = false
     private var healthCheck: ScheduledFuture<*>? = null
+    private var blockedRetry: ScheduledFuture<*>? = null
+    private var blockedAttempt = 0
 
-    /** Set once this instance is cleaned up: what it scheduled no longer runs. */
+    /** Выставляется ТОЛЬКО в onDestroy(): запланированные задачи этого инстанса больше не выполняются. */
     private var destroyed = false
 
     /** The newest start request processed on [worker], so that stopping never drops one that just came. */
@@ -137,8 +154,7 @@ class TunnelService : VpnService() {
         val disconnect = intent?.action == DISCONNECT
         val systemStart = intent == null || intent.action == SERVICE_INTERFACE
         active = this
-        // A system VpnService bind/start arriving while the tunnel is already
-        // starting or up must not abort the running start.
+        // Системный bind/start VpnService во время уже идущего старта или работы не должен сбрасывать туннель.
         if (systemStart && (state == State.STARTING || state == State.ON)) {
             onWorker {
                 lastStartId = startId
@@ -146,34 +162,33 @@ class TunnelService : VpnService() {
             }
             return START_STICKY
         }
-        commandSeq++
+        val seq = commandSeq.incrementAndGet()
         if (disconnect || state == State.STARTING) {
-            // Unblock worker at once if it is waiting on an unreachable server inside Mobile.start.
-            Mobile.stop()
+            // Прерываем возможный блокирующий Mobile.start на отдельном потоке, не вешая UI.
+            abortCore()
         }
         onWorker {
             lastStartId = startId
+            if (destroyed || active !== this) return@onWorker
             if (systemStart) expectedUp = true
             when {
-                disconnect -> stop(null)
-                // Also RETRY from the notification, the system's start of an
-                // always-on VPN, and its restart after the process died (no intent):
-                // explicit starts and profile/app changes run at once, without the
-                // network-flap delay.
+                disconnect -> stop(null, seq)
                 else -> {
+                    blockedAttempt = 0
+                    cancelBlockedRetry()
                     cancelRestart()
-                    start()
+                    start(seq)
                 }
             }
         }
-        // If the process dies the interface goes with it and the picked apps
-        // are outside the tunnel: the system must bring the service back.
         return START_STICKY
     }
 
     override fun onRevoke() {
-        // The system has already taken the interface away (another VPN app, or the user in settings).
-        later { stop(getString(R.string.vpn_revoked)) }
+        // Система уже забрала VPN-интерфейс: немедленно прерываем идущий Mobile.start/check.
+        val seq = commandSeq.incrementAndGet()
+        abortCore()
+        later { stop(getString(R.string.vpn_revoked), seq) }
     }
 
     /** Runs on [worker]; a callback that arrives after onDestroy is dropped. */
@@ -184,36 +199,37 @@ class TunnelService : VpnService() {
     override fun onDestroy() {
         val isCurrent = active === this
         if (isCurrent) {
-            commandSeq++
-            Mobile.stop()
+            commandSeq.incrementAndGet()
+            abortCore()
         }
         onWorker {
-            val wasActive = !destroyed && active === this
+            val shouldStopCore = !destroyed && (active === this || tun != null)
             destroyed = true
             if (active === this) active = null
             cancelRestart()
             cancelHealthCheck()
+            cancelBlockedRetry()
             unwatch()
-            close(stopCore = wasActive)
-            if (wasActive) set(State.OFF, error)
+            close(stopCore = shouldStopCore)
+            if (shouldStopCore) set(State.OFF, error)
         }
         super.onDestroy()
     }
 
-    /** One restart for network changes that arrive within [RESTART_DELAY_MS]. Runs on [worker]. */
+    /** Объединяет серию сетевых событий в пределах [RESTART_DELAY_MS] в один перезапуск. */
     private fun restartSoon(full: Boolean) {
         restartFull = restartFull || full
         if (restart != null) return
-        val seq = commandSeq
+        val seq = commandSeq.get()
         restart = worker.schedule(
             Runnable {
                 restart = null
-                if (destroyed || active !== this || seq != commandSeq || state == State.OFF || state == State.STARTING) {
-                    return@Runnable
-                }
                 val rebuild = restartFull || tun == null
                 restartFull = false
-                if (rebuild) start() else guarded { restartXray() }
+                if (destroyed || active !== this || seq != commandSeq.get() || state == State.OFF || state == State.STARTING) {
+                    return@Runnable
+                }
+                if (rebuild) start(seq) else guarded { restartXray(seq) }
             },
             RESTART_DELAY_MS,
             TimeUnit.MILLISECONDS,
@@ -236,17 +252,19 @@ class TunnelService : VpnService() {
     }
 
     /**
-     * Brings the tunnel up, or moves a running one to the current profile and
-     * apps. The new interface is established before the old one is closed:
-     * Android swaps them in one step, so the picked apps never have a moment
-     * outside the tunnel.
+     * Поднимает туннель или переводит работающий на текущий профиль и список приложений.
+     * Новый интерфейс создаётся до закрытия старого, чтобы трафик приложений не утёк.
      */
-    private fun start() {
-        guarded { bringUp() }
+    private fun start(seq: Int) {
+        guarded { bringUp(seq) }
     }
 
-    private fun bringUp() {
+    private fun bringUp(seq: Int) {
+        if (destroyed || active !== this || seq != commandSeq.get()) return
+        cancelBlockedRetry()
         set(State.STARTING)
+        // Переводим сервис в foreground сразу, не дожидаясь Mobile.start (Verify может занять до ~19 с).
+        foreground(NoteMode.STARTING)
         val profile = Store.selected(this) ?: return fail(getString(R.string.need_profile))
         val builder = Builder()
             .setSession(getString(R.string.app_name))
@@ -255,9 +273,9 @@ class TunnelService : VpnService() {
             .addAddress("fd6f:a5b9:7e11::1", 126)
             .addRoute("0.0.0.0", 0)
             .addRoute("::", 0)
-            // Any address works: Xray answers port 53 itself, through the tunnel.
+            // Любой адрес: Xray перехватывает порт 53 сам через туннель.
             .addDnsServer("1.1.1.1")
-        // false = take the meteredness of the real network (true would always say metered).
+        // false = наследовать meteredness реальной сети.
         if (Build.VERSION.SDK_INT >= 29) builder.setMetered(false)
         var allowed = 0
         for (pkg in Store.apps(this)) {
@@ -266,50 +284,60 @@ class TunnelService : VpnService() {
                 builder.addAllowedApplication(pkg)
                 allowed++
             } catch (e: PackageManager.NameNotFoundException) {
-                // Uninstalled since it was picked.
+                // Приложение уже удалено.
             }
         }
-        // With no allowed app the VPN would take every app, Ashgate included.
+        // Без списка разрешённых приложений VPN захватил бы всё, включая сам Ashgate.
         if (allowed == 0) return fail(getString(R.string.need_apps))
+        if (destroyed || active !== this || seq != commandSeq.get()) return
         var fd: ParcelFileDescriptor? = null
         try {
             fd = builder.establish()
         } catch (e: Exception) {
             return fail(e.message ?: e.javaClass.simpleName)
         }
-        // null: the VPN permission was taken away, and the old interface with it.
-        if (fd == null) return stop(getString(R.string.no_vpn_permission))
+        // null: разрешение на VPN отозвано, и старый интерфейс уже снят.
+        if (fd == null) return stop(getString(R.string.no_vpn_permission), seq)
+        if (destroyed || active !== this || seq != commandSeq.get()) {
+            closeQuietly(fd)
+            return
+        }
         val old = tun
         tun = fd
         closeQuietly(old)
-        runXray(profile, fd)
+        runXray(profile, fd, seq)
     }
 
-    /** A new Xray on the interface that is up, which stays: nothing leaks meanwhile. */
-    private fun restartXray() {
+    /** Перезапускает Xray на уже поднятом TUN-интерфейсе без утечки трафика. */
+    private fun restartXray(seq: Int) {
+        if (destroyed || active !== this || seq != commandSeq.get()) return
         val fd = tun ?: return
+        cancelBlockedRetry()
         set(State.STARTING)
+        foreground(NoteMode.STARTING)
         val profile = Store.selected(this) ?: return fail(getString(R.string.need_profile))
-        runXray(profile, fd)
+        runXray(profile, fd, seq)
     }
 
-    private fun runXray(profile: JSONObject, fd: ParcelFileDescriptor) {
-        val seq = commandSeq
+    private fun runXray(profile: JSONObject, fd: ParcelFileDescriptor, seq: Int) {
+        if (destroyed || active !== this || seq != commandSeq.get()) return
         cancelHealthCheck()
         try {
-            // Stops the previous Xray, if any, starts one on this interface, and
-            // verifies that the VLESS/proxy connection is up and stable.
+            // Останавливает предыдущий Xray (если есть), запускает новый на этом fd
+            // и проверяет стабильность соединения через прокси-сервер.
             Mobile.start(profile.toString(), fd.fd.toLong(), geodata().path)
-        } catch (e: Exception) {
-            if (destroyed || seq != commandSeq) return
+        } catch (e: Throwable) {
+            if (destroyed || active !== this || seq != commandSeq.get()) return
             return fail(e.message ?: e.javaClass.simpleName)
         }
-        if (destroyed || seq != commandSeq) {
+        if (destroyed || active !== this || seq != commandSeq.get()) {
             Mobile.stop()
             return
         }
+        blockedAttempt = 0
+        cancelBlockedRetry()
         watch()
-        foreground(blocked = false)
+        foreground(NoteMode.ON, profile.optString("name"))
         set(State.ON)
         scheduleHealthCheck(seq)
     }
@@ -319,15 +347,15 @@ class TunnelService : VpnService() {
         healthCheck = worker.schedule(
             Runnable {
                 healthCheck = null
-                if (destroyed || seq != commandSeq || state != State.ON) return@Runnable
+                if (destroyed || active !== this || seq != commandSeq.get() || state != State.ON) return@Runnable
                 try {
                     Mobile.check()
-                } catch (e: Exception) {
-                    if (destroyed || seq != commandSeq || state != State.ON) return@Runnable
+                } catch (e: Throwable) {
+                    if (destroyed || active !== this || seq != commandSeq.get() || state != State.ON) return@Runnable
                     fail(e.message ?: e.javaClass.simpleName)
                     return@Runnable
                 }
-                if (!destroyed && seq == commandSeq && state == State.ON) {
+                if (!destroyed && active === this && seq == commandSeq.get() && state == State.ON) {
                     scheduleHealthCheck(seq)
                 }
             },
@@ -341,33 +369,60 @@ class TunnelService : VpnService() {
         healthCheck = null
     }
 
+    /** Планирует автоповтор подключения из состояния BLOCKED с экспоненциальным backoff. */
+    private fun scheduleBlockedRetry(seq: Int) {
+        cancelBlockedRetry()
+        val idx = blockedAttempt.coerceAtMost(BLOCKED_RETRY_MS.lastIndex)
+        val delayMs = BLOCKED_RETRY_MS[idx]
+        blockedAttempt++
+        blockedRetry = worker.schedule(
+            Runnable {
+                blockedRetry = null
+                if (destroyed || active !== this || seq != commandSeq.get() || state != State.BLOCKED || tun == null) {
+                    return@Runnable
+                }
+                guarded { restartXray(seq) }
+            },
+            delayMs,
+            TimeUnit.MILLISECONDS,
+        )
+    }
+
+    private fun cancelBlockedRetry() {
+        blockedRetry?.cancel(false)
+        blockedRetry = null
+    }
+
     /**
-     * A start that failed. If the VPN interface is up, it stays up without
-     * Xray: the picked apps are cut off rather than sent around the tunnel.
-     * With no interface yet nothing can leak, so the service just ends.
+     * Неудачный запуск или разрыв. Если TUN-интерфейс уже поднят, он остаётся без Xray
+     * (fail-closed: выбранные приложения без сети, утечки нет), но планируется автоповтор.
      */
     private fun fail(reason: String) {
         cancelHealthCheck()
-        if (tun == null) return stop(reason)
+        val seq = commandSeq.get()
+        if (tun == null) return stop(reason, seq)
         Mobile.stop()
-        // First: the screen must say so whatever happens below.
+        // Сначала обновляем состояние, чтобы UI показал причину независимо от дальнейших шагов.
         set(State.BLOCKED, reason)
-        watch() // a new network retries by itself
-        foreground(blocked = true)
+        watch()
+        foreground(NoteMode.BLOCKED)
+        scheduleBlockedRetry(seq)
     }
 
-    private fun stop(reason: String?) {
+    private fun stop(reason: String?, seq: Int) {
         val wasUp = tun != null || expectedUp
         expectedUp = false
-        destroyed = true
-        if (active === this) active = null
+        blockedAttempt = 0
         cancelRestart()
         cancelHealthCheck()
+        cancelBlockedRetry()
         unwatch()
         close(stopCore = true)
+        // Не трогаем глобальное состояние и не вызываем stopSelf, если в очереди уже есть более новая команда.
+        if (seq != commandSeq.get()) return
+        if (active === this) active = null
         set(State.OFF, reason)
         stopForeground(STOP_FOREGROUND_REMOVE)
-        // Not asked for by the user: the picked apps are outside the tunnel now.
         if (reason != null && wasUp) notifyDown()
         stopSelf(lastStartId)
     }
@@ -416,7 +471,22 @@ class TunnelService : VpnService() {
                         seeded = true
                         return@later
                     }
-                    if (previous != n && state != State.OFF) restartSoon(full = false)
+                    if (previous != n && state != State.OFF) {
+                        blockedAttempt = 0
+                        restartSoon(full = false)
+                    }
+                }
+            }
+
+            override fun onCapabilitiesChanged(n: Network, caps: NetworkCapabilities) {
+                if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) return
+                if (!caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)) return
+                later {
+                    if (watching !== this) return@later
+                    if (state == State.BLOCKED) {
+                        blockedAttempt = 0
+                        restartSoon(full = false)
+                    }
                 }
             }
         }
@@ -439,7 +509,7 @@ class TunnelService : VpnService() {
                 later {
                     if (tun != null && pkg in Store.apps(this@TunnelService)) {
                         cancelRestart()
-                        start()
+                        start(commandSeq.get())
                     }
                 }
             }
@@ -519,7 +589,9 @@ class TunnelService : VpnService() {
         getSystemService(NotificationManager::class.java).notify(NOTE_DOWN, notification)
     }
 
-    private fun foreground(blocked: Boolean) {
+    private enum class NoteMode { STARTING, ON, BLOCKED }
+
+    private fun foreground(mode: NoteMode, profileName: String? = null) {
         getSystemService(NotificationManager::class.java).cancel(NOTE_DOWN)
         val builder = notificationBuilder("tunnel", R.string.channel, NotificationManager.IMPORTANCE_LOW)
         val flags = PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
@@ -530,16 +602,25 @@ class TunnelService : VpnService() {
             .setSmallIcon(R.drawable.ic_stat)
             .setContentIntent(openApp())
             .setOngoing(true)
-        if (blocked) {
-            val retry = PendingIntent.getService(
-                this, 2, Intent(this, TunnelService::class.java).setAction(RETRY), flags,
-            )
-            builder.setContentTitle(getString(R.string.state_blocked))
-                .setContentText(getString(R.string.blocked_note))
-                .addAction(Notification.Action.Builder(null, getString(R.string.retry), retry).build())
-        } else {
-            builder.setContentTitle(getString(R.string.state_on))
-                .setContentText(Store.selected(this)?.optString("name"))
+        when (mode) {
+            NoteMode.BLOCKED -> {
+                val retry = PendingIntent.getService(
+                    this, 2, Intent(this, TunnelService::class.java).setAction(RETRY), flags,
+                )
+                builder.setContentTitle(getString(R.string.state_blocked))
+                    .setContentText(getString(R.string.blocked_note))
+                    .addAction(Notification.Action.Builder(null, getString(R.string.retry), retry).build())
+            }
+            NoteMode.STARTING -> {
+                builder.setContentTitle(getString(R.string.state_starting))
+                    .setContentText(profileName?.takeIf { it.isNotEmpty() } ?: getString(R.string.title_starting))
+            }
+            NoteMode.ON -> {
+                val name = profileName?.takeIf { it.isNotEmpty() }
+                    ?: try { Store.selected(this)?.optString("name") } catch (_: Exception) { null }
+                builder.setContentTitle(getString(R.string.state_on))
+                    .setContentText(name)
+            }
         }
         val notification = builder
             .addAction(Notification.Action.Builder(null, getString(R.string.disconnect), off).build())
@@ -551,7 +632,8 @@ class TunnelService : VpnService() {
                 startForeground(NOTE_TUNNEL, notification)
             }
         } catch (e: Exception) {
-            // The system keeps a connected VpnService alive without it.
+            // Логируем только класс исключения (без сообщений); активный VpnService продолжает работу.
+            Log.w("Ashgate", "startForeground failed: " + e.javaClass.name)
         }
     }
 }

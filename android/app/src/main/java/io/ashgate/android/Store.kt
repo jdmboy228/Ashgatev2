@@ -7,6 +7,7 @@ import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKeys
 import org.json.JSONArray
 import org.json.JSONObject
+import java.security.GeneralSecurityException
 import java.security.KeyStore
 import java.security.UnrecoverableKeyException
 import java.util.UUID
@@ -51,36 +52,39 @@ object Store {
     private fun prefs(ctx: Context): SharedPreferences =
         cached ?: openOrWipe(ctx).also { cached = it }
 
-    // Twice, with a short pause: the Keystore sometimes fails right after boot.
-    private fun openOrWipe(ctx: Context): SharedPreferences = tryOpen(ctx) ?: run {
+    // Две попытки с короткой паузой: Android Keystore иногда отвечает отказом сразу после загрузки.
+    private fun openOrWipe(ctx: Context): SharedPreferences {
+        var lastError: Exception? = null
+        tryOpen(ctx) { lastError = it }?.let { return it }
         try {
             Thread.sleep(50)
         } catch (_: InterruptedException) {
         }
-        tryOpen(ctx)
-    } ?: run {
-        if (!fileIsLost()) throw Unavailable()
-        // The Keystore works now, so a failure from here on is the file's.
-        tryOpen(ctx) ?: wipeAndOpen(ctx)
+        tryOpen(ctx) { lastError = it }?.let { return it }
+        if (!fileIsLost(lastError)) throw Unavailable()
+        // Ключ либо окончательно потерян, либо рабочий ключ не может расшифровать повреждённый файл.
+        return tryOpen(ctx) { lastError = it } ?: wipeAndOpen(ctx)
     }
 
-    private fun tryOpen(ctx: Context): SharedPreferences? = try {
+    private fun tryOpen(ctx: Context, onError: (Exception) -> Unit = {}): SharedPreferences? = try {
         open(ctx)
     } catch (e: Exception) {
+        onError(e)
         null
     }
 
     /**
-     * Whether the file failed to open for good: the key is gone or dead, or
-     * it works and the file still does not open. A Keystore that fails on
-     * its own may recover, so then nothing may be deleted.
+     * Проверяет, потеряны ли зашифрованные данные безвозвратно:
+     * — ключ в Keystore отсутствует или окончательно инвалидирован;
+     * — либо ключ исправен, но само расшифровывание файла/keyset упало с крипто-ошибкой.
+     * Транзиентные сбои Keystore или ошибки парсинга не приводят к удалению профилей.
      */
-    private fun fileIsLost(): Boolean {
+    private fun fileIsLost(lastError: Exception?): Boolean {
         try {
             val store = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
             val key = store.getKey(MASTER_KEY, null) as SecretKey? ?: return true
             Cipher.getInstance("AES/GCM/NoPadding").apply { init(Cipher.ENCRYPT_MODE, key) }.doFinal(ByteArray(16))
-            return true
+            return isCryptoFileFailure(lastError)
         } catch (e: KeyPermanentlyInvalidatedException) {
             return true
         } catch (e: UnrecoverableKeyException) {
@@ -90,11 +94,22 @@ object Store {
         }
     }
 
+    /** Ищет в цепочке причин подтверждённую ошибку расшифровки или битого keyset Tink. */
+    private fun isCryptoFileFailure(err: Throwable?): Boolean {
+        var cur: Throwable? = err
+        var depth = 0
+        while (cur != null && depth++ < 16) {
+            if (cur is GeneralSecurityException || cur is SecurityException) return true
+            val name = cur.javaClass.name
+            if (name.contains("InvalidProtocolBuffer") || name.contains("AEAD")) return true
+            cur = cur.cause
+        }
+        return false
+    }
+
     /**
-     * The key in the Keystore is gone or does not fit the file: the data was
-     * moved to a new phone (the key never moves), or the key broke.
-     * Nothing in the file can be read again, so start over instead of
-     * failing on every launch.
+     * Ключ в Keystore пропал или не подходит к файлу (например, перенос данных на другой телефон).
+     * Прочитать старый файл невозможно, поэтому очищаем его и начинаем с чистого состояния.
      */
     private fun wipeAndOpen(ctx: Context): SharedPreferences {
         ctx.applicationContext.deleteSharedPreferences(FILE)
@@ -114,13 +129,32 @@ object Store {
             EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
             EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM,
         )
-        // A wrong key can open the file and fail only on the first read.
-        // Cache the decrypted values so later UI reads never re-decrypt on the main thread.
-        val arr = JSONArray(p.getString("profiles", "[]") ?: "[]")
-        cachedProfiles = List(arr.length()) { arr.getJSONObject(it).toString() }
-        cachedSelected = p.getString("selected", null)
-        cachedApps = p.getStringSet("apps", emptySet())?.toSet() ?: emptySet()
+        // Неверный ключ может открыть файл и упасть только на первом чтении.
+        // Кэшируем расшифрованные значения, чтобы последующие чтения UI не дёргали Keystore.
+        val rawProfiles = p.getString("profiles", null)
+        val selected = p.getString("selected", null)
+        val apps = p.getStringSet("apps", emptySet())?.toSet() ?: emptySet()
+        // Разбор JSON выполняем отдельно от криптографии: один битый элемент не должен стирать все профили.
+        cachedProfiles = parseProfiles(rawProfiles)
+        cachedSelected = selected
+        cachedApps = apps
         return p
+    }
+
+    private fun parseProfiles(raw: String?): List<String> {
+        if (raw.isNullOrBlank()) return emptyList()
+        val arr = try {
+            JSONArray(raw)
+        } catch (_: Exception) {
+            return emptyList()
+        }
+        val out = ArrayList<String>(arr.length())
+        for (i in 0 until arr.length()) {
+            val obj = arr.optJSONObject(i) ?: continue
+            if (obj.optString("id").isEmpty()) continue
+            out.add(obj.toString())
+        }
+        return out
     }
 
     private const val FILE = "ashgate"
@@ -146,7 +180,8 @@ object Store {
     private fun save(ctx: Context, list: List<JSONObject>) {
         val p = prefs(ctx)
         cachedProfiles = list.map { it.toString() }
-        p.edit().putString("profiles", JSONArray(list).toString()).apply()
+        // Синхронная запись, чтобы профили не потерялись при резком завершении процесса.
+        p.edit().putString("profiles", JSONArray(list).toString()).commit()
     }
 
     /** Adds a profile, or replaces the one with the same id. */

@@ -162,4 +162,23 @@ func TestFormatErrorAndCheckNotRunning(t *testing.T) {
 	if !strings.HasPrefix(pxErr.Error(), "Прокси: ") || strings.Contains(pxErr.Error(), "192.0.2.10") {
 		t.Fatalf("unexpected proxy error format: %v", pxErr)
 	}
+	cancelErr := formatError(v, context.Canceled)
+	if cancelErr.Error() != "Подключение отменено" {
+		t.Fatalf("canceled error = %q, want %q", cancelErr.Error(), "Подключение отменено")
+	}
+}
+
+func TestStopDoesNotBlockOnCheckAndIdempotent(t *testing.T) {
+	// Повторные и конкурентные вызовы Stop/Check в остановленном состоянии не должны паниковать или зависать.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 50; i++ {
+			Stop()
+			if err := Check(); err == nil {
+				t.Errorf("Check succeeded while stopped")
+			}
+		}
+	}()
+	<-done
 }

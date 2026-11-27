@@ -314,6 +314,7 @@ func TestVerifyAndCheckXHTTPReality(t *testing.T) {
 	t.Cleanup(func() { _ = probeLn.Close() })
 	var dropAfterFirst bool
 	var probeHits int
+	var probeStatus = "204 No Content"
 	go func() {
 		for {
 			c, err := probeLn.Accept()
@@ -322,17 +323,18 @@ func TestVerifyAndCheckXHTTPReality(t *testing.T) {
 			}
 			probeHits++
 			hit := probeHits
+			status := probeStatus
 			if dropAfterFirst && hit > 1 {
 				_ = c.Close()
 				continue
 			}
-			go func(conn net.Conn) {
+			go func(conn net.Conn, st string) {
 				defer conn.Close()
 				_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
 				b := make([]byte, 512)
 				_, _ = conn.Read(b)
-				_, _ = io.WriteString(conn, "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
-			}(c)
+				_, _ = io.WriteString(conn, "HTTP/1.1 "+st+"\r\nContent-Length: 0\r\n\r\n")
+			}(c, status)
 		}
 	}()
 
@@ -452,7 +454,31 @@ func TestVerifyAndCheckXHTTPReality(t *testing.T) {
 		t.Fatalf("Verify dead server: got %v", err)
 	}
 
-	// 7. Connected tunnel whose VLESS server stops later -> Check detects failure.
+	// 7. Non-204 HTTP responses (e.g., 403/302 from Google on datacenter IPs) still prove tunnel liveness;
+	// 407 (proxy auth required) and 502 (bad gateway) must fail.
+	probeStatus = "403 Forbidden"
+	inst, err = vless.Run(clientDoc(net.JoinHostPort("127.0.0.1", itoa(port)), goodParams))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := vless.Verify(inst); err != nil {
+		_ = inst.Close()
+		t.Fatalf("Verify with 403 target failed: %v", err)
+	}
+	probeStatus = "407 Proxy Authentication Required"
+	if err := vless.Check(inst); err == nil || err.Error() != "VLESS: отклонена авторизация прокси" {
+		_ = inst.Close()
+		t.Fatalf("Check with 407: got %v", err)
+	}
+	probeStatus = "502 Bad Gateway"
+	if err := vless.Check(inst); err == nil {
+		_ = inst.Close()
+		t.Fatal("Check with 502 succeeded")
+	}
+	_ = inst.Close()
+	probeStatus = "204 No Content"
+
+	// 8. Connected tunnel whose VLESS server stops later -> Check detects failure.
 	inst, err = vless.Run(clientDoc(net.JoinHostPort("127.0.0.1", itoa(port)), goodParams))
 	if err != nil {
 		t.Fatal(err)

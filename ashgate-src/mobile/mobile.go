@@ -4,6 +4,7 @@
 package mobile
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -53,6 +54,10 @@ func encode(v any) (string, error) {
 }
 
 var (
+	// startMu сериализует вызовы Start (защищает глобальные переменные окружения xray.tun.fd / asset).
+	startMu sync.Mutex
+	// mu защищает только лёгкие поля состояния; блокирующие I/O и Close выполняются вне mu,
+	// чтобы Stop() никогда не ждал запуска Xray.
 	mu            sync.Mutex
 	running       io.Closer
 	activeProfile mobilecfg.Profile
@@ -60,6 +65,9 @@ var (
 )
 
 func formatError(p mobilecfg.Profile, err error) error {
+	if errors.Is(err, context.Canceled) {
+		return errors.New("Подключение отменено")
+	}
 	msg := p.Mask(err.Error())
 	if p.Kind != mobilecfg.KindVLESS && strings.HasPrefix(msg, "VLESS: ") {
 		msg = "Прокси: " + strings.TrimPrefix(msg, "VLESS: ")
@@ -67,10 +75,9 @@ func formatError(p mobilecfg.Profile, err error) error {
 	return errors.New(msg)
 }
 
-// Start runs Xray for a profile on the TUN descriptor fd and verifies that
-// the connection through the proxy server is up and stable before returning.
-// Xray reads a duplicate, so the caller still owns and closes fd. assetDir
-// holds geosite.dat.
+// Start запускает Xray для профиля на дескрипторе TUN fd и проверяет, что
+// соединение через прокси-сервер поднялось и стабильно. Xray дублирует fd,
+// поэтому вызывающая сторона продолжает владеть им и закрывает его сама.
 func Start(profileJSON string, fd int, assetDir string) error {
 	var p mobilecfg.Profile
 	if err := json.Unmarshal([]byte(profileJSON), &p); err != nil {
@@ -80,34 +87,60 @@ func Start(profileJSON string, fd int, assetDir string) error {
 	if err != nil {
 		return err
 	}
+
+	startMu.Lock()
+	defer startMu.Unlock()
+
 	mu.Lock()
 	gen++
 	myGen := gen
 	prev := running
 	running = nil
 	activeProfile = mobilecfg.Profile{}
+	mu.Unlock()
+
 	if prev != nil {
 		_ = prev.Close()
 	}
+
+	mu.Lock()
+	if gen != myGen {
+		mu.Unlock()
+		return errors.New("Подключение отменено")
+	}
+	mu.Unlock()
+
 	os.Setenv("xray.location.asset", assetDir)
 	os.Setenv("xray.tun.fd", strconv.Itoa(fd))
 	inst, err := vless.Run(raw)
 	if err != nil {
-		mu.Unlock()
 		return errors.New("Не удалось запустить Xray: " + p.Mask(err.Error()))
+	}
+
+	mu.Lock()
+	if gen != myGen {
+		mu.Unlock()
+		_ = inst.Close()
+		return errors.New("Подключение отменено")
 	}
 	running = inst
 	activeProfile = p
 	mu.Unlock()
 
 	if err := vless.Verify(inst); err != nil {
-		_ = inst.Close()
+		// Сначала убираем инстанс из глобального состояния под замком,
+		// чтобы параллельный Check не получил уже закрываемый инстанс.
 		mu.Lock()
+		cancelled := gen != myGen
 		if running == inst {
 			running = nil
 			activeProfile = mobilecfg.Profile{}
 		}
 		mu.Unlock()
+		_ = inst.Close()
+		if cancelled || errors.Is(err, context.Canceled) {
+			return errors.New("Подключение отменено")
+		}
 		return formatError(p, err)
 	}
 	mu.Lock()
@@ -120,25 +153,31 @@ func Start(profileJSON string, fd int, assetDir string) error {
 	return nil
 }
 
-// Check verifies that the running tunnel still passes traffic through its
-// proxy server. It returns an error when nothing runs or the server stopped
-// answering.
+// Check проверяет, что запущенный туннель продолжает пропускать трафик через
+// прокси-сервер. Возвращает ошибку, если туннель не запущен или сервер перестал отвечать.
 func Check() error {
 	mu.Lock()
 	inst := running
 	p := activeProfile
+	myGen := gen
 	mu.Unlock()
 	if inst == nil {
 		return errors.New("Туннель не запущен")
 	}
 	if err := vless.Check(inst); err != nil {
+		mu.Lock()
+		stale := gen != myGen || running != inst
+		mu.Unlock()
+		if stale || errors.Is(err, context.Canceled) {
+			return errors.New("Подключение отменено")
+		}
 		return formatError(p, err)
 	}
 	return nil
 }
 
-// Stop ends Xray and aborts any in-flight Start or Check. It is safe to call
-// when nothing runs.
+// Stop останавливает Xray и прерывает любые текущие Start или Check.
+// Безопасен при вызове в остановленном состоянии и не блокируется на запуске Xray.
 func Stop() {
 	mu.Lock()
 	gen++

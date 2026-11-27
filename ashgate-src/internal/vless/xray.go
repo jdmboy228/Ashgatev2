@@ -114,23 +114,41 @@ func Run(raw []byte) (io.Closer, error) {
 	return &runInstance{inst: inst, tr: tr}, nil
 }
 
-// Probe settings for Verify and Check. Tests point ProbeHost and ProbePort
-// at a local HTTP server and shorten ProbePause / ProbeWait.
+const (
+	defaultProbeHost         = "www.gstatic.com"
+	defaultProbePort  uint16 = 80
+)
+
+// Настройки пробы для Verify и Check. Тесты перенаправляют ProbeHost и ProbePort
+// на локальный HTTP-сервер и сокращают ProbePause / ProbeWait.
 var (
-	ProbeHost         = "www.gstatic.com"
-	ProbePort  uint16 = 80
-	ProbePause        = 300 * time.Millisecond
-	ProbeWait         = 6 * time.Second
+	ProbeHost                = defaultProbeHost
+	ProbePort         uint16 = defaultProbePort
+	ProbeFallbackHost        = "cp.cloudflare.com"
+	ProbeFallbackPort uint16 = 80
+	ProbePause               = 300 * time.Millisecond
+	ProbeWait                = 6 * time.Second
 )
 
 const probeUA = "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36"
 
-func probeOnce(parent context.Context, inst *instance) error {
+type probeStatusError struct {
+	code int
+}
+
+func (e probeStatusError) Error() string {
+	if e.code == http.StatusProxyAuthRequired {
+		return "VLESS: отклонена авторизация прокси"
+	}
+	return fmt.Errorf("unexpected status %d", e.code).Error()
+}
+
+func probeTarget(parent context.Context, inst *instance, host string, port uint16) error {
 	ctx, cancel := context.WithTimeout(parent, ProbeWait)
 	defer cancel()
-	// Tag "dns-in" (not "tun") ensures the probe always routes through the
-	// proxy outbound, even when tests point ProbeHost at a LAN/loopback IP.
-	conn, err := dialInstance(ctx, inst, "dns-in", ProbeHost, ProbePort)
+	// Тег "dns-in" (а не "tun") гарантирует маршрутизацию пробы через прокси-outbound,
+	// даже когда тесты направляют ProbeHost на loopback/LAN.
+	conn, err := dialInstance(ctx, inst, "dns-in", host, port)
 	if err != nil {
 		return err
 	}
@@ -142,7 +160,7 @@ func probeOnce(parent context.Context, inst *instance) error {
 	for i := range pad {
 		pad[i] = "0123456789abcdef"[rand.IntN(16)]
 	}
-	req := "GET /generate_204 HTTP/1.1\r\nHost: " + ProbeHost +
+	req := "GET /generate_204 HTTP/1.1\r\nHost: " + host +
 		"\r\nUser-Agent: " + probeUA +
 		"\r\nAccept: */*\r\nX-Request-Id: " + string(pad) +
 		"\r\nConnection: close\r\n\r\n"
@@ -154,10 +172,33 @@ func probeOnce(parent context.Context, inst *instance) error {
 		return err
 	}
 	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusNoContent {
-		return fmt.Errorf("unexpected status %d", resp.StatusCode)
+	// Любой HTTP-ответ 2xx-4xx (кроме 407 Proxy Auth Required) подтверждает,
+	// что туннель пропустил запрос и вернул ответ (даже если Google отдал 403/302 на VPS IP).
+	if resp.StatusCode >= 200 && resp.StatusCode < 500 && resp.StatusCode != http.StatusProxyAuthRequired {
+		return nil
 	}
-	return nil
+	return probeStatusError{code: resp.StatusCode}
+}
+
+func probeOnce(parent context.Context, inst *instance, attempt int) error {
+	// Если тесты переопределили ProbeHost/ProbePort, используем только тестовую цель.
+	useFallback := ProbeHost == defaultProbeHost && ProbePort == defaultProbePort && ProbeFallbackHost != ""
+	host, port := ProbeHost, ProbePort
+	altHost, altPort := ProbeFallbackHost, ProbeFallbackPort
+	if useFallback && attempt%2 == 1 {
+		host, port, altHost, altPort = altHost, altPort, host, port
+	}
+	err := probeTarget(parent, inst, host, port)
+	if err == nil || !useFallback || parent.Err() != nil {
+		return err
+	}
+	// При 5xx от первого контрольного хоста сразу пробуем резервный хост,
+	// чтобы временный сбой gstatic/cloudflare не ломал проверку туннеля.
+	var statusErr probeStatusError
+	if errors.As(err, &statusErr) && statusErr.code >= 500 {
+		return probeTarget(parent, inst, altHost, altPort)
+	}
+	return err
 }
 
 // isHardFailure reports errors that cannot recover on an immediate retry
@@ -170,6 +211,7 @@ func isHardFailure(err error) bool {
 	return strings.HasPrefix(s, "REALITY:") ||
 		s == certFailed ||
 		strings.Contains(s, "отклонил") ||
+		strings.Contains(s, "отклонена авторизация") ||
 		strings.Contains(s, "не удалось найти адрес") ||
 		strings.Contains(s, "(таймаут)")
 }
@@ -196,7 +238,7 @@ func Verify(c io.Closer) error {
 			}
 		}
 		start := time.Now()
-		err := probeOnce(r.tr.ctx, r.inst)
+		err := probeOnce(r.tr.ctx, r.inst, try)
 		if r.tr.ctx.Err() != nil {
 			return r.tr.ctx.Err()
 		}
@@ -240,7 +282,7 @@ func Check(c io.Closer) error {
 			}
 		}
 		start := time.Now()
-		err := probeOnce(r.tr.ctx, r.inst)
+		err := probeOnce(r.tr.ctx, r.inst, try)
 		if r.tr.ctx.Err() != nil {
 			return r.tr.ctx.Err()
 		}
@@ -248,6 +290,9 @@ func Check(c io.Closer) error {
 			return nil
 		}
 		lastErr = TunnelError(start, err)
+		if isHardFailure(lastErr) {
+			return lastErr
+		}
 	}
 	return lastErr
 }
@@ -263,8 +308,9 @@ func (r *runInstance) Close() error {
 	r.once.Do(func() {
 		clearActiveTracker(r.tr)
 		r.tr.cancel()
-		err = r.inst.Close()
+		// Сначала принудительно закрываем активные сокеты, чтобы не блокироваться внутри inst.Close().
 		r.tr.closeAll()
+		err = r.inst.Close()
 	})
 	return err
 }
