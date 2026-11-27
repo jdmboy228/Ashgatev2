@@ -1,6 +1,7 @@
-﻿package io.ashgate.android
+package io.ashgate.android
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.Context
 import android.content.Intent
@@ -28,6 +29,7 @@ import android.view.View
 import android.widget.ImageButton
 import android.widget.TextView
 import android.widget.Toast
+import com.google.zxing.qrcode.QRCodeReader
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.thread
 
@@ -48,6 +50,9 @@ class QrScanActivity : Activity() {
         private const val MAX_PREVIEW_W = 1920
         private const val MAX_IMAGE_SIDE = 1600
         private const val COOLDOWN_MS = 1500L
+        /** Минимальный интервал между декодированиями кадров камеры (~8 fps вместо 30 fps). */
+        private const val ANALYZE_INTERVAL_MS = 120L
+        private const val INVERT_EVERY_N = 6
     }
 
     private lateinit var preview: TextureView
@@ -67,12 +72,21 @@ class QrScanActivity : Activity() {
     private var previewSurface: Surface? = null
     private var request: CaptureRequest.Builder? = null
     private var active = false
+    /** Идёт асинхронный openCamera(): teardown() не гасит camThread до прихода колбэка. */
+    private var opening = false
+    private var quitAfterOpen = false
     private var torchOn = false
     private var previewSize = android.util.Size(0, 0)
     private var sensorOrientation = 90
 
     private val analyzing = AtomicBoolean(false)
     private val importing = AtomicBoolean(false)
+
+    /** Переиспользуемые буферы анализа (используются только из camThread под analyzing). */
+    private var yBuf = ByteArray(0)
+    private var packedBuf = ByteArray(0)
+    private val qrReader = QRCodeReader()
+    private var lastAnalyzeAt = 0L
 
     @Volatile
     private var frameCount = 0
@@ -88,7 +102,14 @@ class QrScanActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        if (!Store.usable(this)) return finish()
+        // Не блокируем UI-поток на Keystore при холодном восстановлении Activity.
+        if (!Store.isOpen) {
+            thread {
+                if (!Store.usable(this)) {
+                    runOnUiThread { if (!isFinishing && !isDestroyed) finish() }
+                }
+            }
+        }
         setContentView(R.layout.activity_qr_scan)
         asked = savedInstanceState?.getBoolean(STATE_ASKED) ?: false
         preview = findViewById(R.id.preview)
@@ -198,10 +219,11 @@ class QrScanActivity : Activity() {
 
     // ---- Camera ----
 
+    @SuppressLint("MissingPermission")
     private fun startCamera() {
         if (isFinishing || isDestroyed || !hasPermission()) return
         synchronized(cameraLock) {
-            if (active) return
+            if (active || opening) return
             try {
                 val mgr = getSystemService(Context.CAMERA_SERVICE) as CameraManager
                 val ids = mgr.cameraIdList
@@ -252,32 +274,65 @@ class QrScanActivity : Activity() {
                 r.setOnImageAvailableListener({ ir -> analyze(ir) }, h)
                 previewSurface = Surface(st)
                 active = true
+                opening = true
+                quitAfterOpen = false
                 mgr.openCamera(
                     id,
                     object : CameraDevice.StateCallback() {
                         override fun onOpened(camera: CameraDevice) {
+                            var threadToQuit: HandlerThread? = null
                             val keep = synchronized(cameraLock) {
+                                opening = false
                                 if (active && device == null && reader === r) {
                                     device = camera
                                     true
                                 } else {
+                                    if (quitAfterOpen && camThread === t) {
+                                        threadToQuit = t
+                                        camThread = null
+                                        handler = null
+                                        quitAfterOpen = false
+                                    }
                                     false
                                 }
                             }
                             if (!keep) {
-                                camera.close()
+                                try { camera.close() } catch (_: Throwable) {}
+                                try { threadToQuit?.quitSafely() } catch (_: Throwable) {}
                                 return
                             }
                             createSession(camera, continuousAf, flash)
                         }
 
                         override fun onDisconnected(camera: CameraDevice) {
-                            camera.close()
+                            var threadToQuit: HandlerThread? = null
+                            synchronized(cameraLock) {
+                                opening = false
+                                if (quitAfterOpen && camThread === t) {
+                                    threadToQuit = t
+                                    camThread = null
+                                    handler = null
+                                    quitAfterOpen = false
+                                }
+                            }
+                            try { camera.close() } catch (_: Throwable) {}
+                            try { threadToQuit?.quitSafely() } catch (_: Throwable) {}
                             runOnUiThread { stopCamera() }
                         }
 
                         override fun onError(camera: CameraDevice, error: Int) {
-                            camera.close()
+                            var threadToQuit: HandlerThread? = null
+                            synchronized(cameraLock) {
+                                opening = false
+                                if (quitAfterOpen && camThread === t) {
+                                    threadToQuit = t
+                                    camThread = null
+                                    handler = null
+                                    quitAfterOpen = false
+                                }
+                            }
+                            try { camera.close() } catch (_: Throwable) {}
+                            try { threadToQuit?.quitSafely() } catch (_: Throwable) {}
                             runOnUiThread {
                                 stopCamera()
                                 if (!isFinishing && !isDestroyed) showStatus(R.string.qr_camera_unavailable, false)
@@ -292,6 +347,7 @@ class QrScanActivity : Activity() {
                 )
             } catch (_: Throwable) {
                 // CameraAccessException, SecurityException, IllegalArgumentException, anything the HAL throws.
+                opening = false
                 teardown()
                 showStatus(R.string.qr_camera_unavailable, false)
             }
@@ -416,7 +472,7 @@ class QrScanActivity : Activity() {
     private fun updateTorchIcon() =
         torch.setImageResource(if (torchOn) R.drawable.ic_flash_on else R.drawable.ic_flash_off)
 
-    /** Closes everything the camera holds. Safe to call twice, from any thread. */
+    /** Закрывает все ресурсы камеры. Если openCamera() ещё в процессе, оставляет camThread живым до onOpened/onError. */
     private fun teardown() {
         synchronized(cameraLock) {
             active = false
@@ -430,9 +486,14 @@ class QrScanActivity : Activity() {
             try { previewSurface?.release() } catch (_: Throwable) {}
             previewSurface = null
             request = null
-            try { camThread?.quitSafely() } catch (_: Throwable) {}
-            camThread = null
-            handler = null
+            if (opening) {
+                quitAfterOpen = true
+            } else {
+                try { camThread?.quitSafely() } catch (_: Throwable) {}
+                camThread = null
+                handler = null
+                quitAfterOpen = false
+            }
         }
         analyzing.set(false)
     }
@@ -448,19 +509,36 @@ class QrScanActivity : Activity() {
         val image = try { ir.acquireLatestImage() } catch (_: Throwable) { null } ?: return
         var started = false
         try {
-            if (importing.get() || !analyzing.compareAndSet(false, true)) return
+            if (importing.get()) return
+            val now = SystemClock.elapsedRealtime()
+            if (now - lastAnalyzeAt < ANALYZE_INTERVAL_MS) return
+            if (!analyzing.compareAndSet(false, true)) return
             started = true
+            lastAnalyzeAt = now
             val plane = image.planes[0]
             val buf = plane.buffer
-            val bytes = ByteArray(buf.remaining())
-            buf.get(bytes)
+            val len = buf.remaining()
+            if (yBuf.size < len) yBuf = ByteArray(len)
+            buf.get(yBuf, 0, len)
+            val needed = image.width * image.height
+            if (plane.rowStride != image.width && packedBuf.size < needed) {
+                packedBuf = ByteArray(needed)
+            }
             val n = frameCount++
-            val raw = QrBitmap.decodeYuv(bytes, image.width, image.height, plane.rowStride, tryInverted = n % 4 == 0)
-                ?: return
+            val raw = QrBitmap.decodeYuv(
+                yData = yBuf,
+                width = image.width,
+                height = image.height,
+                rowStride = plane.rowStride,
+                tryInverted = n % INVERT_EVERY_N == 0,
+                yDataLen = len,
+                packedBuf = packedBuf,
+                reader = qrReader,
+            ) ?: return
             if (raw == lastBad && SystemClock.elapsedRealtime() - lastBadAt < COOLDOWN_MS) return
             handleScannedText(raw)
         } catch (_: Throwable) {
-            // A bad frame is only dropped.
+            // Битый кадр просто пропускаем.
         } finally {
             image.close()
             if (started) analyzing.set(false)
@@ -469,9 +547,10 @@ class QrScanActivity : Activity() {
 
     // ---- Import ----
 
-    private fun handleScannedText(raw: String) {
-        if (!importing.compareAndSet(false, true)) return
+    private fun handleScannedText(raw: String, alreadyLocked: Boolean = false) {
+        if (!alreadyLocked && !importing.compareAndSet(false, true)) return
         runOnUiThread {
+            if (isFinishing || isDestroyed) return@runOnUiThread
             errorView.visibility = View.GONE
             hint.setText(R.string.qr_importing)
         }
@@ -538,8 +617,10 @@ class QrScanActivity : Activity() {
         super.onActivityResult(requestCode, resultCode, data)
         val uri = data?.data
         if (requestCode != REQ_PICK || resultCode != RESULT_OK || uri == null) return
-        if (importing.get()) return
+        // Захватываем importing ДО декодирования картинки, чтобы кадры камеры не перехватили импорт из галереи.
+        if (!importing.compareAndSet(false, true)) return
         errorView.visibility = View.GONE
+        hint.setText(R.string.qr_importing)
         thread {
             var failed = false
             val raw = try {
@@ -549,10 +630,12 @@ class QrScanActivity : Activity() {
                 null
             }
             if (raw != null) {
-                handleScannedText(raw)
+                handleScannedText(raw, alreadyLocked = true)
             } else {
                 runOnUiThread {
+                    importing.set(false)
                     if (isFinishing || isDestroyed) return@runOnUiThread
+                    hint.setText(R.string.qr_scan_hint)
                     showError(getString(if (failed) R.string.qr_image_failed else R.string.qr_not_found_image))
                 }
             }

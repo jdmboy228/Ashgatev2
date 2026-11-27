@@ -14,12 +14,14 @@ import android.widget.ImageView
 import android.widget.ListView
 import android.widget.TextView
 import io.ashgate.android.TunnelService.State
+import java.util.Locale
 import java.util.concurrent.Executors
 import kotlin.concurrent.thread
 
 /** The apps that go through the tunnel: every app with a launcher icon, with a check. */
 class AppsActivity : Activity() {
-    private var before: Set<String> = emptySet()
+    /** null до загрузки списка, чтобы ранний onPause() не принял начальные приложения за изменение. */
+    private var before: Set<String>? = null
 
     private class App(val pkg: String, val label: String, val info: ResolveInfo)
 
@@ -56,18 +58,20 @@ class AppsActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        // Reopened by the system with the Keystore failing: back to the main screen's message.
-        if (!Store.usable(this)) return finish()
         setContentView(R.layout.apps)
         findViewById<View>(R.id.back).onClick { finish() }
         findViewById<TextView>(R.id.title).apply { setText(R.string.apps); typeface = Fonts.extrabold(context) }
         findViewById<TextView>(R.id.sub).apply { setText(R.string.apps_sub); typeface = Fonts.medium(context) }
         Fonts.set(Fonts.medium(this), findViewById(R.id.note))
         val list = findViewById<ListView>(R.id.list)
-        before = Store.apps(this)
-        val chosen = before.toMutableSet()
-        // Reading the label of every app takes a moment.
+        // Открытие Store (если холодный старт) и чтение списка приложений выполняем в фоне.
         thread {
+            if (!Store.usable(this)) {
+                runOnUiThread { if (!isFinishing && !isDestroyed) finish() }
+                return@thread
+            }
+            val initial = Store.apps(this)
+            val chosen = initial.toMutableSet()
             val found = try {
                 launcherApps(this)
             } catch (e: Exception) {
@@ -78,16 +82,17 @@ class AppsActivity : Activity() {
                     try {
                         App(it.activityInfo.packageName, labelOf(packageManager, it), it)
                     } catch (e: Exception) {
-                        null // Being uninstalled right now.
+                        null // Приложение удаляется в данный момент.
                     }
                 }
-                // Picked apps first, then by name.
-                .sortedWith(compareBy({ it.pkg !in chosen }, { it.label.lowercase() }))
+                // Сначала выбранные, затем по имени без зависимости от локали.
+                .sortedWith(compareBy({ it.pkg !in chosen }, { it.label.lowercase(Locale.ROOT) }))
             val installedPkgs = apps.mapTo(HashSet()) { it.pkg }
             runOnUiThread {
+                if (isFinishing || isDestroyed) return@runOnUiThread
+                before = initial
                 val adapter = Adapter(apps, chosen)
                 list.adapter = adapter
-                // The list fades in instead of popping up once it is read.
                 list.alpha = 0f
                 list.animate().alpha(1f).setDuration(200).start()
                 list.setOnItemClickListener { _, row, position, _ ->
@@ -121,6 +126,7 @@ class AppsActivity : Activity() {
                 return@execute
             }
             runOnUiThread {
+                if (isFinishing || isDestroyed) return@runOnUiThread
                 icons.put(app.pkg, icon)
                 if (view.tag == app.pkg) view.setImageDrawable(icon)
             }
@@ -138,9 +144,11 @@ class AppsActivity : Activity() {
 
     override fun onPause() {
         super.onPause()
-        // A running tunnel is rebuilt with the new list of apps.
+        val initial = before ?: return
+        if (!Store.isOpen) return
+        // Пересобираем запущенный туннель с новым списком приложений.
         val now = Store.apps(this)
-        if (now != before && TunnelService.state != State.OFF) {
+        if (now != initial && TunnelService.state != State.OFF) {
             before = now
             if (now.isEmpty()) TunnelService.disconnect(this) else TunnelService.connect(this)
         }

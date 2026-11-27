@@ -18,6 +18,12 @@ import com.google.zxing.qrcode.decoder.ErrorCorrectionLevel
 import org.json.JSONObject
 
 object QrBitmap {
+    private val DECODE_HINTS = mapOf<DecodeHintType, Any>(
+        DecodeHintType.POSSIBLE_FORMATS to listOf(BarcodeFormat.QR_CODE),
+        DecodeHintType.TRY_HARDER to true,
+        DecodeHintType.CHARACTER_SET to "UTF-8",
+    )
+
     fun encodePayload(profile: JSONObject): String? {
         val kind = profile.optString("kind").ifEmpty { "vless" }
         val link = profile.optString("link")
@@ -59,15 +65,19 @@ object QrBitmap {
         height: Int,
         rowStride: Int,
         tryInverted: Boolean = false,
+        yDataLen: Int = yData.size,
+        packedBuf: ByteArray? = null,
+        reader: QRCodeReader = QRCodeReader(),
     ): String? {
-        val packed = if (rowStride == width && yData.size >= width * height) {
+        val needed = width * height
+        val packed = if (rowStride == width && yDataLen >= needed) {
             yData
         } else {
-            val dest = ByteArray(width * height)
+            val dest = if (packedBuf != null && packedBuf.size >= needed) packedBuf else ByteArray(needed)
             for (row in 0 until height) {
                 val srcOffset = row * rowStride
                 val destOffset = row * width
-                val copyLen = minOf(width, maxOf(0, yData.size - srcOffset))
+                val copyLen = minOf(width, maxOf(0, yDataLen - srcOffset))
                 if (copyLen > 0) {
                     System.arraycopy(yData, srcOffset, dest, destOffset, copyLen)
                 }
@@ -76,26 +86,20 @@ object QrBitmap {
         }
 
         val source = PlanarYUVLuminanceSource(packed, width, height, 0, 0, width, height, false)
-        val hints = mapOf<DecodeHintType, Any>(
-            DecodeHintType.POSSIBLE_FORMATS to listOf(BarcodeFormat.QR_CODE),
-            DecodeHintType.TRY_HARDER to true,
-            DecodeHintType.CHARACTER_SET to "UTF-8",
-        )
-        val reader = QRCodeReader()
         return try {
             try {
-                reader.decode(BinaryBitmap(HybridBinarizer(source)), hints).text
+                reader.decode(BinaryBitmap(HybridBinarizer(source)), DECODE_HINTS).text
             } catch (e1: Exception) {
                 if (e1 !is NotFoundException && e1 !is ChecksumException && e1 !is FormatException) throw e1
                 if (!tryInverted) return null
                 reader.reset()
                 try {
-                    reader.decode(BinaryBitmap(HybridBinarizer(source.invert())), hints).text
+                    reader.decode(BinaryBitmap(HybridBinarizer(source.invert())), DECODE_HINTS).text
                 } catch (e2: Exception) {
                     if (e2 !is NotFoundException && e2 !is ChecksumException && e2 !is FormatException) throw e2
                     reader.reset()
                     try {
-                        reader.decode(BinaryBitmap(GlobalHistogramBinarizer(source)), hints).text
+                        reader.decode(BinaryBitmap(GlobalHistogramBinarizer(source)), DECODE_HINTS).text
                     } catch (e3: Exception) {
                         if (e3 !is NotFoundException && e3 !is ChecksumException && e3 !is FormatException) throw e3
                         null
@@ -113,25 +117,20 @@ object QrBitmap {
         val pixels = IntArray(w * h)
         bitmap.getPixels(pixels, 0, w, 0, 0, w, h)
         val source = RGBLuminanceSource(w, h, pixels)
-        val hints = mapOf<DecodeHintType, Any>(
-            DecodeHintType.POSSIBLE_FORMATS to listOf(BarcodeFormat.QR_CODE),
-            DecodeHintType.TRY_HARDER to true,
-            DecodeHintType.CHARACTER_SET to "UTF-8",
-        )
         val reader = QRCodeReader()
         return try {
             try {
-                reader.decode(BinaryBitmap(HybridBinarizer(source)), hints).text
+                reader.decode(BinaryBitmap(HybridBinarizer(source)), DECODE_HINTS).text
             } catch (e1: Exception) {
                 if (e1 !is NotFoundException && e1 !is ChecksumException && e1 !is FormatException) throw e1
                 reader.reset()
                 try {
-                    reader.decode(BinaryBitmap(GlobalHistogramBinarizer(source)), hints).text
+                    reader.decode(BinaryBitmap(GlobalHistogramBinarizer(source)), DECODE_HINTS).text
                 } catch (e2: Exception) {
                     if (e2 !is NotFoundException && e2 !is ChecksumException && e2 !is FormatException) throw e2
                     reader.reset()
                     try {
-                        reader.decode(BinaryBitmap(HybridBinarizer(source.invert())), hints).text
+                        reader.decode(BinaryBitmap(HybridBinarizer(source.invert())), DECODE_HINTS).text
                     } catch (e3: Exception) {
                         if (e3 !is NotFoundException && e3 !is ChecksumException && e3 !is FormatException) throw e3
                         null

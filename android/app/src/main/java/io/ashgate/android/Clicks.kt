@@ -3,8 +3,8 @@ package io.ashgate.android
 import android.os.SystemClock
 import android.view.View
 
-/** Shared by every button, so two quick taps never open two screens or connect twice. */
-private val taps = Debounce(500) { SystemClock.elapsedRealtime() }
+/** Общий дебаунс на 350 мс: исключает двойное открытие экранов/подключений без «залипания» переходов. */
+private val taps = Debounce(350) { SystemClock.elapsedRealtime() }
 
 /** True when a tap or hold is outside the debounce window. */
 fun allowTap(): Boolean = taps.accept()

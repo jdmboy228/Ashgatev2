@@ -98,6 +98,8 @@ object ProfileImporter {
             val conn = URL(address).openConnection() as HttpURLConnection
             conn.connectTimeout = 15_000
             conn.readTimeout = 15_000
+            // Запрещаем авто-редиректы, чтобы токен подписки в URL не утёк на сторонний хост.
+            conn.instanceFollowRedirects = false
             try {
                 if (conn.responseCode != 200) throw Exception()
                 return conn.inputStream.use { readAtMost(it, 1 shl 20) }
@@ -112,9 +114,15 @@ object ProfileImporter {
     private fun readAtMost(input: java.io.InputStream, limit: Int): ByteArray {
         val out = java.io.ByteArrayOutputStream()
         val buf = ByteArray(8192)
+        var zeroReads = 0
         while (out.size() <= limit) {
             val n = input.read(buf, 0, minOf(buf.size, limit + 1 - out.size()))
             if (n < 0) break
+            if (n == 0) {
+                if (++zeroReads > 16) throw Exception()
+                continue
+            }
+            zeroReads = 0
             out.write(buf, 0, n)
         }
         if (out.size() > limit) throw Exception()

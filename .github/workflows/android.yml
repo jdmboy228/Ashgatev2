@@ -16,7 +16,13 @@ on:
       - "ashgate-src/internal/mobilecfg/**"
       - "ashgate-src/internal/vless/**"
       - "ashgate-src/internal/subs/**"
+      - "ashgate-src/internal/config/**"
+      - "ashgate-src/internal/secret/**"
+      - "ashgate-src/internal/bootstrap/**"
+      - "ashgate-src/internal/atomicfile/**"
+      - "ashgate-src/cmd/geotrim/**"
       - "ashgate-src/go.mod"
+      - "ashgate-src/go.sum"
       - ".github/workflows/android.yml"
 
 permissions:
@@ -57,28 +63,45 @@ jobs:
           # the router tests below run on the trimmed file.
           (cd "$GITHUB_WORKSPACE/ashgate-src" && go run ./cmd/geotrim "$GITHUB_WORKSPACE/android/app/src/main/assets")
 
-      # Links, subscriptions and proxies; the Xray document; and the real
-      # Xray router with the geodata above (mobile/router_test.go).
+      # Ссылки, подписки, прокси, DoH bootstrap, JSON Xray и реальный роутер на урезанной геодате.
       - name: Tests
         working-directory: ashgate-src
         env:
           ASHGATE_GEODATA: ${{ github.workspace }}/android/app/src/main/assets
         run: |
-          go test ./internal/mobilecfg/ ./internal/subs/ ./cmd/geotrim/
+          go vet ./mobile/ ./internal/mobilecfg/ ./internal/vless/ ./internal/subs/ ./internal/bootstrap/ ./cmd/geotrim/
+          go test -race ./internal/mobilecfg/ ./internal/subs/ ./internal/bootstrap/ ./cmd/geotrim/
           go test -v ./mobile/
-          go test ./internal/vless/ -run 'Parse|ClientJSON|Outbound|TLSPinned|Fingerprint|Normalize|UnknownType'
+          go test ./internal/vless/ -run 'Parse|ClientJSON|Outbound|TLSPinned|Fingerprint|Normalize|UnknownType|TestExplain|TestRunTrackerClosesLiveSockets|TestLogHookMarksTunDead|TestVerifyAndCheckXHTTPReality'
 
       - name: Go core (AAR)
         working-directory: ashgate-src
+        env:
+          ANDROID_NDK_VERSION: "27.2.12479018"
         run: |
           go install golang.org/x/mobile/cmd/gomobile golang.org/x/mobile/cmd/gobind
-          # -checklinkname=0: Xray's dependency anet reaches into package net
-          # on Android, which the linker refuses since Go 1.23.
-          export ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME"
+          if [ ! -d "$ANDROID_HOME/ndk/$ANDROID_NDK_VERSION" ]; then
+            (yes || true) | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;$ANDROID_NDK_VERSION"
+          fi
+          export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/$ANDROID_NDK_VERSION"
           mkdir -p ../android/app/libs
-          # amd64 only feeds the emulator APK below; the release packs arm64.
+          # -checklinkname=0: зависимость anet обращается к пакету net на Android (Go 1.23+).
+          # -Wl,-z,max-page-size=16384: выравнивание LOAD-сегментов под устройства с 16 KB страницами.
           gomobile bind -target=android/arm64,android/amd64 -androidapi 24 -javapkg io.ashgate \
-            -trimpath -ldflags "-s -w -checklinkname=0" -o ../android/app/libs/ashgate.aar ./mobile
+            -trimpath -ldflags "-s -w -checklinkname=0 -extldflags=-Wl,-z,max-page-size=16384" \
+            -o ../android/app/libs/ashgate.aar ./mobile
+          # Проверяем выравнивание >= 16 KB (кратно 0x4000) для всех LOAD-сегментов arm64-v8a libgojni.so.
+          unzip -p ../android/app/libs/ashgate.aar jni/arm64-v8a/libgojni.so > "$RUNNER_TEMP/libgojni.so"
+          readelf -lW "$RUNNER_TEMP/libgojni.so" | grep 'LOAD' | tee "$RUNNER_TEMP/load.txt"
+          python3 -c '
+          import sys
+          lines = [l.strip() for l in open(sys.argv[1]) if l.strip().startswith("LOAD")]
+          assert lines, "No LOAD segments found"
+          for l in lines:
+              align = int(l.split()[-1], 16)
+              if align < 16384 or align % 16384 != 0:
+                  sys.exit(f"Bad ELF LOAD alignment ({hex(align)}): {l}")
+          ' "$RUNNER_TEMP/load.txt"
 
       - uses: gradle/actions/setup-gradle@v4
         with:
@@ -99,16 +122,27 @@ jobs:
         working-directory: android
         env:
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-        # JVM unit tests (app/src/test) first, then the signed APK (arm64).
-        # Then the same release build with the x86_64 core for the emulator:
-        # translated ARM Go code dies there on a CPU-ID instruction that
-        # real phones handle.
+          ANDROID_NDK_VERSION: "27.2.12479018"
+          ASHGATE_VERSION_CODE: ${{ github.run_number }}
+        # Сначала JVM-тесты и lintRelease, затем релизный arm64 APK, затем clean и x86_64 APK для эмулятора.
         run: |
-          gradle --no-daemon testReleaseUnitTest assembleRelease
+          gradle --no-daemon testReleaseUnitTest lintRelease assembleRelease
           mkdir -p dist
           cp app/build/outputs/apk/release/app-release.apk dist/app-release.apk
-          gradle --no-daemon assembleRelease -Pashgate.abis=x86_64
+          # Убеждаемся, что релизный APK содержит только arm64-v8a libgojni.so.
+          unzip -l dist/app-release.apk | grep -q 'lib/arm64-v8a/libgojni.so'
+          if unzip -l dist/app-release.apk | grep -E 'lib/(armeabi-v7a|x86|x86_64)/'; then
+            echo "::error::unexpected ABI found in arm64 release APK"; exit 1
+          fi
+          gradle --no-daemon clean assembleRelease -Pashgate.abis=x86_64
           cp app/build/outputs/apk/release/app-release.apk dist/app-smoke-x86_64.apk
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: android-lint-report
+          path: android/app/build/reports/lint-results-release.*
+          if-no-files-found: ignore
 
       # The certificate's SHA-256 is public; a different one means a different key.
       - name: Signature
@@ -138,6 +172,10 @@ jobs:
     needs: apk
     runs-on: ubuntu-latest
     timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        api-level: [30, 34]
     steps:
       - uses: actions/checkout@v4
 
@@ -154,7 +192,7 @@ jobs:
 
       - uses: reactivecircus/android-emulator-runner@v2
         with:
-          api-level: 30
+          api-level: ${{ matrix.api-level }}
           target: google_apis
           arch: x86_64
           disable-animations: true
@@ -164,6 +202,6 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: smoke-screenshots
+          name: smoke-screenshots-api-${{ matrix.api-level }}
           path: smoke-out
           if-no-files-found: ignore

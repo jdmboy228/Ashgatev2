@@ -246,12 +246,15 @@ class TunnelService : VpnService() {
         restartFull = false
     }
 
-    /** Saved data that cannot be read must not end the process, and the tunnel with it. */
+    /** Разделяем сбой Keystore и прочие ошибки (например, отсутствие геоданных или битый JSON). */
     private inline fun guarded(block: () -> Unit) {
         try {
             block()
-        } catch (e: Exception) {
+        } catch (e: Store.Unavailable) {
             fail(getString(R.string.store_unavailable))
+        } catch (e: Exception) {
+            Log.e("Ashgate", "tunnel guard failed: " + e.javaClass.name)
+            fail(e.message ?: e.javaClass.simpleName)
         }
     }
 
@@ -519,18 +522,33 @@ class TunnelService : VpnService() {
         val receiver = object : BroadcastReceiver() {
             override fun onReceive(context: Context, intent: Intent) {
                 AppsActivity.invalidateCache()
-                // An update keeps the uid.
+                // При обновлении приложения его uid не меняется.
                 if (intent.getBooleanExtra(Intent.EXTRA_REPLACING, false)) return
                 val pkg = intent.data?.schemeSpecificPart ?: return
+                val removed = intent.action == Intent.ACTION_PACKAGE_REMOVED
                 later {
-                    if (tun != null && pkg in Store.apps(this@TunnelService)) {
+                    val savedApps = Store.apps(this@TunnelService)
+                    if (pkg !in savedApps) return@later
+                    if (removed) {
+                        val updated = savedApps - pkg
+                        Store.saveApps(this@TunnelService, updated)
+                        if (tun != null) {
+                            cancelRestart()
+                            if (updated.isEmpty()) stop(null, commandSeq.incrementAndGet())
+                            else start(commandSeq.get())
+                        }
+                    } else if (tun != null) {
                         cancelRestart()
                         start(commandSeq.get())
                     }
                 }
             }
         }
-        val filter = IntentFilter(Intent.ACTION_PACKAGE_ADDED).apply { addDataScheme("package") }
+        val filter = IntentFilter().apply {
+            addAction(Intent.ACTION_PACKAGE_ADDED)
+            addAction(Intent.ACTION_PACKAGE_REMOVED)
+            addDataScheme("package")
+        }
         try {
             if (Build.VERSION.SDK_INT >= 33) {
                 registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
@@ -567,8 +585,12 @@ class TunnelService : VpnService() {
         }
         dir.mkdirs()
         for (name in listOf("geosite.dat")) {
-            assets.open(name).use { input ->
-                File(dir, name).outputStream().use { input.copyTo(it) }
+            try {
+                assets.open(name).use { input ->
+                    File(dir, name).outputStream().use { input.copyTo(it) }
+                }
+            } catch (e: Exception) {
+                throw IllegalStateException(getString(R.string.geodata_missing), e)
             }
         }
         stamp.writeText(build)

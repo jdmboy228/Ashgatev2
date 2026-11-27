@@ -11,6 +11,7 @@ import android.widget.ListView
 import android.widget.TextView
 import io.ashgate.android.TunnelService.State
 import org.json.JSONObject
+import kotlin.concurrent.thread
 
 /** The profile list, opened from the «Профиль» row: pick, hold to edit, add. */
 class ProfilesActivity : Activity() {
@@ -23,8 +24,6 @@ class ProfilesActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        // Reopened by the system with the Keystore failing: back to the main screen's message.
-        if (!Store.usable(this)) return finish()
         setContentView(R.layout.profiles)
         findViewById<View>(R.id.back).onClick { finish() }
         findViewById<View>(R.id.scan_qr).onClick { startActivity(Intent(this, QrScanActivity::class.java)) }
@@ -67,10 +66,25 @@ class ProfilesActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
-        // After adding, editing or deleting a profile.
-        profiles = Store.profiles(this)
-        selectedId = Store.selectedId(this)
-        adapter.notifyDataSetChanged()
+        if (Store.isOpen) {
+            profiles = Store.profiles(this)
+            selectedId = Store.selectedId(this)
+            adapter.notifyDataSetChanged()
+        } else {
+            // При холодном восстановлении открываем Keystore в фоновом потоке.
+            thread {
+                val usable = Store.usable(this)
+                val loaded = if (usable) Store.profiles(this) else emptyList()
+                val sel = if (usable) Store.selectedId(this) else null
+                runOnUiThread {
+                    if (isFinishing || isDestroyed) return@runOnUiThread
+                    if (!usable) return@runOnUiThread finish()
+                    profiles = loaded
+                    selectedId = sel
+                    adapter.notifyDataSetChanged()
+                }
+            }
+        }
     }
 
     /** «VLESS · XHTTP · host» or «SOCKS5 · host:port»: never the uuid or the password. */

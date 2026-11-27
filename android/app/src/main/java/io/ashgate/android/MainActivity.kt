@@ -196,7 +196,7 @@ class MainActivity : Activity() {
                 State.BLOCKED -> R.string.state_blocked
             },
         )
-        swap(status, word.uppercase(Locale("ru")), null, animate)
+        swap(status, word.uppercase(Locale.forLanguageTag("ru")), null, animate)
         showStatusColor(
             getColor(
                 when (state) {
@@ -279,7 +279,7 @@ class MainActivity : Activity() {
         val paint = { c: Int ->
             statusColor = c
             status.setTextColor(c)
-            (dot.background.mutate() as GradientDrawable).setColor(c)
+            (dot.background.mutate() as? GradientDrawable)?.setColor(c)
         }
         if (!animate || statusColor == 0 || statusColor == color) return paint(color)
         colorAnim = ValueAnimator.ofArgb(statusColor, color).apply {

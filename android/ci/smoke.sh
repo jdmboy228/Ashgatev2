@@ -26,6 +26,9 @@ fail() {
   exit 1
 }
 
+# При любой неожиданной ошибке (например, падении adb install) сохраняем скриншот и logcat.
+trap 'shot failure; adb logcat -d >"$OUT/logcat.txt" || true' ERR
+
 # locate BY VALUE: waits up to 20 s for the view, prints "x y".
 locate() {
   for _ in $(seq 1 20); do
@@ -91,8 +94,9 @@ no_crash() {
 
 adb install -r "$APK"
 # The VPN consent dialog cannot be tapped reliably; grant it the way the
-# dialog would.
+# dialog would. На API 33+ заранее выдаём право уведомлений, чтобы системный диалог не перекрыл UI.
 adb shell appops set "$PKG" ACTIVATE_VPN allow
+adb shell pm grant "$PKG" android.permission.POST_NOTIFICATIONS 2>/dev/null || true
 adb logcat -c
 adb logcat -b crash -c || true
 

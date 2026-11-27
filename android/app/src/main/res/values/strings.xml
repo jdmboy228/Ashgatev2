@@ -24,6 +24,10 @@
     <string name="pass_hint">Пароль (если есть)</string>
     <string name="save">Сохранить</string>
     <string name="delete">Удалить</string>
+    <string name="cancel">Отмена</string>
+    <string name="delete_confirm_title">Удалить профиль?</string>
+    <string name="delete_confirm_message">Ключи и настройки этого профиля будут удалены с устройства.</string>
+    <string name="geodata_missing">Не найдены геоданные (geosite.dat). Переустановите приложение.</string>
     <string name="sub_failed">Не удалось загрузить подписку</string>
     <string name="sub_insecure">Подписка по http:// передала бы ключи серверов открытым текстом. Нужен адрес https://</string>
     <string name="proxy_note">SOCKS5 и HTTP не шифруют трафик до прокси: провайдер видит адреса сайтов и логин.</string>

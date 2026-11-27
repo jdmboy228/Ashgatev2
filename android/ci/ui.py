@@ -11,6 +11,8 @@ import xml.etree.ElementTree as ET
 
 
 def main():
+    if len(sys.argv) != 4:
+        sys.exit(1)
     dump, by, value = sys.argv[1:4]
     try:
         root = ET.parse(dump).getroot()

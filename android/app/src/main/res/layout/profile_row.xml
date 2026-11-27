@@ -42,7 +42,7 @@
                 android:ellipsize="end"
                 android:includeFontPadding="false"
                 android:singleLine="true"
-                android:textColor="@color/ag_text3"
+                android:textColor="@color/ag_text2"
                 android:textSize="@dimen/ag_ts_caption" />
         </LinearLayout>
 

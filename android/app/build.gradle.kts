@@ -1,3 +1,5 @@
+import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -6,13 +8,14 @@ plugins {
 android {
     namespace = "io.ashgate.android"
     compileSdk = 35
+    System.getenv("ANDROID_NDK_VERSION")?.takeIf { it.isNotBlank() }?.let { ndkVersion = it }
 
     defaultConfig {
         applicationId = "io.ashgate.android"
         minSdk = 24
-        targetSdk = 34
-        versionCode = 1
-        versionName = "0.1.0"
+        targetSdk = 35
+        versionCode = (System.getenv("ASHGATE_VERSION_CODE") ?: "1").toInt()
+        versionName = System.getenv("ASHGATE_VERSION_NAME")?.takeIf { it.isNotBlank() } ?: "0.1.0"
         // 64-bit ARM only: nearly every phone in use runs it (32-bit-only
         // phones are left out); a second copy of the Go core for
         // armeabi-v7a doubled the APK.
@@ -45,12 +48,20 @@ android {
             signingConfig = signingConfigs.findByName("release")
         }
     }
-    lint { checkReleaseBuilds = false }
+    lint {
+        abortOnError = true
+        checkReleaseBuilds = true
+    }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
-    kotlinOptions { jvmTarget = "17" }
+}
+
+kotlin {
+    compilerOptions {
+        jvmTarget.set(JvmTarget.JVM_17)
+    }
 }
 
 dependencies {

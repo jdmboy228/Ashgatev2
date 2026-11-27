@@ -61,6 +61,7 @@
                         android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
                         android:layout_marginLeft="@dimen/ag_dot_to_label"
+                        android:accessibilityLiveRegion="polite"
                         android:includeFontPadding="false"
                         android:letterSpacing="0.08"
                         android:textSize="@dimen/ag_ts_status" />
@@ -83,6 +84,7 @@
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
                     android:layout_marginTop="@dimen/ag_title_to_sub"
+                    android:accessibilityLiveRegion="polite"
                     android:ellipsize="end"
                     android:gravity="center_horizontal"
                     android:includeFontPadding="false"
@@ -184,6 +186,6 @@
         android:includeFontPadding="false"
         android:letterSpacing="0.04"
         android:singleLine="true"
-        android:textColor="@color/ag_text3"
+        android:textColor="@color/ag_text2"
         android:textSize="@dimen/ag_ts_caption" />
 </FrameLayout>

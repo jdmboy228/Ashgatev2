@@ -1,6 +1,7 @@
 package io.ashgate.android
 
 import android.app.Activity
+import android.app.AlertDialog
 import android.content.Intent
 import android.os.Bundle
 import android.view.View
@@ -10,6 +11,7 @@ import android.widget.EditText
 import android.widget.RadioGroup
 import android.widget.TextView
 import io.ashgate.android.TunnelService.State
+import org.json.JSONObject
 import kotlin.concurrent.thread
 
 /**
@@ -37,9 +39,7 @@ class ProfileActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        // Reopened by the system with the Keystore failing: back to the main screen's message.
-        if (!Store.usable(this)) return finish()
-        // The form shows the link and the password: not in Recents or screenshots.
+        // Форма содержит ссылку/пароль: скрываем из Recents и скриншотов.
         window.setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE)
         setContentView(R.layout.profile)
         kind = findViewById(R.id.kind)
@@ -52,12 +52,32 @@ class ProfileActivity : Activity() {
         delete = findViewById(R.id.delete)
 
         id = intent.getStringExtra("id")
-        val old = Store.find(this, id)
         kind.setOnCheckedChangeListener { _, checked ->
             link.visibility = if (checked == R.id.kind_vless) View.VISIBLE else View.GONE
             proxy.visibility = if (checked == R.id.kind_vless) View.GONE else View.VISIBLE
             findViewById<View>(R.id.proxy_note).visibility = proxy.visibility
         }
+        save.onClick { save() }
+
+        if (Store.isOpen) {
+            bindProfile(Store.find(this, id))
+        } else {
+            // При холодном восстановлении после process death открываем Keystore в фоне.
+            save.isEnabled = false
+            thread {
+                val usable = Store.usable(this)
+                val old = if (usable) Store.find(this, id) else null
+                runOnUiThread {
+                    if (closed || isFinishing || isDestroyed) return@runOnUiThread
+                    if (!usable) return@runOnUiThread finish()
+                    save.isEnabled = true
+                    bindProfile(old)
+                }
+            }
+        }
+    }
+
+    private fun bindProfile(old: JSONObject?) {
         kind.check(
             when (old?.optString("kind")) {
                 "socks5" -> R.id.kind_socks5
@@ -85,13 +105,7 @@ class ProfileActivity : Activity() {
             }
             delete.apply {
                 visibility = View.VISIBLE
-                onClick {
-                    closed = true
-                    val wasSelected = Store.selectedId(this@ProfileActivity) == this@ProfileActivity.id
-                    Store.delete(this@ProfileActivity, this@ProfileActivity.id!!)
-                    if (wasSelected) reconnect()
-                    finish()
-                }
+                onClick { confirmDelete() }
             }
         } else {
             scanQr.apply {
@@ -101,7 +115,28 @@ class ProfileActivity : Activity() {
                 }
             }
         }
-        save.onClick { save() }
+    }
+
+    private fun confirmDelete() {
+        val targetId = id ?: return
+        AlertDialog.Builder(this)
+            .setTitle(R.string.delete_confirm_title)
+            .setMessage(R.string.delete_confirm_message)
+            .setNegativeButton(R.string.cancel, null)
+            .setPositiveButton(R.string.delete) { _, _ ->
+                closed = true
+                save.isEnabled = false
+                delete.isEnabled = false
+                thread {
+                    val wasSelected = Store.selectedId(this) == targetId
+                    Store.delete(this, targetId)
+                    runOnUiThread {
+                        if (wasSelected) reconnect()
+                        if (!isFinishing && !isDestroyed) finish()
+                    }
+                }
+            }
+            .show()
     }
 
     override fun onDestroy() {

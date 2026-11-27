@@ -18,12 +18,9 @@ class ProfileQrActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        if (!Store.usable(this)) return finish()
-        // The code holds the uuid or the password: not in Recents or screenshots.
+        // QR-код содержит UUID или пароль: скрываем из Recents и скриншотов.
         window.setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE)
-        val profile = Store.find(this, intent.getStringExtra(EXTRA_PROFILE_ID)) ?: return finish()
         setContentView(R.layout.activity_profile_qr)
-        // Brighter screen scans more reliably; restored with the window when the screen closes.
         window.attributes = window.attributes.apply { screenBrightness = 0.85f }
 
         val title = findViewById<TextView>(R.id.title)
@@ -31,20 +28,34 @@ class ProfileQrActivity : Activity() {
         val hint = findViewById<TextView>(R.id.qr_hint)
         val error = findViewById<TextView>(R.id.qr_error)
         val image = findViewById<ImageView>(R.id.qr_image)
-        title.apply { text = profile.optString("name"); typeface = Fonts.extrabold(context) }
-        sub.apply { text = meta(profile); typeface = Fonts.mono(context) }
         Fonts.set(Fonts.medium(this), hint, error)
         findViewById<View>(R.id.back).onClick { finish() }
 
+        val profileId = intent.getStringExtra(EXTRA_PROFILE_ID)
         val size = (280 * resources.displayMetrics.density).toInt().coerceIn(360, 1024).coerceAtMost(720)
+        // Открытие Store (если холодный старт) и генерация QR выполняются в фоне.
         thread {
+            if (!Store.usable(this)) {
+                runOnUiThread { if (!isFinishing && !isDestroyed) finish() }
+                return@thread
+            }
+            val profile = Store.find(this, profileId)
+            if (profile == null) {
+                runOnUiThread { if (!isFinishing && !isDestroyed) finish() }
+                return@thread
+            }
             val bmp = try {
                 QrBitmap.encodePayload(profile)?.let { QrBitmap.generate(it, size) }
             } catch (_: Throwable) {
                 null
             }
             runOnUiThread {
-                if (isFinishing || isDestroyed) return@runOnUiThread
+                if (isFinishing || isDestroyed) {
+                    bmp?.recycle()
+                    return@runOnUiThread
+                }
+                title.apply { text = profile.optString("name"); typeface = Fonts.extrabold(context) }
+                sub.apply { text = meta(profile); typeface = Fonts.mono(context) }
                 if (bmp == null) {
                     findViewById<View>(R.id.qr_card).visibility = View.GONE
                     hint.visibility = View.GONE
