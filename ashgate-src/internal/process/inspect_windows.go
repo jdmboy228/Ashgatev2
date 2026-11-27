@@ -210,14 +210,49 @@ func matchModuleDirs(modDirs, dirs []string) bool {
 	return false
 }
 
-// normDir normalizes a directory path and strips a trailing separator
-// (keeping a lone `\` root intact).
+// normDir normalizes a directory path, expands any Windows 8.3 short path
+// segments (such as RUNNER~1 from CreateToolhelp32Snapshot), and strips a
+// trailing separator (keeping a lone `\` root intact).
 func normDir(p string) string {
 	p = rules.NormalizePath(p)
+	if strings.ContainsRune(p, '~') {
+		if expanded := expandShortPath(p); expanded != p {
+			p = rules.NormalizePath(expanded)
+		}
+	}
 	if len(p) > 1 && strings.HasSuffix(p, `\`) {
 		p = p[:len(p)-1]
 	}
 	return p
+}
+
+// expandShortPath resolves Windows 8.3 short path components via
+// GetLongPathName, falling back to p unchanged on any error.
+func expandShortPath(p string) string {
+	if !strings.ContainsRune(p, '~') {
+		return p
+	}
+	src, err := windows.UTF16PtrFromString(p)
+	if err != nil {
+		return p
+	}
+	size := uint32(len(p) + 64)
+	if size < 260 {
+		size = 260
+	}
+	buf := make([]uint16, size)
+	n, err := windows.GetLongPathName(src, &buf[0], uint32(len(buf)))
+	if err != nil || n == 0 {
+		return p
+	}
+	if n >= uint32(len(buf)) {
+		buf = make([]uint16, n+1)
+		n, err = windows.GetLongPathName(src, &buf[0], uint32(len(buf)))
+		if err != nil || n == 0 || n >= uint32(len(buf)) {
+			return p
+		}
+	}
+	return windows.UTF16ToString(buf[:n])
 }
 
 // moduleDirOf returns the normalized parent directory of a module path.

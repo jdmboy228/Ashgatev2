@@ -238,6 +238,43 @@ func TestHasModuleInDirsSelf(t *testing.T) {
 	}
 }
 
+func TestExpandShortPathAndNormDir(t *testing.T) {
+	// Nonexistent path with '~' must fall back cleanly without error.
+	missing := `C:\no-such~1\folder`
+	if got := normDir(missing); got != `c:\no-such~1\folder` {
+		t.Fatalf("normDir(%q) = %q, want fallback", missing, got)
+	}
+
+	// Create a long directory name and ask Windows for its 8.3 short path.
+	longDir := filepath.Join(t.TempDir(), "ashgate_long_directory_name_test")
+	if err := os.MkdirAll(longDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	src, err := windows.UTF16PtrFromString(longDir)
+	if err != nil {
+		t.Fatalf("UTF16PtrFromString: %v", err)
+	}
+	buf := make([]uint16, 512)
+	n, err := windows.GetShortPathName(src, &buf[0], uint32(len(buf)))
+	if err != nil || n == 0 || n >= uint32(len(buf)) {
+		t.Skipf("GetShortPathName unavailable: n=%d err=%v", n, err)
+	}
+	shortDir := windows.UTF16ToString(buf[:n])
+	if !strings.ContainsRune(shortDir, '~') {
+		t.Skipf("volume has 8.3 short names disabled (short=%q)", shortDir)
+	}
+	want := normDir(longDir)
+	if got := normDir(shortDir); got != want {
+		t.Fatalf("normDir(%q) = %q, want %q", shortDir, got, want)
+	}
+	if !matchModuleDirs([]string{normDir(shortDir)}, []string{longDir}) {
+		t.Errorf("matchModuleDirs(short=%q, long=%q) = false, want true", shortDir, longDir)
+	}
+	if !matchModuleDirs([]string{want}, []string{shortDir}) {
+		t.Errorf("matchModuleDirs(long=%q, short=%q) = false, want true", want, shortDir)
+	}
+}
+
 func TestInspectorNoHandleLeaks(t *testing.T) {
 	procGetHandleCount := windows.NewLazySystemDLL("kernel32.dll").NewProc("GetProcessHandleCount")
 	getHandles := func() (uint32, bool) {
