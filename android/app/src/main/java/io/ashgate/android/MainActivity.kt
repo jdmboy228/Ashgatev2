@@ -276,7 +276,7 @@ class MainActivity : Activity() {
 
     private fun showStatusColor(color: Int, animate: Boolean) {
         colorAnim?.cancel()
-        val paint = { c: Int ->
+        val paint: (Int) -> Unit = { c ->
             statusColor = c
             status.setTextColor(c)
             (dot.background.mutate() as? GradientDrawable)?.setColor(c)
