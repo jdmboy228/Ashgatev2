@@ -91,7 +91,10 @@ func Run(configPath string, startCapture bool) error {
 	logs, logErr := openLog(cfg, configPath)
 	h := &host{path: configPath, logs: logs}
 	appHost.Store(h)
-	defer appHost.Store(nil)
+	defer func() {
+		appHost.Store(nil)
+		quitPending.Store(false)
+	}()
 	notice := retireService(configPath, logs)
 	h.ctrl = newController(configPath, cfg, logs, hooks{
 		admin:        isAdmin(),
@@ -160,6 +163,11 @@ func Run(configPath string, startCapture bool) error {
 		browserFolder = runtimeDir
 	}
 
+	// Exit right away if `ashgate quit` already arrived before WebView2 starts.
+	if quitPending.Load() {
+		return nil
+	}
+
 	w := webview2.NewWithOptions(webview2.WebViewOptions{
 		Debug:                   false,
 		AutoFocus:               true,
@@ -191,6 +199,9 @@ func Run(configPath string, startCapture bool) error {
 	// Subclass before the first resize so WM_NCCALCSIZE drops the caption
 	// frame and WM_GETMINMAXINFO already enforces the DIP minimum.
 	h.subclass()
+	// Deliver any `ashgate quit` that arrived while WebView2 was starting now
+	// that the subclassed window procedure can handle wmQuitReq.
+	deliverPendingQuit()
 	styleWindow(hwnd)
 	h.installIcons()
 	_ = w.Bind("ashgateDrag", func() { pPostMessage.Call(hwnd, wmDrag, 0, 0) })

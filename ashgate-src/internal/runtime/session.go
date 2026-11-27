@@ -118,6 +118,40 @@ func (s *Session) RelayHealth(proxy string, since time.Time) engine.RelayHealth 
 	return s.eng.RelayHealth(proxy, since)
 }
 
+// AutoMatches returns the processes the auto matcher currently attributes to
+// rules. Empty when the engine has no inspector.
+func (s *Session) AutoMatches() []engine.AutoMatch {
+	if s == nil || s.eng == nil {
+		return nil
+	}
+	return s.eng.AutoMatches()
+}
+
+// DirectSnapshot returns the programs whose traffic went direct without a
+// matching rule, their event feed, and the feed's generation.
+func (s *Session) DirectSnapshot() ([]engine.DirectProc, []logbuf.Event, uint64) {
+	if s == nil || s.eng == nil {
+		return nil, nil, 0
+	}
+	return s.eng.DirectSnapshot()
+}
+
+// DirectCount returns the number of non-system unmatched programs active within window.
+func (s *Session) DirectCount(now time.Time, window time.Duration) int {
+	if s == nil || s.eng == nil {
+		return 0
+	}
+	return s.eng.DirectCount(now, window)
+}
+
+// ClearDirectEvents empties the unmatched-traffic feed.
+func (s *Session) ClearDirectEvents() {
+	if s == nil || s.eng == nil {
+		return
+	}
+	s.eng.ClearDirectEvents()
+}
+
 // Traffic is bytes relayed by this session.
 func (s *Session) Traffic() (up, down int64) {
 	if s == nil || s.eng == nil {

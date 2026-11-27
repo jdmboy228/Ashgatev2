@@ -36,7 +36,9 @@ type tcpFlow struct {
 	live     bool
 	parent   string
 	stat     *ruleStat
-	mu       sync.Mutex
+	// sub is the per-process share of stat's counters; nil for system DNS.
+	sub *subProcStat
+	mu  sync.Mutex
 	// settled is set when the relay got its first bytes back or ended; a
 	// relay asks at most once before that. Guarded by relayBook.mu.
 	settled bool
@@ -140,8 +142,8 @@ func (e *Engine) serveFlow(ctx context.Context, conn net.Conn, flow *tcpFlow) {
 		e.relays.good(flow.proxy.Name, e.now())
 	}
 	upErr := splice(conn, upstream,
-		counter{flow: &up, total: &e.bytesUp, rule: flow.stat.upCounter(), first: asked},
-		counter{flow: &down, total: &e.bytesDown, rule: flow.stat.downCounter(), first: good})
+		counter{flow: &up, total: &e.bytesUp, rule: flow.stat.upCounter(), sub: flow.sub.upCounter(), subSeen: flow.sub.seenCounter(), first: asked},
+		counter{flow: &down, total: &e.bytesDown, rule: flow.stat.downCounter(), sub: flow.sub.downCounter(), subSeen: flow.sub.seenCounter(), first: good})
 	if down.Load() == 0 && (up.Load() > 0 || upErr != nil) {
 		// The app spoke, or the upstream broke, and nothing came back.
 		e.relays.dead(flow.proxy.Name, flow.created, e.now())
@@ -186,6 +188,9 @@ func (e *Engine) closeFlowLocked(flow *tcpFlow) {
 		if flow.stat != nil {
 			flow.stat.flows.Add(-1)
 		}
+		if flow.sub != nil {
+			flow.sub.flows.Add(-1)
+		}
 	}
 	flow.mu.Lock()
 	c := flow.conn
@@ -218,6 +223,9 @@ func (e *Engine) dropFlowLocked(flow *tcpFlow) {
 		if flow.stat != nil {
 			flow.stat.flows.Add(-1)
 		}
+		if flow.sub != nil {
+			flow.sub.flows.Add(-1)
+		}
 	}
 	flow.mu.Lock()
 	c := flow.conn
@@ -236,6 +244,8 @@ func (e *Engine) dropFlowLocked(flow *tcpFlow) {
 type counter struct {
 	flow, total *atomic.Int64
 	rule        *atomic.Int64 // may be nil
+	sub         *atomic.Int64 // the process's share of rule; may be nil
+	subSeen     *atomic.Int64 // the process's last activity; may be nil
 	first       func()        // runs on the flow's first bytes; may be nil
 }
 
@@ -246,6 +256,12 @@ func (c counter) add(n int) {
 	c.total.Add(int64(n))
 	if c.rule != nil {
 		c.rule.Add(int64(n))
+	}
+	if c.sub != nil {
+		c.sub.Add(int64(n))
+	}
+	if c.subSeen != nil && n > 0 {
+		c.subSeen.Store(time.Now().UnixMilli())
 	}
 }
 

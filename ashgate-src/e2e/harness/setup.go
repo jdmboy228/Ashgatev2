@@ -22,6 +22,11 @@ import (
 // firewall rules point at these paths.
 const AppsDir = `C:\ashgate-e2e\apps`
 
+// ControlDir holds the client that must stay outside every rule. A rule
+// covers its app's install folder, so the control in AppsDir would inherit
+// the rule of the client next to it.
+const ControlDir = `C:\ashgate-e2e\control`
+
 // SharedDir is readable and writable by every account (other-user tests).
 const SharedDir = `C:\ashgate-e2e\shared`
 
@@ -47,10 +52,16 @@ const (
 	ClientPlain   = "ashgate-e2e-plain"
 )
 
-// ClientExe copies the client under name and returns its path.
+// ClientExe copies the client under name and returns its path. The control
+// client goes to ControlDir, apart from the app a rule names, so no folder
+// rule reaches it.
 func (e *Env) ClientExe(t testing.TB, name string) string {
 	t.Helper()
-	dst := filepath.Join(AppsDir, name+".exe")
+	dir := AppsDir
+	if name == ClientDirect {
+		dir = ControlDir
+	}
+	dst := filepath.Join(dir, name+".exe")
 	if _, err := os.Stat(dst); err == nil {
 		return dst
 	}

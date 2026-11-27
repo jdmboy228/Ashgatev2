@@ -2,11 +2,13 @@ package gui
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1125,5 +1127,190 @@ func TestIconAPIRejectsUNCAndNonExeWithoutStat(t *testing.T) {
 		if p != "" {
 			t.Fatalf("iconPNG called with non-empty rejected path %q", p)
 		}
+	}
+}
+
+func TestRuleMasks(t *testing.T) {
+	cfg := &config.Config{Rules: []config.Rule{
+		{Process: `C:\Users\u\AppData\Local\Discord\app-1.0.9187\Discord.exe`},
+		{Process: `C:\Program Files\App\App.exe`},
+		{Process: `*\Slack\app-*\slack.exe`},
+		{Process: "curl"},
+	}}
+	got := ruleMasks(cfg)
+	want := map[string]string{
+		`c:\users\u\appdata\local\discord\app-1.0.9187\discord.exe`: `C:\Users\u\AppData\Local\Discord\app-*\Discord.exe`,
+	}
+	if len(got) != len(want) {
+		t.Fatalf("ruleMasks = %v", got)
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Fatalf("%q = %q, want %q", k, got[k], v)
+		}
+	}
+	if ruleMasks(nil) != nil {
+		t.Fatal("nil config must give no masks")
+	}
+}
+
+func TestBrowseAnswersMask(t *testing.T) {
+	dir := t.TempDir()
+	exe := filepath.Join(dir, "app-1.0.9187", "Discord.exe")
+	if err := os.MkdirAll(filepath.Dir(exe), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(exe, []byte("MZ"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c := newController(filepath.Join(dir, "config.json"), config.Default(), nil, hooks{
+		browse: func() (string, error) { return exe, nil },
+	})
+	body := strings.NewReader(`{}`)
+	r := httptest.NewRequest(http.MethodPost, "/api/browse", body)
+	w := httptest.NewRecorder()
+	c.api(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", w.Code, w.Body)
+	}
+	var out map[string]string
+	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if out["path"] != exe {
+		t.Fatalf("path = %q", out["path"])
+	}
+	if want := filepath.Join(dir, "app-*", "Discord.exe"); out["mask"] != want {
+		t.Fatalf("mask = %q, want %q", out["mask"], want)
+	}
+}
+
+func TestCompanionCandidatesAPI(t *testing.T) {
+	on := true
+	const ruleProcess = `C:\Apps\MyApp\myapp.exe`
+	cfg := config.Default()
+	cfg.Rules = []config.Rule{{Enabled: &on, Process: ruleProcess, Action: "direct"}}
+	c := newController(filepath.Join(t.TempDir(), "config.json"), cfg, nil, hooks{})
+	c.mu.Lock()
+	c.aliveAt = time.Now() // no background process scan in the test
+	c.liveProcs = []rules.Process{{Name: "helper.exe", Path: `C:\Other\myapp-tool\helper.exe`, PID: 42}}
+	c.mu.Unlock()
+	h := c.Handler()
+	key := ruleKey(ruleProcess)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/companions/candidates?rule="+url.QueryEscape(key), nil)
+	req.Host = "127.0.0.1:5000"
+	req.Header.Set(tokenHeader, c.token)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rr.Code, rr.Body)
+	}
+	var got struct {
+		Rule       string               `json:"rule"`
+		Candidates []companionCandidate `json:"candidates"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Rule != key {
+		t.Fatalf("rule = %q, want %q", got.Rule, key)
+	}
+	found := false
+	for _, cand := range got.Candidates {
+		if cand.Name == "helper.exe" && cand.Running {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("helper.exe missing from %+v", got.Candidates)
+	}
+
+	missing := httptest.NewRequest(http.MethodGet, "/api/companions/candidates?rule=nope", nil)
+	missing.Host = "127.0.0.1:5000"
+	missing.Header.Set(tokenHeader, c.token)
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, missing)
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("unknown rule: %d", rr.Code)
+	}
+
+	postReq := httptest.NewRequest(http.MethodPost, "/api/companions/candidates?rule="+url.QueryEscape(key), strings.NewReader("{}"))
+	postReq.Host = "127.0.0.1:5000"
+	postReq.Header.Set(tokenHeader, c.token)
+	postReq.Header.Set("Content-Type", "application/json")
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, postReq)
+	if rr.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("POST candidates: %d, want 405", rr.Code)
+	}
+}
+
+func TestDirectAPI(t *testing.T) {
+	c := newController(filepath.Join(t.TempDir(), "config.json"), config.Default(), nil, hooks{})
+	req := httptest.NewRequest(http.MethodGet, "/api/direct", nil)
+	req.Host = "127.0.0.1:5000"
+	req.Header.Set(tokenHeader, c.token)
+	rr := httptest.NewRecorder()
+	c.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rr.Code, rr.Body)
+	}
+	var got struct {
+		Procs      []json.RawMessage `json:"procs"`
+		Events     []json.RawMessage `json:"events"`
+		Generation uint64            `json:"generation"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Generation != 0 || len(got.Procs) != 0 || len(got.Events) != 0 {
+		t.Fatalf("empty session answered %s", rr.Body)
+	}
+}
+
+func TestDirectClearAPI(t *testing.T) {
+	c := newController(filepath.Join(t.TempDir(), "config.json"), config.Default(), nil, hooks{})
+	code, body := apiPost(t, c, "/api/direct/clear", "{}")
+	if code != http.StatusOK || !strings.Contains(body, `"ok":true`) {
+		t.Fatalf("%d %s", code, body)
+	}
+}
+
+func TestStateShowsRuleMembersAndDirectCount(t *testing.T) {
+	const exe = `C:\LDPlayer\ldmutiplayer\dnmultiplayerex.exe`
+	cfg := config.Default()
+	cfg.Rules = []config.Rule{{Process: exe, Action: "direct", Companions: []string{`C:\LDPlayer\ldmutiplayer\Ld9BoxSVC.exe`}}}
+	c := newController(filepath.Join(t.TempDir(), "config.json"), cfg, nil, hooks{})
+	c.mu.Lock()
+	c.aliveAt = time.Now() // no background process scan in the test
+	c.mu.Unlock()
+	st := c.snapshot()
+	list := st.RuleMembers[ruleKey(exe)]
+	if len(list) != 1 || list[0].Name != "Ld9BoxSVC.exe" || list[0].Kind != "companion" {
+		t.Fatalf("ruleMembers = %+v", st.RuleMembers)
+	}
+	raw, err := json.Marshal(st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"ruleMembers"`) {
+		t.Fatalf("state has no ruleMembers: %s", raw)
+	}
+	// The badge is omitted while no program sends direct traffic.
+	if strings.Contains(string(raw), `"directCount"`) {
+		t.Fatalf("zero directCount should be omitted: %s", raw)
+	}
+}
+
+// Changing a rule's companions must reach the engine: saving only window
+// settings still skips Apply, but companions are not a window setting.
+func TestEngineViewSeesCompanions(t *testing.T) {
+	a := config.Default()
+	a.Rules = []config.Rule{{Process: "app.exe", Companions: []string{"helper.exe"}}}
+	b := config.Default()
+	b.Rules = []config.Rule{{Process: "app.exe"}}
+	if engineView(a) == engineView(b) {
+		t.Fatal("companion change counted as a window-only change")
 	}
 }

@@ -10,7 +10,8 @@ type App struct {
 	Name   string `json:"name"`
 	Path   string `json:"path"`
 	Window bool   `json:"window"`
-	Title  string `json:"title,omitempty"`
+	Title string `json:"title,omitempty"`
+	Mask  string `json:"mask,omitempty"`
 }
 
 // List is empty outside Windows.

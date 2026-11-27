@@ -3,6 +3,7 @@ package vless
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"sync"
 	"testing"
@@ -288,5 +289,69 @@ func TestUDPSendDoesNotBlockOnStuckServer(t *testing.T) {
 	}
 	if n := len(s.out); n != 0 {
 		t.Fatalf("%d datagrams left queued after Close", n)
+	}
+}
+
+// TestBridgeCloseInterruptsBlockedXHTTPRead reproduces the ServerStall failure:
+// an in-flight XHTTP DialTCP read stuck on a blackholed server must fail as
+// soon as Bridge.Close runs on failover, instead of hanging until the client's
+// HTTP timeout.
+func TestBridgeCloseInterruptsBlockedXHTTPRead(t *testing.T) {
+	bh, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bh.Close()
+	go func() {
+		for {
+			c, err := bh.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				_, _ = io.Copy(io.Discard, conn)
+			}(c)
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	p := Params{UUID: sampleUUID, Network: "xhttp", Security: "none", Path: "/"}
+	br, err := Listen(ctx, bh.Addr().String(), p, Inbound{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer br.Close()
+
+	c, err := DialTCP(br.Addr, "198.51.100.10", 18080)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if _, err := c.Write([]byte("GET / HTTP/1.1\r\nHost: test\r\n\r\n")); err != nil {
+		t.Fatal(err)
+	}
+
+	readErr := make(chan error, 1)
+	go func() {
+		_, err := c.Read(make([]byte, 64))
+		readErr <- err
+	}()
+
+	time.Sleep(150 * time.Millisecond)
+	t0 := time.Now()
+	br.Close()
+
+	select {
+	case err := <-readErr:
+		if err == nil {
+			t.Fatal("Read returned nil error after Bridge.Close")
+		}
+		if d := time.Since(t0); d > 2*time.Second {
+			t.Fatalf("Read took %s after Bridge.Close, want <= 2s", d)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Read stayed blocked on blackholed XHTTP bridge after Bridge.Close")
 	}
 }

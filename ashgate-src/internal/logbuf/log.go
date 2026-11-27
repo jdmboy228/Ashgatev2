@@ -26,6 +26,7 @@ var utf8BOM = []byte{0xEF, 0xBB, 0xBF}
 type Event struct {
 	Time      time.Time `json:"time"`
 	Process   string    `json:"process"`
+	Path      string    `json:"path,omitempty"`
 	PID       uint32    `json:"pid"`
 	Proto     string    `json:"proto"`
 	Dest      string    `json:"dest"`

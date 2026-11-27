@@ -211,7 +211,7 @@ func (e *Engine) systemDNS(pkt []byte, h *packet.Header, meta Meta, proc rules.P
 			return Result{Action: ActionDrop}
 		}
 		e.debugDNS(h, proc, "DNS Windows: нет прокси для туннеля")
-		e.rememberDirectExceptDNS(h)
+		e.rememberDirectExceptDNS(h, nil)
 		return Result{Action: ActionPass}
 	}
 	p := *snap.sysProxy
@@ -223,7 +223,7 @@ func (e *Engine) systemDNS(pkt []byte, h *packet.Header, meta Meta, proc rules.P
 		}
 		// The name is not visible before the handshake: all of it goes
 		// through the tunnel. Windows uses TCP only after a truncated answer.
-		return e.startTCP(pkt, h, meta, proc, p, snap, "", nil, true)
+		return e.startTCP(pkt, h, meta, proc, p, snap, "", nil, "", true)
 	}
 	if h.Frag {
 		e.dropFragment(h)
@@ -232,7 +232,7 @@ func (e *Engine) systemDNS(pkt []byte, h *packet.Header, meta Meta, proc rules.P
 	if name, _, _, ok := question(payloadOf(pkt, h)); ok && snap.bypassNames.bypass(name) {
 		return Result{Action: ActionPass}
 	}
-	return e.startUDP(pkt, h, meta, proc, p, snap, "", nil, false, true)
+	return e.startUDP(pkt, h, meta, proc, p, snap, "", nil, "", false, true)
 }
 
 // dohServers are public resolvers Windows can use with DNS over HTTPS
@@ -274,7 +274,7 @@ func encryptedDNS(h *packet.Header) bool {
 // next to a routed program's traffic.
 func (e *Engine) systemEncryptedDNS(pkt []byte, h *packet.Header, meta Meta, proc rules.Process, snap *snapshot) Result {
 	if snap.sysProxy == nil {
-		e.rememberDirect(h)
+		e.rememberDirect(h, nil)
 		return Result{Action: ActionPass}
 	}
 	p := *snap.sysProxy
@@ -283,11 +283,11 @@ func (e *Engine) systemEncryptedDNS(pkt []byte, h *packet.Header, meta Meta, pro
 			// Opened before capture: reset, Windows reconnects through the tunnel.
 			return e.reset(h)
 		}
-		return e.startTCP(pkt, h, meta, proc, p, snap, "", nil, false)
+		return e.startTCP(pkt, h, meta, proc, p, snap, "", nil, "", false)
 	}
 	// QUIC that the proxy cannot carry is dropped, never sent direct:
 	// Windows then uses DoH over TCP.
-	return e.startUDP(pkt, h, meta, proc, p, snap, "", nil, true, false)
+	return e.startUDP(pkt, h, meta, proc, p, snap, "", nil, "", true, false)
 }
 
 // forwardDNSTCP sends one query as DNS over TCP through the flow's proxy:

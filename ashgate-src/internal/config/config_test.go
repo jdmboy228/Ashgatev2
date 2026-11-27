@@ -2,6 +2,7 @@ package config
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -105,6 +106,16 @@ func TestValidateErrors(t *testing.T) {
 		{"system dns mode", Config{DNS: DNS{SystemResolver: "on"}}, "systemResolver"},
 		{"bootstrap name", Config{DNS: DNS{Bootstrap: []string{"https://dns.google/dns-query"}}}, "IP address"},
 		{"bootstrap plain http", Config{DNS: DNS{Bootstrap: []string{"http://1.1.1.1/dns-query"}}}, "https"},
+		{"empty companion", Config{Rules: []Rule{{Process: "a.exe", Action: "direct", Companions: []string{"  "}}}}, "companions"},
+		{"quoted empty companion", Config{Rules: []Rule{{Process: "a.exe", Action: "direct", Companions: []string{`""`}}}}, "companions"},
+		{"svchost companion", Config{Rules: []Rule{{Process: "a.exe", Action: "direct", Companions: []string{`C:\Windows\System32\svchost.exe`}}}}, "svchost"},
+		{"companion mask", Config{Rules: []Rule{{Process: "a.exe", Action: "direct", Companions: []string{"*"}}}}, "matches every program"},
+		{"companion exe mask", Config{Rules: []Rule{{Process: "a.exe", Action: "direct", Companions: []string{"*.exe"}}}}, "matches every program"},
+		{"empty exclude companion", Config{Rules: []Rule{{Process: "a.exe", Action: "direct", ExcludeCompanions: []string{"  "}}}}, "exclude_companions"},
+		{"quoted empty exclude companion", Config{Rules: []Rule{{Process: "a.exe", Action: "direct", ExcludeCompanions: []string{`""`}}}}, "exclude_companions"},
+		{"svchost exclude companion", Config{Rules: []Rule{{Process: "a.exe", Action: "direct", ExcludeCompanions: []string{`C:\Windows\System32\svchost.exe`}}}}, "svchost"},
+		{"exclude companion mask", Config{Rules: []Rule{{Process: "a.exe", Action: "direct", ExcludeCompanions: []string{"*"}}}}, "matches every program"},
+		{"exclude companion exe mask", Config{Rules: []Rule{{Process: "a.exe", Action: "direct", ExcludeCompanions: []string{"*.exe"}}}}, "matches every program"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -383,15 +394,27 @@ func TestGroupValidation(t *testing.T) {
 }
 
 func TestMaskMatchingEverythingRejected(t *testing.T) {
-	for _, p := range []string{"*", "*.exe", `*\*.exe`, "?*"} {
+	for _, p := range []string{"*", "*.exe", `*\*.exe`, "?*", `C:\*`, `D:\*.exe`, `?:\*`, `c:/*.exe`} {
 		c := Default()
 		c.Rules = []Rule{{Process: p, Action: "direct"}}
 		if err := c.Validate(); err == nil {
-			t.Fatalf("%q accepted", p)
+			t.Fatalf("process %q accepted", p)
+		}
+		c2 := Default()
+		c2.Rules = []Rule{{Process: "app.exe", Action: "direct", Companions: []string{p}}}
+		if err := c2.Validate(); err == nil {
+			t.Fatalf("companion %q accepted", p)
+		}
+	}
+	for _, bad := range []string{"svchost", "svchost.exe", `C:\Windows\System32\svchost.exe`, "  ", `""`} {
+		c := Default()
+		c.Rules = []Rule{{Process: "app.exe", Action: "direct", Companions: []string{bad}}}
+		if err := c.Validate(); err == nil {
+			t.Fatalf("companion %q accepted", bad)
 		}
 	}
 	c := Default()
-	c.Rules = []Rule{{Process: `*\Discord\*.exe`, Action: "direct"}}
+	c.Rules = []Rule{{Process: `*\Discord\*.exe`, Action: "direct", Companions: []string{`C:\Apps\Helper\helper-*.exe`}}}
 	if err := c.Validate(); err != nil {
 		t.Fatal(err)
 	}
@@ -564,5 +587,129 @@ func TestBootstrapURLs(t *testing.T) {
 	c.DNS.Bootstrap = []string{"https://1.1.1.1/dns-query", "http://127.0.0.1:8053/dns-query", "https://[2606:4700:4700::1111]/dns-query"}
 	if err := c.Validate(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestRuleCompanionsJSON(t *testing.T) {
+	// An empty list leaves the key out entirely.
+	data, err := json.Marshal(Rule{Process: "a.exe", Action: "direct"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(data, []byte("companions")) {
+		t.Fatalf("empty companions written: %s", data)
+	}
+
+	raw := []byte(`{"process": "dnplayer.exe", "action": "direct", "companions": ["Ld9BoxHeadless.exe", "C:\\VM\\Service\\svc.exe"]}`)
+	var r Rule
+	if err := json.Unmarshal(raw, &r); err != nil {
+		t.Fatal(err)
+	}
+	if len(r.Companions) != 2 || r.Companions[0] != "Ld9BoxHeadless.exe" || r.Companions[1] != `C:\VM\Service\svc.exe` {
+		t.Fatalf("companions: %#v", r.Companions)
+	}
+	data, err = json.Marshal(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var again Rule
+	if err := json.Unmarshal(data, &again); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(again.Companions, ",") != strings.Join(r.Companions, ",") {
+		t.Fatalf("round trip: %#v", again.Companions)
+	}
+}
+
+func TestRuleCompanionsDeepCopy(t *testing.T) {
+	cfg := &Config{Rules: []Rule{{
+		Process: "a.exe", Action: "direct",
+		Companions: []string{"b.exe", "c.exe"},
+	}}}
+	cp := deepCopy(cfg)
+	cfg.Rules[0].Companions[0] = "changed"
+	if cp.Rules[0].Companions[0] != "b.exe" {
+		t.Fatalf("deepCopy shares the companions slice: %#v", cp.Rules[0].Companions)
+	}
+	// EffectiveRules must not hand the engine a slice that config edits mutate.
+	eff := cfg.EffectiveRules()
+	cfg.Rules[0].Companions[1] = "changed too"
+	if eff[0].Companions[1] != "c.exe" {
+		t.Fatalf("EffectiveRules shares the companions slice: %#v", eff[0].Companions)
+	}
+	if len(eff[0].Companions) != 2 {
+		t.Fatalf("EffectiveRules lost companions: %#v", eff[0].Companions)
+	}
+}
+
+func TestRuleCompanionsSaveLoadRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	cfg := Default()
+	cfg.Rules = []Rule{{
+		Process:    `C:\LDPlayer\dnplayer.exe`,
+		Action:     "direct",
+		Companions: []string{`C:\Program Files\ldplayer9box\Ld9BoxHeadless.exe`, "helper.exe"},
+	}}
+	if err := Save(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	got, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Rules) != 1 || strings.Join(got.Rules[0].Companions, ",") != strings.Join(cfg.Rules[0].Companions, ",") {
+		t.Fatalf("loaded companions = %#v, want %#v", got.Rules, cfg.Rules[0].Companions)
+	}
+}
+
+func TestRuleExcludeCompanionsJSON(t *testing.T) {
+	// An empty list leaves the key out entirely.
+	data, err := json.Marshal(Rule{Process: "a.exe", Action: "direct"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(data, []byte("exclude_companions")) {
+		t.Fatalf("empty exclude companions written: %s", data)
+	}
+
+	raw := []byte(`{"process": "dnplayer.exe", "action": "direct", "exclude_companions": ["chrome.exe", "C:\\VM\\Service\\svc.exe"]}`)
+	var r Rule
+	if err := json.Unmarshal(raw, &r); err != nil {
+		t.Fatal(err)
+	}
+	if len(r.ExcludeCompanions) != 2 || r.ExcludeCompanions[0] != "chrome.exe" || r.ExcludeCompanions[1] != `C:\VM\Service\svc.exe` {
+		t.Fatalf("exclude companions: %#v", r.ExcludeCompanions)
+	}
+	data, err = json.Marshal(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var again Rule
+	if err := json.Unmarshal(data, &again); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(again.ExcludeCompanions, ",") != strings.Join(r.ExcludeCompanions, ",") {
+		t.Fatalf("round trip: %#v", again.ExcludeCompanions)
+	}
+}
+
+func TestRuleExcludeCompanionsDeepCopy(t *testing.T) {
+	cfg := &Config{Rules: []Rule{{
+		Process: "a.exe", Action: "direct",
+		ExcludeCompanions: []string{"b.exe", "c.exe"},
+	}}}
+	cp := deepCopy(cfg)
+	cfg.Rules[0].ExcludeCompanions[0] = "changed"
+	if cp.Rules[0].ExcludeCompanions[0] != "b.exe" {
+		t.Fatalf("deepCopy shares the exclude companions slice: %#v", cp.Rules[0].ExcludeCompanions)
+	}
+	// EffectiveRules must not hand the engine a slice that config edits mutate.
+	eff := cfg.EffectiveRules()
+	cfg.Rules[0].ExcludeCompanions[1] = "changed too"
+	if eff[0].ExcludeCompanions[1] != "c.exe" {
+		t.Fatalf("EffectiveRules shares the exclude companions slice: %#v", eff[0].ExcludeCompanions)
+	}
+	if len(eff[0].ExcludeCompanions) != 2 {
+		t.Fatalf("EffectiveRules lost exclude companions: %#v", eff[0].ExcludeCompanions)
 	}
 }

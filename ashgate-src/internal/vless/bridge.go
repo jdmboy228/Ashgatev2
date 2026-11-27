@@ -118,17 +118,31 @@ type Bridge struct {
 	routing Routing
 	server  string
 	inst    *instance
+	ctx     context.Context
+	cancel  context.CancelFunc
 	stop    chan struct{}
 	once    sync.Once
 }
 
-// Close stops the embedded Xray instance. It is safe to call more than once.
+// parentCtx returns the bridge's lifetime context, cancelled on Close.
+func (b *Bridge) parentCtx() context.Context {
+	if b != nil && b.ctx != nil {
+		return b.ctx
+	}
+	return context.Background()
+}
+
+// Close stops the embedded Xray instance and cancels in-flight in-process
+// connections. It is safe to call more than once.
 func (b *Bridge) Close() {
 	if b == nil {
 		return
 	}
 	b.once.Do(func() {
 		close(b.stop)
+		if b.cancel != nil {
+			b.cancel()
+		}
 		unregister(b)
 		if b.inst != nil {
 			_ = b.inst.Close()
@@ -227,10 +241,11 @@ func startBridge(ctx context.Context, cc ClientConfig) (*Bridge, error) {
 	if err != nil {
 		return nil, err
 	}
+	bctx, bcancel := context.WithCancel(context.Background())
 	b := &Bridge{
 		Addr: fmt.Sprintf("127.0.0.1:%d", cc.Port), User: cc.User, Pass: cc.Pass,
 		routing: cc.Routing, server: net.JoinHostPort(cc.Server, fmt.Sprint(cc.ServerPort)),
-		inst: inst, stop: make(chan struct{}),
+		inst: inst, ctx: bctx, cancel: bcancel, stop: make(chan struct{}),
 	}
 	if cc.Published.Port != 0 {
 		b.Published = fmt.Sprintf("127.0.0.1:%d", cc.Published.Port)

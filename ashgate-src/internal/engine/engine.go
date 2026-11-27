@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -117,6 +118,15 @@ type Options struct {
 	SelfPID  uint32
 	Now      func() time.Time
 	SkipSelf bool
+	// Inspector enables the auto matcher (see auto.go). When nil the matcher
+	// is not created and the engine behaves as before.
+	Inspector AutoInspector
+	// Snapshot supplies the process list to the auto matcher; nil uses
+	// process.Snapshot. Tests replace it.
+	Snapshot func() []rules.Process
+	// AutoRefresh is how often the auto matcher re-reads the process list;
+	// zero uses defaultAutoRefresh. Tests shorten it.
+	AutoRefresh time.Duration
 }
 
 // Engine is safe for one packet goroutine plus the accept and UDP goroutines.
@@ -140,13 +150,18 @@ type Engine struct {
 	noRelay6     atomic.Bool
 	relay6Logged atomic.Bool
 
-	mu        sync.Mutex
-	byClient  map[tcpKey]*tcpFlow
-	byAlloc   map[allocKey]*tcpFlow
-	directTCP ageSet[tcpKey]
-	directUDP ageSet[udpKey]
+	mu       sync.Mutex
+	byClient map[tcpKey]*tcpFlow
+	byAlloc  map[allocKey]*tcpFlow
+	// directTCP and directUDP cache direct decisions with the unmatched
+	// program behind them (nil for an explicit direct rule), so their bytes
+	// keep counting; see direct.go.
+	directTCP ageMap[tcpKey, *directProcEntry]
+	directUDP ageMap[udpKey, *directProcEntry]
 	// directPorts indexes directUDP by source port; see udpport.go.
 	directPorts map[uint16]map[udpKey]struct{}
+	// direct lists the programs whose traffic went direct without a rule.
+	direct directTracker
 	blockTCP    ageSet[tcpKey]
 	blockUDP    ageSet[udpKey]
 	// closedTCP holds the app side of proxied TCP flows that ended. Their
@@ -194,6 +209,10 @@ type Engine struct {
 	bytesUp   atomic.Int64
 	bytesDown atomic.Int64
 	dnsRR     atomic.Uint64
+
+	// auto attributes the processes rules cover indirectly (see auto.go). It
+	// is nil unless Options.Inspector was set.
+	auto *autoMatcher
 }
 
 type fragKey struct {
@@ -258,8 +277,8 @@ func New(cfg *config.Config, opt Options) (*Engine, error) {
 		now:        opt.Now,
 		byClient:   map[tcpKey]*tcpFlow{},
 		byAlloc:    map[allocKey]*tcpFlow{},
-		directTCP:  newAgeSet[tcpKey](),
-		directUDP:  newAgeSet[udpKey](),
+		directTCP:  newAgeMap[tcpKey, *directProcEntry](),
+		directUDP:  newAgeMap[udpKey, *directProcEntry](),
 		blockTCP:   newAgeSet[tcpKey](),
 		blockUDP:   newAgeSet[udpKey](),
 		closedTCP:  newAgeSet[tcpKey](),
@@ -270,6 +289,7 @@ func New(cfg *config.Config, opt Options) (*Engine, error) {
 		dnsSem:     make(chan struct{}, httpDNSParallel),
 		stats:      map[string]*ruleStat{},
 	}
+	e.direct.init()
 	if e.alloc == nil {
 		e.alloc = OSAllocator{}
 	}
@@ -290,7 +310,81 @@ func New(cfg *config.Config, opt Options) (*Engine, error) {
 	if err := e.Apply(cfg); err != nil {
 		return nil, err
 	}
+	if opt.Inspector != nil {
+		e.auto = newAutoMatcher(opt.Inspector, opt.Snapshot, opt.AutoRefresh, e.onAutoMatchAdded)
+		if snap := e.snap.Load(); snap != nil {
+			e.auto.configure(cfg.EffectiveRules(), snap.rules, snap.ruleKeys)
+		}
+	}
 	return e, nil
+}
+
+// Close stops the auto matcher. It is safe to call more than once and safe
+// when the matcher was never created.
+func (e *Engine) Close() {
+	if e == nil || e.auto == nil {
+		return
+	}
+	e.auto.stop()
+}
+
+// AutoMatches copies the processes the auto matcher currently attributes to
+// rules. It is empty when no inspector was configured.
+func (e *Engine) AutoMatches() []AutoMatch {
+	if e == nil || e.auto == nil {
+		return nil
+	}
+	t := e.auto.table()
+	if t == nil || len(t.byPID) == 0 {
+		return nil
+	}
+	out := make([]AutoMatch, 0, len(t.byPID))
+	for _, am := range t.byPID {
+		out = append(out, am)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].RuleIndex != out[j].RuleIndex {
+			return out[i].RuleIndex < out[j].RuleIndex
+		}
+		if out[i].Proc.PID != out[j].Proc.PID {
+			return out[i].Proc.PID < out[j].Proc.PID
+		}
+		return out[i].Proc.Started < out[j].Proc.Started
+	})
+	return out
+}
+
+// onAutoMatchAdded forgets what the caches said about a process that just
+// became routed, so its DIRECT row disappears and the next packet follows
+// the rule. The address caches are cleared whole: they are small, hold no
+// process key, and the packet path will refill them.
+func (e *Engine) onAutoMatchAdded(am AutoMatch) {
+	if e == nil {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.directTCP.clear()
+	e.directUDP.clear()
+	e.directPorts = nil
+	e.direct.pruneKey(autoProcKey(am.Proc))
+}
+
+// autoCompatible reports that am still names the same rule in snap. The table
+// can lag one Apply behind, and an index that no longer points at the same
+// rule must not route traffic by its old action.
+func (e *Engine) autoCompatible(snap *snapshot, am AutoMatch) bool {
+	if snap == nil {
+		return false
+	}
+	if am.RuleIndex < 0 || am.RuleIndex >= len(snap.ruleKeys) {
+		return false
+	}
+	key := snap.ruleKeys[am.RuleIndex]
+	if key == "" || am.RuleKey == "" {
+		return true
+	}
+	return key == am.RuleKey
 }
 
 // SetInjector installs the reply path used by UDP.
@@ -326,15 +420,19 @@ func (e *Engine) Apply(cfg *config.Config) error {
 	if err != nil {
 		return err
 	}
-	e.snap.Store(snap)
 	e.verbose.Store(strings.EqualFold(cfg.Log.Level, "debug"))
 	e.mu.Lock()
-	e.directTCP = newAgeSet[tcpKey]()
-	e.directUDP = newAgeSet[udpKey]()
+	e.snap.Store(snap)
+	e.directTCP = newAgeMap[tcpKey, *directProcEntry]()
+	e.directUDP = newAgeMap[udpKey, *directProcEntry]()
 	e.directPorts = nil
 	e.blockTCP = newAgeSet[tcpKey]()
 	e.blockUDP = newAgeSet[udpKey]()
 	e.unknownUDP = newAgeSet[udpKey]()
+	// Prune under e.mu after publishing snap and clearing direct caches so no
+	// concurrent decide() on the old snapshot can re-insert a matched program.
+	// Lock order (e.mu -> direct.mu) matches decide() -> direct.record().
+	e.direct.pruneMatched(snap.rules)
 	var stale []*udpFlow
 	for k, f := range e.udp {
 		f.mu.Lock()
@@ -348,6 +446,10 @@ func (e *Engine) Apply(cfg *config.Config) error {
 	e.mu.Unlock()
 	for _, f := range stale {
 		e.retireUDP(f)
+	}
+	// Outside e.mu: configure wakes the matcher, whose callback takes e.mu.
+	if e.auto != nil {
+		e.auto.configure(cfg.EffectiveRules(), snap.rules, snap.ruleKeys)
 	}
 	return nil
 }
@@ -674,7 +776,14 @@ func (e *Engine) fastPath(pkt []byte, h *packet.Header) (Result, bool) {
 			return e.rewriteForward(pkt, h, flow, snap), true
 		} else if e.closedTCP.has(key) {
 			return Result{Action: ActionDrop}, true
-		} else if e.directTCP.has(key) {
+		} else if dp, ok := e.directTCP.get(key); ok {
+			if dp != nil && dp.evicted.Load() {
+				e.directTCP.del(key)
+				return Result{}, false
+			}
+			if dp != nil {
+				dp.addBytes(int64(len(pkt)), e.now().UnixMilli())
+			}
 			return Result{Action: ActionPass}, true
 		} else if e.blockTCP.has(key) {
 			return Result{Action: ActionDrop}, true
@@ -702,9 +811,20 @@ func (e *Engine) fastPath(pkt []byte, h *packet.Header) (Result, bool) {
 			if flow.stat != nil {
 				flow.stat.up.Add(n)
 			}
+			if flow.owner != nil {
+				flow.owner.up.Add(n)
+				flow.owner.lastSeen.Store(e.now().UnixMilli())
+			}
 			return Result{Action: ActionUDP, UDP: datagram(pkt, h, flow)}, true
 		}
-		if e.directUDP.has(key) {
+		if dp, ok := e.directUDP.get(key); ok {
+			if dp != nil && dp.evicted.Load() {
+				e.directUDP.del(key)
+				return Result{}, false
+			}
+			if dp != nil {
+				dp.addBytes(int64(len(pkt)), e.now().UnixMilli())
+			}
 			return Result{Action: ActionPass}, true
 		}
 		if e.blockUDP.has(key) {
@@ -727,7 +847,7 @@ func (e *Engine) decide(pkt []byte, h *packet.Header, meta Meta, proc rules.Proc
 	// program's query.
 	dns := h.Dst.Port == 53
 	if destinationBypass(h.Dst, snap.bypassPrivate && !dns, dns) {
-		e.rememberDirectExceptDNS(h)
+		e.rememberDirectExceptDNS(h, nil)
 		return Result{Action: ActionPass}
 	}
 	if !found {
@@ -735,7 +855,7 @@ func (e *Engine) decide(pkt []byte, h *packet.Header, meta Meta, proc rules.Proc
 			return Result{Action: ActionUnknown}
 		}
 		if e.proxyServer(h.Dst) {
-			e.rememberDirectExceptDNS(h)
+			e.rememberDirectExceptDNS(h, nil)
 			return Result{Action: ActionPass}
 		}
 		if dns {
@@ -766,15 +886,45 @@ func (e *Engine) decide(pkt []byte, h *packet.Header, meta Meta, proc rules.Proc
 			e.unknownDropLocked()
 			return Result{Action: ActionDrop}
 		}
-		e.rememberDirect(h)
+		e.rememberDirect(h, nil)
 		return Result{Action: ActionPass}
 	}
 	if e.selfPID != 0 && proc.PID == e.selfPID {
-		e.rememberDirectExceptDNS(h)
+		e.rememberDirectExceptDNS(h, nil)
 		return Result{Action: ActionPass}
 	}
 
 	dec := snap.rules.Match(proc)
+	if e.auto != nil {
+		if dec.Action != "" {
+			// The rule matched this process; hand its folder to the matcher
+			// at once, so a candidate in a sibling folder is attributed
+			// without waiting for the next snapshot.
+			e.auto.noteRuleProc(dec.RuleIndex, proc)
+		} else if !rules.IsShellOrSystem(proc) && !rules.IsSystemDNS(proc.Name) && !rules.IsSystemPath(proc.Path) {
+			am, ok, decided, hasRules := e.auto.lookup(proc)
+			if ok && !snap.rules.IsExcluded(am.RuleIndex, proc) && e.autoCompatible(snap, am) {
+				dec = rules.Decision{
+					Action:     am.Action,
+					Proxy:      am.Proxy,
+					RuleIndex:  am.RuleIndex,
+					MatchKind:  rules.MatchAuto,
+					Parent:     am.RuleName,
+					KillSwitch: am.KillSwitch,
+					TCPOnly:    am.TCPOnly,
+				}
+			} else if hasRules && !decided {
+				// Ask the matcher to classify the process. Holding the first
+				// packet (ActionUnknown) gives the pass up to holdFor (50 ms)
+				// to finish, so the connection starts through the proxy rather
+				// than leaking out direct.
+				e.auto.enqueue(proc)
+				if !final && (h.Proto == packet.ProtoTCP || h.Proto == packet.ProtoUDP) {
+					return Result{Action: ActionUnknown}
+				}
+			}
+		}
+	}
 	parent := dec.Parent
 	var stat *ruleStat
 	if dec.RuleIndex >= 0 && dec.RuleIndex < len(snap.ruleKeys) {
@@ -796,9 +946,10 @@ func (e *Engine) decide(pkt []byte, h *packet.Header, meta Meta, proc rules.Proc
 	}
 	switch action {
 	case "direct":
-		e.rememberDirectExceptDNS(h)
+		e.rememberDirectExceptDNS(h, nil)
 		e.log(logbuf.Event{
 			Process: display(proc),
+			Path:    proc.Path,
 			PID:     proc.PID,
 			Proto:   protoName(h.Proto),
 			Dest:    h.Dst.String(),
@@ -812,6 +963,7 @@ func (e *Engine) decide(pkt []byte, h *packet.Header, meta Meta, proc rules.Proc
 		e.dropFragment(h)
 		e.log(logbuf.Event{
 			Process: display(proc),
+			Path:    proc.Path,
 			PID:     proc.PID,
 			Proto:   protoName(h.Proto),
 			Dest:    h.Dst.String(),
@@ -823,7 +975,7 @@ func (e *Engine) decide(pkt []byte, h *packet.Header, meta Meta, proc rules.Proc
 		p, ok := snap.proxies[proxyName]
 		if !ok {
 			e.rememberBlock(h)
-			e.log(logbuf.Event{Process: display(proc), PID: proc.PID, Proto: protoName(h.Proto), Dest: h.Dst.String(), Via: proxyName, Status: "error", Error: "unknown proxy"})
+			e.log(logbuf.Event{Process: display(proc), Path: proc.Path, PID: proc.PID, Proto: protoName(h.Proto), Dest: h.Dst.String(), Via: proxyName, Status: "error", Error: "unknown proxy"})
 			return Result{Action: ActionDrop}
 		}
 		if h.Proto == packet.ProtoTCP {
@@ -831,31 +983,35 @@ func (e *Engine) decide(pkt []byte, h *packet.Header, meta Meta, proc rules.Proc
 				if dec.KillSwitch {
 					return e.resetExisting(h, meta, proc, p, parent)
 				}
-				e.rememberDirect(h)
+				e.rememberDirect(h, nil)
 				return Result{Action: ActionPass}
 			}
-			return e.startTCP(pkt, h, meta, proc, p, snap, parent, stat, false)
+			return e.startTCP(pkt, h, meta, proc, p, snap, parent, stat, dec.MatchKind, false)
 		}
 		if dec.TCPOnly && h.Dst.Port != 53 {
 			// "Only TCP": drop UDP so QUIC and the like fall back to TCP,
 			// which goes through the proxy. DNS still goes via the proxy.
 			e.rememberBlock(h)
 			e.dropFragment(h)
-			e.log(logbuf.Event{Process: display(proc), PID: proc.PID, Proto: "UDP", Dest: h.Dst.String(), Via: p.Name, Status: "blocked", Error: "только TCP: UDP отброшен", Parent: parent})
+			e.log(logbuf.Event{Process: display(proc), Path: proc.Path, PID: proc.PID, Proto: "UDP", Dest: h.Dst.String(), Via: p.Name, Status: "blocked", Error: "только TCP: UDP отброшен", Parent: parent})
 			return Result{Action: ActionDrop}
 		}
-		return e.startUDP(pkt, h, meta, proc, p, snap, parent, stat, dec.KillSwitch, false)
+		return e.startUDP(pkt, h, meta, proc, p, snap, parent, stat, dec.MatchKind, dec.KillSwitch, false)
 	default:
 		if dns {
 			e.debugDNS(h, proc, "программа без правила: DNS напрямую")
 		}
-		e.rememberDirectExceptDNS(h)
+		// A known program with no matching rule: remember it for the window,
+		// so it can be attached to an application as a companion.
+		dp := e.direct.record(proc, protoName(h.Proto), h.Dst.String(), len(pkt), e.now())
+		e.rememberDirectExceptDNS(h, dp)
 		return Result{Action: ActionPass}
 	}
 }
 
-// startTCP maps a new connection to the relay. sys marks system DNS.
-func (e *Engine) startTCP(pkt []byte, h *packet.Header, meta Meta, proc rules.Process, p config.Proxy, snap *snapshot, parent string, stat *ruleStat, sys bool) Result {
+// startTCP maps a new connection to the relay. sys marks system DNS; kind is
+// the rule match that routed the process (see rules.Decision.MatchKind).
+func (e *Engine) startTCP(pkt []byte, h *packet.Header, meta Meta, proc rules.Process, p config.Proxy, snap *snapshot, parent string, stat *ruleStat, kind string, sys bool) Result {
 	if h.Ver == 6 && e.noRelay6.Load() {
 		if !e.relay6Logged.Swap(true) {
 			e.log(logbuf.Event{Process: display(proc), PID: proc.PID, Proto: "TCP", Dest: h.Dst.String(), Via: p.Name, Status: "blocked",
@@ -873,6 +1029,10 @@ func (e *Engine) startTCP(pkt []byte, h *packet.Header, meta Meta, proc rules.Pr
 		e.log(logbuf.Event{Process: display(proc), PID: proc.PID, Proto: "TCP", Dest: h.Dst.String(), Via: p.Name, Status: "error", Error: err.Error()})
 		return Result{Action: ActionDrop}
 	}
+	var sub *subProcStat
+	if !sys {
+		sub = stat.procFor(proc, kind)
+	}
 	flow := &tcpFlow{
 		ver:      h.Ver,
 		app:      h.Src,
@@ -881,6 +1041,7 @@ func (e *Engine) startTCP(pkt []byte, h *packet.Header, meta Meta, proc rules.Pr
 		release:  release,
 		proxy:    p,
 		proc:     proc,
+		sub:      sub,
 		ifIdx:    meta.IfIdx,
 		subIfIdx: meta.SubIfIdx,
 		created:  e.now(),
@@ -898,6 +1059,9 @@ func (e *Engine) startTCP(pkt []byte, h *packet.Header, meta Meta, proc rules.Pr
 	if stat != nil {
 		stat.flows.Add(1)
 	}
+	if sub != nil {
+		sub.flows.Add(1)
+	}
 	e.byClient[tcpKey{Src: h.Src, Dst: h.Dst}] = flow
 	e.byAlloc[allocKey{ver: h.Ver, port: port}] = flow
 	e.active.Add(1)
@@ -910,7 +1074,7 @@ func (e *Engine) startTCP(pkt []byte, h *packet.Header, meta Meta, proc rules.Pr
 // it reconnect through the proxy instead of staying direct.
 func (e *Engine) resetExisting(h *packet.Header, _ Meta, proc rules.Process, p config.Proxy, parent string) Result {
 	res := e.reset(h)
-	e.log(logbuf.Event{Process: display(proc), PID: proc.PID, Proto: "TCP", Dest: h.Dst.String(), Via: p.Name, Status: "blocked",
+	e.log(logbuf.Event{Process: display(proc), Path: proc.Path, PID: proc.PID, Proto: "TCP", Dest: h.Dst.String(), Via: p.Name, Status: "blocked",
 		Error: "kill switch: соединение открыто до запуска перехвата, сброшено", Parent: parent})
 	return res
 }
@@ -966,8 +1130,9 @@ func (e *Engine) unknownDropLocked() {
 	e.unknownDrops = 0
 }
 
-// startUDP opens a proxied UDP flow. sys marks system DNS (see dns.go).
-func (e *Engine) startUDP(pkt []byte, h *packet.Header, meta Meta, proc rules.Process, p config.Proxy, snap *snapshot, parent string, stat *ruleStat, killSwitch, sys bool) Result {
+// startUDP opens a proxied UDP flow. sys marks system DNS (see dns.go); kind
+// is the rule match that routed the process.
+func (e *Engine) startUDP(pkt []byte, h *packet.Header, meta Meta, proc rules.Process, p config.Proxy, snap *snapshot, parent string, stat *ruleStat, kind string, killSwitch, sys bool) Result {
 	key := udpKey{Src: h.Src, Dst: h.Dst}
 	if h.Frag {
 		e.blockUDP.add(key)
@@ -977,13 +1142,17 @@ func (e *Engine) startUDP(pkt []byte, h *packet.Header, meta Meta, proc rules.Pr
 	}
 	if p.Type != "socks5" && p.Type != "vless" && h.Dst.Port != 53 {
 		if snap.udpUnsupported == "direct" && !killSwitch {
-			e.addDirectUDP(key)
+			e.addDirectUDP(key, nil)
 			e.log(logbuf.Event{Process: display(proc), PID: proc.PID, Proto: "UDP", Dest: h.Dst.String(), Via: "direct", Status: "direct", Error: "http proxy has no udp; sent direct"})
 			return Result{Action: ActionPass}
 		}
 		e.blockUDP.add(key)
 		e.log(logbuf.Event{Process: display(proc), PID: proc.PID, Proto: "UDP", Dest: h.Dst.String(), Via: p.Name, Status: "blocked", Error: "http proxy cannot carry this udp flow"})
 		return Result{Action: ActionDrop}
+	}
+	var sub *subProcStat
+	if !sys {
+		sub = stat.procFor(proc, kind)
 	}
 	relay := h.Dst
 	if h.Dst.Port == 53 && (snap.dns.Mode == "proxy" || sys) {
@@ -1003,11 +1172,17 @@ func (e *Engine) startUDP(pkt []byte, h *packet.Header, meta Meta, proc rules.Pr
 		live:   true,
 		parent: parent,
 		stat:   stat,
+		owner:  sub,
 		sys:    sys,
 	}
 	if stat != nil {
 		stat.flows.Add(1)
 		stat.up.Add(int64(h.PayloadLen))
+	}
+	if sub != nil {
+		sub.flows.Add(1)
+		sub.up.Add(int64(h.PayloadLen))
+		sub.lastSeen.Store(e.now().UnixMilli())
 	}
 	flow.touch(e.now())
 	n := int64(h.PayloadLen)
@@ -1089,20 +1264,22 @@ func (e *Engine) rewriteForward(pkt []byte, h *packet.Header, flow *tcpFlow, sna
 	return Result{Action: ActionModified, IfIdx: flow.ifIdx, SubIfIdx: flow.subIfIdx}
 }
 
-func (e *Engine) rememberDirect(h *packet.Header) {
+// rememberDirect caches a direct decision. dp is the unmatched program behind
+// it, nil for a program with an explicit direct rule or no program at all.
+func (e *Engine) rememberDirect(h *packet.Header, dp *directProcEntry) {
 	if h.Proto == packet.ProtoTCP {
-		e.directTCP.add(tcpKey{Src: h.Src, Dst: h.Dst})
+		e.directTCP.set(tcpKey{Src: h.Src, Dst: h.Dst}, dp)
 		return
 	}
-	e.addDirectUDP(udpKey{Src: h.Src, Dst: h.Dst})
+	e.addDirectUDP(udpKey{Src: h.Src, Dst: h.Dst}, dp)
 }
 
 // rememberDirectExceptDNS is rememberDirect for anything but UDP to port
 // 53. A DNS socket's port is soon another program's, and the cache is keyed
 // by address. TCP is safe: a new connection's SYN clears the entry.
-func (e *Engine) rememberDirectExceptDNS(h *packet.Header) {
+func (e *Engine) rememberDirectExceptDNS(h *packet.Header, dp *directProcEntry) {
 	if h.Proto != packet.ProtoUDP || h.Dst.Port != 53 {
-		e.rememberDirect(h)
+		e.rememberDirect(h, dp)
 	}
 }
 

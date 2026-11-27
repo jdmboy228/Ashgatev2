@@ -231,6 +231,13 @@ type Rule struct {
 	// Group names the group this rule belongs to. The group's switch and
 	// route (action and proxy) apply to all its rules.
 	Group string `json:"group,omitempty"`
+	// Companions are extra executables, paths, or glob masks attached to the
+	// same application rule (for example, a service-started VM process outside
+	// the app's process tree and install folder).
+	Companions []string `json:"companions,omitempty"`
+	// ExcludeCompanions are executables, paths, or glob masks that must not be
+	// picked up as companions of this rule by its install folder.
+	ExcludeCompanions []string `json:"exclude_companions,omitempty"`
 }
 
 // Group is a named set of rules with one switch and one route.
@@ -265,6 +272,8 @@ func (c *Config) EffectiveRules() []Rule {
 			ks = *r.KillSwitch
 		}
 		r.KillSwitch = &ks
+		r.Companions = cloneStrings(r.Companions)
+		r.ExcludeCompanions = cloneStrings(r.ExcludeCompanions)
 		out[i] = r
 	}
 	return out
@@ -466,16 +475,17 @@ func (c *Config) Validate() error {
 		if strings.TrimSpace(r.Process) == "" {
 			return fmt.Errorf("rules[%d]: process is required", i)
 		}
-		base := strings.ToLower(r.Process)
-		base = strings.ReplaceAll(base, "/", `\`)
-		if idx := strings.LastIndex(base, `\`); idx >= 0 {
-			base = base[idx+1:]
-		}
 		if matchesEverything(r.Process) {
 			return fmt.Errorf("rules[%d]: mask %q matches every program", i, r.Process)
 		}
-		if base == "svchost.exe" {
+		if maskBase(r.Process) == "svchost.exe" {
 			return fmt.Errorf("rules[%d]: do not match svchost.exe; system DNS follows dns.systemResolver", i)
+		}
+		if err := validateCompanionList("companions", r.Companions); err != nil {
+			return fmt.Errorf("rules[%d]: %w", i, err)
+		}
+		if err := validateCompanionList("exclude_companions", r.ExcludeCompanions); err != nil {
+			return fmt.Errorf("rules[%d]: %w", i, err)
 		}
 		if r.Group != "" {
 			continue // the group's route applies and is checked above
@@ -519,6 +529,24 @@ func checkRoute(action, proxy string, names map[string]struct{}) error {
 		}
 	default:
 		return fmt.Errorf("action must be proxy, direct or block, got %q", action)
+	}
+	return nil
+}
+
+// validateCompanionList checks the entries of a rule's companions or
+// exclude_companions list: each must name something specific.
+func validateCompanionList(field string, list []string) error {
+	for j, comp := range list {
+		c := strings.Trim(strings.TrimSpace(comp), `"`)
+		if c == "" {
+			return fmt.Errorf("%s[%d] is empty", field, j)
+		}
+		if matchesEverything(c) {
+			return fmt.Errorf("%s[%d]: mask %q matches every program", field, j, comp)
+		}
+		if maskBase(c) == "svchost.exe" {
+			return fmt.Errorf("%s[%d]: do not match svchost.exe; system DNS follows dns.systemResolver", field, j)
+		}
 	}
 	return nil
 }
@@ -730,6 +758,8 @@ func deepCopy(cfg *Config) Config {
 				v := *r.KillSwitch
 				r.KillSwitch = &v
 			}
+			r.Companions = cloneStrings(r.Companions)
+			r.ExcludeCompanions = cloneStrings(r.ExcludeCompanions)
 			cp.Rules[i] = r
 		}
 	}
@@ -934,12 +964,31 @@ func validDomain(d string) bool {
 }
 
 // matchesEverything reports a process mask made only of wildcards, such as
-// "*" or "*.exe": it would route every program on the PC.
+// "*", "*.exe", or "C:\*": it would route every program on the PC or drive.
 func matchesEverything(process string) bool {
 	p := strings.ToLower(strings.Trim(strings.TrimSpace(process), `"`))
 	if !strings.ContainsAny(p, "*?") {
 		return false
 	}
+	// Strip an optional drive prefix (C:, ?:, etc.) so "C:\*" and "?:\*.exe"
+	// are recognized as matching everything on the drive.
+	if len(p) >= 2 && p[1] == ':' && ((p[0] >= 'a' && p[0] <= 'z') || p[0] == '?' || p[0] == '*') {
+		p = p[2:]
+	}
 	p = strings.NewReplacer("*", "", "?", "", ".exe", "", `\`, "", "/", "", ".", "").Replace(p)
 	return p == ""
+}
+
+// maskBase is the lower-case file name at the end of a process mask, so a
+// full path and a bare name (with or without .exe) are checked the same way.
+func maskBase(process string) string {
+	base := strings.ToLower(strings.Trim(strings.TrimSpace(process), `"`))
+	base = strings.ReplaceAll(base, "/", `\`)
+	if idx := strings.LastIndex(base, `\`); idx >= 0 {
+		base = base[idx+1:]
+	}
+	if base != "" && !strings.Contains(base, ".") && !strings.HasSuffix(base, "*") {
+		base += ".exe"
+	}
+	return base
 }

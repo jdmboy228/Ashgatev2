@@ -97,9 +97,9 @@ func DialTCP(addr, host string, port uint16) (net.Conn, error) {
 	if host == "" || port == 0 {
 		return nil, errors.New("VLESS: неверный адрес назначения")
 	}
-	// The connection's context lives until Close: Xray runs the whole
-	// session in the dispatch context.
-	ctx, cancel := context.WithCancel(context.Background())
+	// The connection's context lives until Close or until the bridge itself
+	// closes (for example on failover), so replaced-server relays end at once.
+	ctx, cancel := context.WithCancel(b.parentCtx())
 	c := &tcpConn{cancel: cancel, ob: &session.Outbound{}}
 	ctx = b.inboundContext(ctx, "http", "tls", "quic")
 	ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{c.ob})
@@ -118,6 +118,13 @@ func DialTCP(addr, host string, port uint16) (net.Conn, error) {
 	}
 	c.r, c.w = r, link.Writer
 	c.remote = &net.TCPAddr{IP: net.ParseIP(host), Port: int(port)}
+	// Interrupt the pipes directly when the bridge closes: transports like
+	// XHTTP may stay blocked on a blackholed socket even after ctx cancels.
+	c.mu.Lock()
+	if !c.closed {
+		c.stopAfter = context.AfterFunc(b.parentCtx(), func() { _ = c.Close() })
+	}
+	c.mu.Unlock()
 	return c, nil
 }
 
@@ -138,9 +145,10 @@ type tcpConn struct {
 	routed bool
 	direct atomic.Bool
 
-	mu       sync.Mutex
-	closed   bool
-	reading  bool
+	mu        sync.Mutex
+	closed    bool
+	stopAfter func() bool
+	reading   bool
 	rdl, wdl time.Time
 	rtimer   *time.Timer
 	writing  bool
@@ -261,6 +269,8 @@ func (c *tcpConn) Close() error {
 	c.once.Do(func() {
 		c.mu.Lock()
 		c.closed = true
+		stopAfter := c.stopAfter
+		c.stopAfter = nil
 		if c.rtimer != nil {
 			c.rtimer.Stop()
 		}
@@ -268,6 +278,9 @@ func (c *tcpConn) Close() error {
 			c.wtimer.Stop()
 		}
 		c.mu.Unlock()
+		if stopAfter != nil {
+			stopAfter()
+		}
 		c.cancel()
 		common.Interrupt(c.r)
 		common.Interrupt(c.w)
@@ -380,8 +393,11 @@ type UDPSession struct {
 	cancel context.CancelFunc
 	in     chan *pudp.Packet
 	out    chan *buf.Buffer
-	done   chan struct{}
-	once   sync.Once
+	done      chan struct{}
+	once      sync.Once
+	afterMu   sync.Mutex
+	closed    bool
+	stopAfter func() bool
 	// dropped counts datagrams that Send dropped on a full queue.
 	dropped atomic.Uint64
 }
@@ -394,9 +410,15 @@ func DialUDP(addr string) (*UDPSession, error) {
 	if err != nil {
 		return nil, err
 	}
-	// The session lives until Close, not as long as one request.
-	ctx, cancel := context.WithCancel(context.Background())
-	return newUDPSession(b.inboundContext(ctx, "quic"), cancel, d), nil
+	// The session lives until Close or until the bridge closes.
+	ctx, cancel := context.WithCancel(b.parentCtx())
+	s := newUDPSession(b.inboundContext(ctx, "quic"), cancel, d)
+	s.afterMu.Lock()
+	if !s.closed {
+		s.stopAfter = context.AfterFunc(b.parentCtx(), func() { _ = s.Close() })
+	}
+	s.afterMu.Unlock()
+	return s, nil
 }
 
 // newUDPSession starts a session on d; cancel ends ctx.
@@ -522,6 +544,14 @@ func (s *UDPSession) Recv(ctx context.Context) (*net.UDPAddr, []byte, error) {
 // Close ends the session and drops the replies nobody read.
 func (s *UDPSession) Close() error {
 	s.once.Do(func() {
+		s.afterMu.Lock()
+		s.closed = true
+		stopAfter := s.stopAfter
+		s.stopAfter = nil
+		s.afterMu.Unlock()
+		if stopAfter != nil {
+			stopAfter()
+		}
 		close(s.done)
 		s.cancel()
 		s.d.RemoveRay()

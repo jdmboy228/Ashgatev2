@@ -20,6 +20,9 @@ type App struct {
 	Path   string `json:"path"`
 	Window bool   `json:"window"`
 	Title  string `json:"title,omitempty"` // main window caption
+	// Mask is the path generalized for versioned (Squirrel) folders and is
+	// empty when it does not apply. See process.Installed.
+	Mask string `json:"mask,omitempty"`
 }
 
 var (
@@ -85,7 +88,9 @@ func List() ([]App, error) {
 			continue
 		}
 		byPath[low] = len(out)
-		out = append(out, App{PID: pid, Name: img.Name, Path: img.Path, Window: win, Title: title})
+		mask, _ := rules.VersionMask(img.Path)
+		out = append(out, App{PID: pid, Name: img.Name, Path: img.Path, Window: win, Title: title,
+			Mask: mask})
 	}
 	sort.SliceStable(out, func(i, j int) bool {
 		if out[i].Window != out[j].Window {
