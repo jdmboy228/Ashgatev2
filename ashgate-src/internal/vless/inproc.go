@@ -118,6 +118,13 @@ func DialTCP(addr, host string, port uint16) (net.Conn, error) {
 	}
 	c.r, c.w = r, link.Writer
 	c.remote = &net.TCPAddr{IP: net.ParseIP(host), Port: int(port)}
+	// Interrupt the pipes directly when the bridge closes: transports like
+	// XHTTP may stay blocked on a blackholed socket even after ctx cancels.
+	c.mu.Lock()
+	if !c.closed {
+		c.stopAfter = context.AfterFunc(b.parentCtx(), func() { _ = c.Close() })
+	}
+	c.mu.Unlock()
 	return c, nil
 }
 
@@ -138,9 +145,10 @@ type tcpConn struct {
 	routed bool
 	direct atomic.Bool
 
-	mu       sync.Mutex
-	closed   bool
-	reading  bool
+	mu        sync.Mutex
+	closed    bool
+	stopAfter func() bool
+	reading   bool
 	rdl, wdl time.Time
 	rtimer   *time.Timer
 	writing  bool
@@ -261,6 +269,8 @@ func (c *tcpConn) Close() error {
 	c.once.Do(func() {
 		c.mu.Lock()
 		c.closed = true
+		stopAfter := c.stopAfter
+		c.stopAfter = nil
 		if c.rtimer != nil {
 			c.rtimer.Stop()
 		}
@@ -268,6 +278,9 @@ func (c *tcpConn) Close() error {
 			c.wtimer.Stop()
 		}
 		c.mu.Unlock()
+		if stopAfter != nil {
+			stopAfter()
+		}
 		c.cancel()
 		common.Interrupt(c.r)
 		common.Interrupt(c.w)
@@ -380,8 +393,11 @@ type UDPSession struct {
 	cancel context.CancelFunc
 	in     chan *pudp.Packet
 	out    chan *buf.Buffer
-	done   chan struct{}
-	once   sync.Once
+	done      chan struct{}
+	once      sync.Once
+	afterMu   sync.Mutex
+	closed    bool
+	stopAfter func() bool
 	// dropped counts datagrams that Send dropped on a full queue.
 	dropped atomic.Uint64
 }
@@ -396,7 +412,13 @@ func DialUDP(addr string) (*UDPSession, error) {
 	}
 	// The session lives until Close or until the bridge closes.
 	ctx, cancel := context.WithCancel(b.parentCtx())
-	return newUDPSession(b.inboundContext(ctx, "quic"), cancel, d), nil
+	s := newUDPSession(b.inboundContext(ctx, "quic"), cancel, d)
+	s.afterMu.Lock()
+	if !s.closed {
+		s.stopAfter = context.AfterFunc(b.parentCtx(), func() { _ = s.Close() })
+	}
+	s.afterMu.Unlock()
+	return s, nil
 }
 
 // newUDPSession starts a session on d; cancel ends ctx.
@@ -522,6 +544,14 @@ func (s *UDPSession) Recv(ctx context.Context) (*net.UDPAddr, []byte, error) {
 // Close ends the session and drops the replies nobody read.
 func (s *UDPSession) Close() error {
 	s.once.Do(func() {
+		s.afterMu.Lock()
+		s.closed = true
+		stopAfter := s.stopAfter
+		s.stopAfter = nil
+		s.afterMu.Unlock()
+		if stopAfter != nil {
+			stopAfter()
+		}
 		close(s.done)
 		s.cancel()
 		s.d.RemoveRay()
