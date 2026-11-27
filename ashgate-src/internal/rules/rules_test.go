@@ -316,7 +316,7 @@ func TestPathTokens(t *testing.T) {
 		// unrelated apps installed under AppData never share the username token.
 		{`C:\Users\tanki\AppData\Local\Discord\app-1.0.9163\Discord.exe`, []string{"discord"}},
 		{`C:\Users\tanki\AppData\Local\Microsoft\OneDrive\OneDrive.exe`, []string{"drive", "microsoft", "one"}},
-		{`D:/Users/John.Doe_99/AppData/Roaming/Opera Software/Opera GX Stable/opera.exe`, []string{"opera", "software", "stable"}},
+		{`D:/Users/John.Doe_99/AppData/Roaming/Opera Software/Opera GX Stable/opera.exe`, []string{"opera"}},
 		{`C:\Users\tanki`, nil},
 	}
 	for _, c := range cases {
@@ -576,6 +576,133 @@ func TestIsServiceOrCOMAncestor(t *testing.T) {
 		if IsServiceOrCOMAncestor(p) {
 			t.Errorf("IsServiceOrCOMAncestor(%+v) = true", p)
 		}
+	}
+}
+
+// hasToken reports that tokens contains want.
+func hasToken(tokens []string, want string) bool {
+	for _, t := range tokens {
+		if t == want {
+			return true
+		}
+	}
+	return false
+}
+
+// Program Files (x86) used to leave an "86)" token that tied unrelated
+// programs together; "Application" is no product word either.
+func TestPathTokensProgramFilesPunctuation(t *testing.T) {
+	const path = `C:\Program Files (x86)\Google\Chrome\Application\chrome.exe`
+	got := PathTokens(path)
+	for _, bad := range []string{"86)", "application", "x86", "program", "files"} {
+		if hasToken(got, bad) {
+			t.Fatalf("PathTokens(%q) = %v, should not contain %q", path, got, bad)
+		}
+	}
+	if !hasToken(got, "chrome") {
+		t.Fatalf("PathTokens(%q) = %v, want chrome", path, got)
+	}
+	if p := ProductTokens(path); strings.Join(p, ",") != "chrome" {
+		t.Fatalf("ProductTokens(%q) = %v, want [chrome] (no google)", path, p)
+	}
+}
+
+// The per-user Programs folder is shared: it must not tie two unrelated
+// programs together.
+func TestPathTokensUserProgramsFolder(t *testing.T) {
+	for _, path := range []string{
+		`C:\Users\me\AppData\Local\Programs\T3Code\t3code.exe`,
+		`C:\Users\me\AppData\Local\Programs\YandexMusic\YandexMusic.exe`,
+	} {
+		if got := PathTokens(path); hasToken(got, "programs") {
+			t.Fatalf("PathTokens(%q) = %v, should not contain programs", path, got)
+		}
+	}
+	browser := ProductTokens(`C:\Users\me\AppData\Local\Programs\YandexBrowser\YandexBrowser.exe`)
+	music := ProductTokens(`C:\Users\me\AppData\Local\Programs\YandexMusic\YandexMusic.exe`)
+	for _, got := range [][]string{browser, music} {
+		if hasToken(got, "yandex") {
+			t.Fatalf("ProductTokens = %v, vendor token yandex must be filtered", got)
+		}
+	}
+	for _, b := range browser {
+		if hasToken(music, b) {
+			t.Fatalf("YandexBrowser and YandexMusic share product token %q (%v vs %v)", b, browser, music)
+		}
+	}
+}
+
+// Installer package folders carry a GUID whose pieces used to become tokens.
+func TestPathTokensStripsGUID(t *testing.T) {
+	const path = `C:\ProgramData\Package Cache\{02bd05cf-6a5f-4c2e-9a2b-1d3c4e5f6a7b}v10.1.26100.9457\setup.exe`
+	got := PathTokens(path)
+	if strings.Join(got, ",") != "package" {
+		t.Fatalf("PathTokens(%q) = %v, want [package]", path, got)
+	}
+	for _, tok := range got {
+		if strings.ContainsAny(tok, "{}") || tok == "02bd05cf" || strings.Contains(tok, "v10") {
+			t.Fatalf("GUID pieces leaked into tokens: %v", got)
+		}
+	}
+}
+
+// A Store package-family folder ends with a publisher hash; it says nothing
+// about the product and must not become a token.
+func TestPathTokensStripsStoreFamilyTail(t *testing.T) {
+	const path = `C:\Program Files\WindowsApps\Microsoft.WidgetsPlatformRuntime_1.6.19.0_x64__8wekyb3d8bbwe\WidgetService.exe`
+	got := PathTokens(path)
+	for _, bad := range []string{"wekyb", "bbwe", "windowsapps", "x64"} {
+		if hasToken(got, bad) {
+			t.Fatalf("PathTokens(%q) = %v, should not contain %q", path, got, bad)
+		}
+	}
+	for _, want := range []string{"microsoft", "widget", "widgets", "platform"} {
+		if !hasToken(got, want) {
+			t.Fatalf("PathTokens(%q) = %v, want %q", path, got, want)
+		}
+	}
+}
+
+// Windows folder names and LocalLow are not product words.
+func TestPathTokensSystemFolders(t *testing.T) {
+	for _, path := range []string{
+		`C:\Windows\SysWOW64\wow64.dll`,
+		`C:\Windows\System32\svchost.exe`,
+		`C:\Users\me\AppData\LocalLow\Acme\acme.ini`,
+	} {
+		got := PathTokens(path)
+		for _, bad := range []string{"system", "low"} {
+			if hasToken(got, bad) {
+				t.Fatalf("PathTokens(%q) = %v, should not contain %q", path, got, bad)
+			}
+		}
+	}
+}
+
+func TestCommandLineMatchesBoundaries(t *testing.T) {
+	if !CommandLineMatches(`"C:\Apps\Farm\app.exe" --config x`, []string{`c:\apps\farm`}, nil) {
+		t.Fatal("a complete folder on the command line should match")
+	}
+	if !CommandLineMatches(`C:/Apps/Farm/app.exe`, []string{`c:\apps\farm`}, nil) {
+		t.Fatal("forward slashes should be normalized")
+	}
+	if CommandLineMatches(`C:\Apps\Farm2\data\x`, []string{`c:\apps\farm`}, nil) {
+		t.Fatal("Farm must not match Farm2")
+	}
+	if CommandLineMatches(`C:\Other\worker.exe C:\Apps\Farm2\data`, []string{`c:\apps\farm`}, []string{`farm.exe`}) {
+		t.Fatal("neither the folder nor the exe may match a longer name")
+	}
+	if !CommandLineMatches(`code.exe --new-window`, nil, []string{"code.exe"}) {
+		t.Fatal("a bare exe on the command line should match")
+	}
+	if CommandLineMatches(`C:\Other\vscode.exe --x`, nil, []string{"code.exe"}) {
+		t.Fatal("code.exe must not match inside vscode.exe")
+	}
+	if !CommandLineMatches(`"C:\Other\code.exe"`, nil, []string{"code.exe"}) {
+		t.Fatal("a quoted path should end the exe name")
+	}
+	if CommandLineMatches("", nil, []string{"code.exe"}) {
+		t.Fatal("an empty command line matches nothing")
 	}
 }
 

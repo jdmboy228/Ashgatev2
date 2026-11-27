@@ -201,6 +201,156 @@ func TestRankCandidatesSystemAreNeverSuggested(t *testing.T) {
 	}
 }
 
+// Shared folders (Programs, "Program Files (x86)") must not make two
+// unrelated applications look like one product.
+func TestRankCandidatesNoSharedFolderTokens(t *testing.T) {
+	now := time.Now()
+	cases := []struct{ name, ruleExe, candExe string }{
+		{
+			"user programs",
+			`C:\Users\me\AppData\Local\Programs\T3Code\t3code.exe`,
+			`C:\Users\me\AppData\Local\Programs\GrokBot\grokbot.exe`,
+		},
+		{
+			"program files x86",
+			`C:\Program Files (x86)\Acme\Thing\thing.exe`,
+			`C:\Program Files (x86)\Other\Widget\widget.exe`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rule := config.Rule{Process: tc.ruleExe, Action: "proxy"}
+			direct := []engine.DirectProc{{
+				Name: displayBase(tc.candExe), Path: tc.candExe, PID: 700,
+				Conns: 2, Bytes: 50_000, LastSeen: now.UnixMilli(),
+			}}
+			got := rankCandidates(rule, []config.Rule{rule}, nil, direct, nil, &fakeInspector{}, nil, now)
+			if len(got) != 1 {
+				t.Fatalf("got %+v", got)
+			}
+			if hasReason(got[0], "Похожий путь") {
+				t.Fatalf("false path match: %+v", got[0])
+			}
+		})
+	}
+}
+
+// Yandex signs both its browser and its music app: the vendor token and the
+// platform signature are weak evidence, not a product match.
+func TestRankCandidatesVendorOnlyTokenNotShared(t *testing.T) {
+	now := time.Now()
+	const ruleExe = `C:\Users\me\AppData\Local\Programs\YandexBrowser\YandexBrowser.exe`
+	const candExe = `C:\Users\me\AppData\Local\Programs\YandexMusic\YandexMusic.exe`
+	ins := &fakeInspector{meta: map[string]process.FileMeta{
+		strings.ToLower(ruleExe): {Signer: "Yandex LLC", Company: "Yandex"},
+		strings.ToLower(candExe): {Signer: "Yandex LLC", Company: "Yandex"},
+	}}
+	rule := config.Rule{Process: ruleExe, Action: "proxy"}
+	direct := []engine.DirectProc{{
+		Name: "YandexMusic.exe", Path: candExe, PID: 800,
+		Conns: 2, Bytes: 50_000, LastSeen: now.UnixMilli(),
+	}}
+	got := rankCandidates(rule, []config.Rule{rule}, nil, direct, nil, ins, nil, now)
+	if len(got) != 1 {
+		t.Fatalf("got %+v", got)
+	}
+	c := got[0]
+	if hasReason(c, "Похожий путь") || hasReason(c, "yandex") {
+		t.Fatalf("vendor token treated as a product match: %+v", c)
+	}
+	// 10 (common vendor) + 25 (recent traffic) + 10 (volume), never the 50 of
+	// an uncommon publisher.
+	if c.Score != 45 {
+		t.Fatalf("score = %d, want 45: %+v", c.Score, c)
+	}
+}
+
+// The command-line check respects a path and an exe boundary.
+func TestRankCandidatesCommandLineBoundaries(t *testing.T) {
+	now := time.Now()
+	const tool = `C:\Tools\Tool\tool.exe`
+	cases := []struct {
+		name string
+		rule config.Rule
+		cmd  string
+		want bool
+	}{
+		{
+			"path hit",
+			config.Rule{Process: `C:\Apps\Farm\farm.exe`, Action: "proxy"},
+			`C:\Tools\Tool\tool.exe --config "C:\Apps\Farm\data"`,
+			true,
+		},
+		{
+			"path prefix",
+			config.Rule{Process: `C:\Apps\Farm\farm.exe`, Action: "proxy"},
+			`C:\Tools\Tool\tool.exe --config "C:\Apps\Farm2\data"`,
+			false,
+		},
+		{
+			"exe hit",
+			config.Rule{Process: "code.exe", Action: "proxy"},
+			`C:\Tools\Tool\tool.exe --open "C:\Else\code.exe"`,
+			true,
+		},
+		{
+			"exe substring",
+			config.Rule{Process: "code.exe", Action: "proxy"},
+			`C:\Tools\Tool\tool.exe --open C:\Else\vscode.exe`,
+			false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ins := &fakeInspector{cmds: map[uint32]string{901: tc.cmd}}
+			direct := []engine.DirectProc{{Name: "tool.exe", Path: tool, PID: 901}}
+			got := rankCandidates(tc.rule, []config.Rule{tc.rule}, nil, direct, nil, ins, nil, now)
+			if len(got) != 1 {
+				t.Fatalf("got %+v", got)
+			}
+			if h := hasReason(got[0], "Запущен с путём программы"); h != tc.want {
+				t.Fatalf("command line match = %v, want %v: %+v", h, tc.want, got[0])
+			}
+		})
+	}
+}
+
+// A program in a Windows folder (or the installer cache) is never suggested,
+// even when its publisher would score highly.
+func TestSystemPathCandidateNotSuggested(t *testing.T) {
+	now := time.Now()
+	const ruleExe = `C:\Apps\MyApp\myapp.exe`
+	const mstscExe = `C:\Windows\System32\mstsc.exe`
+	const setupExe = `C:\ProgramData\Package Cache\{02bd05cf-6a5f-4c2e-9a2b-1d3c4e5f6a7b}v10.1\setup.exe`
+	ins := &fakeInspector{meta: map[string]process.FileMeta{
+		strings.ToLower(ruleExe):  {Signer: "Contoso Ltd"},
+		strings.ToLower(mstscExe): {Signer: "Contoso Ltd"},
+	}}
+	rule := config.Rule{Process: ruleExe, Action: "proxy"}
+	direct := []engine.DirectProc{
+		{Name: "mstsc.exe", Path: mstscExe, PID: 950, Conns: 5, Bytes: 500_000, LastSeen: now.UnixMilli()},
+		{Name: "setup.exe", Path: setupExe, PID: 951, Conns: 1, Bytes: 4096, LastSeen: now.UnixMilli()},
+	}
+	got := rankCandidates(rule, []config.Rule{rule}, nil, direct, nil, ins, nil, now)
+	if len(got) != 2 {
+		t.Fatalf("got %+v", got)
+	}
+	for _, c := range got {
+		if !c.systemPath {
+			t.Fatalf("%s is not flagged as a system path: %+v", c.Name, c)
+		}
+		if c.System {
+			t.Fatalf("%s: the visible System flag must not change: %+v", c.Name, c)
+		}
+	}
+	if topCandidate(got, nil) != nil {
+		t.Fatalf("a system-path candidate was suggested: %+v", topCandidate(got, nil))
+	}
+	if strongCandidate(got, nil) != nil {
+		t.Fatalf("a system-path candidate was suggested as strong: %+v", strongCandidate(got, nil))
+	}
+}
+
 // buildRuleMembers merges the saved companions, the live matches, and the
 // engine's per-process counters, without repeating the rule's own process.
 func TestBuildRuleMembers(t *testing.T) {

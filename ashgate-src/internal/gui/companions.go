@@ -39,20 +39,23 @@ type ruleMemberView struct {
 // companionCandidate is a running or recently direct program the user can
 // attach to a rule as a companion, with the signals that suggest it.
 type companionCandidate struct {
-	Name        string   `json:"name"`
-	Path        string   `json:"path"`
-	PID         uint32   `json:"pid,omitempty"`
-	Mask        string   `json:"mask,omitempty"`
-	Conns       int64    `json:"conns"`
-	Bytes       int64    `json:"bytes"`
-	LastSeen    int64    `json:"lastSeen,omitempty"`
-	SampleDests []string `json:"sampleDests,omitempty"`
-	Score       int      `json:"score"`
-	Reasons     []string `json:"reasons,omitempty"`
-	System      bool     `json:"system,omitempty"`
+	Name         string   `json:"name"`
+	Path         string   `json:"path"`
+	PID          uint32   `json:"pid,omitempty"`
+	Mask         string   `json:"mask,omitempty"`
+	Conns        int64    `json:"conns"`
+	Bytes        int64    `json:"bytes"`
+	LastSeen     int64    `json:"lastSeen,omitempty"`
+	SampleDests  []string `json:"sampleDests,omitempty"`
+	Score        int      `json:"score"`
+	Reasons      []string `json:"reasons,omitempty"`
+	System       bool     `json:"system,omitempty"`
 	Running      bool     `json:"running"`
 	OtherRule    string   `json:"otherRule,omitempty"`
 	strongSignal bool
+	// systemPath is a Windows or installer-cache location. Such a candidate is
+	// never suggested, but it stays in the list for the user to browse.
+	systemPath bool
 }
 
 // ruleHintView is the suggestion the Apps tab shows for a rule whose app is
@@ -503,19 +506,19 @@ func rankCandidates(rule config.Rule, allRules []config.Rule, ruleRunning []rule
 		ruleDirs = append(ruleDirs, d)
 	}
 	ruleTokens := map[string]bool{}
-	for _, t := range rules.PathTokens(rule.Process) {
+	for _, t := range rules.ProductTokens(rule.Process) {
 		ruleTokens[t] = true
 	}
 	for _, comp := range rule.Companions {
-		for _, t := range rules.PathTokens(comp) {
+		for _, t := range rules.ProductTokens(comp) {
 			ruleTokens[t] = true
 		}
 	}
 	for _, p := range ruleRunning {
-		for _, t := range rules.PathTokens(p.Path) {
+		for _, t := range rules.ProductTokens(p.Path) {
 			ruleTokens[t] = true
 		}
-		for _, t := range rules.PathTokens(p.Name) {
+		for _, t := range rules.ProductTokens(p.Name) {
 			ruleTokens[t] = true
 		}
 	}
@@ -546,6 +549,10 @@ func rankCandidates(rule config.Rule, allRules []config.Rule, ruleRunning []rule
 	}
 	ruleExe := nameKey(rule.Process)
 	ruleExeUsable := ruleExe != "" && !strings.ContainsAny(ruleExe, "*?")
+	var ruleExes []string
+	if ruleExeUsable {
+		ruleExes = []string{ruleExe}
+	}
 
 	out := make([]companionCandidate, 0, len(pool))
 	for _, c := range pool {
@@ -554,6 +561,7 @@ func rankCandidates(rule config.Rule, allRules []config.Rule, ruleRunning []rule
 			v.Name = displayBase(v.Path)
 		}
 		v.Mask, _ = rules.VersionMask(v.Path)
+		v.systemPath = isSystemCandidatePath(v.Path)
 		if !v.System {
 			score, reasons := 0, []string(nil)
 			strong := false
@@ -563,18 +571,7 @@ func rankCandidates(rule config.Rule, allRules []config.Rule, ruleRunning []rule
 			}
 			if v.PID != 0 {
 				if cmd := ins.CommandLine(v.PID, c.started); cmd != "" {
-					low := strings.ToLower(cmd)
-					hit := false
-					for _, d := range ruleDirs {
-						if strings.Contains(low, d) {
-							hit = true
-							break
-						}
-					}
-					if !hit && ruleExeUsable && strings.Contains(low, ruleExe) {
-						hit = true
-					}
-					if hit {
+					if rules.CommandLineMatches(cmd, ruleDirs, ruleExes) {
 						score += 60
 						strong = true
 						reasons = append(reasons, "Запущен с путём программы")
@@ -616,7 +613,7 @@ func rankCandidates(rule config.Rule, allRules []config.Rule, ruleRunning []rule
 				}
 			}
 			if v.Path != "" && len(ruleTokens) > 0 {
-				for _, t := range rules.PathTokens(v.Path) {
+				for _, t := range rules.ProductTokens(v.Path) {
 					if ruleTokens[t] {
 						score += 35
 						reasons = append(reasons, fmt.Sprintf("Похожий путь (%s)", t))
@@ -688,6 +685,19 @@ func rankCandidates(rule config.Rule, allRules []config.Rule, ruleRunning []rule
 	return out
 }
 
+// isSystemCandidatePath reports a Windows folder or the installer package
+// cache: a program there belongs to the system, not to a rule's application.
+func isSystemCandidatePath(path string) bool {
+	if rules.IsSystemPath(path) {
+		return true
+	}
+	p := rules.NormalizePath(path)
+	if len(p) >= 2 && p[1] == ':' {
+		p = p[2:]
+	}
+	return strings.HasPrefix(p, `\programdata\package cache\`)
+}
+
 // candidateExcluded reports that the user excluded the candidate from this
 // rule's auto-pickup, so it must not be suggested again.
 func candidateExcluded(ruleSet *rules.Set, c companionCandidate) bool {
@@ -705,7 +715,7 @@ func candidateExcluded(ruleSet *rules.Set, c companionCandidate) bool {
 // the best active direct candidate still surfaces.
 func topCandidate(cands []companionCandidate, ruleSet *rules.Set) *companionCandidate {
 	for i := range cands {
-		if cands[i].System {
+		if cands[i].System || cands[i].systemPath {
 			continue
 		}
 		c := cands[i]
@@ -730,7 +740,7 @@ func topCandidate(cands []companionCandidate, ruleSet *rules.Set) *companionCand
 // background pings (like OneDrive) never spam suggestions.
 func strongCandidate(cands []companionCandidate, ruleSet *rules.Set) *companionCandidate {
 	for i := range cands {
-		if cands[i].System {
+		if cands[i].System || cands[i].systemPath {
 			continue
 		}
 		c := cands[i]

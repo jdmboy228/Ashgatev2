@@ -367,6 +367,39 @@ func TestAutoCommandLinePathBoundary(t *testing.T) {
 	waitDecidedUnmatched(t, e, worker)
 }
 
+// TestAutoGenericHostNotLearned: an application that starts node.exe or
+// cmd.exe must not teach the profile that exe name. Otherwise any unrelated
+// process whose command line mentions the host would look like a companion.
+func TestAutoGenericHostNotLearned(t *testing.T) {
+	cases := []struct{ name, host, hostPath string }{
+		{"node", "node.exe", `C:\Program Files\nodejs\node.exe`},
+		{"cmd", "cmd.exe", `C:\Windows\System32\cmd.exe`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ins := newFakeAutoInspector()
+			root := rules.Process{PID: 100, Name: "myapp.exe", Path: `C:\Apps\MyApp\myapp.exe`, Started: autoBase}
+			host := rules.Process{
+				PID: 150, Name: tc.host, Path: tc.hostPath, PPID: 100,
+				Started: autoBase + int64(time.Second),
+				Parents: []rules.Process{root},
+			}
+			cand := rules.Process{
+				PID: 300, Name: "tool.exe", Path: `C:\Tools\Tool\tool.exe`,
+				Started: autoBase + int64(2*time.Second),
+				Parents: []rules.Process{{PID: 900, Name: "explorer.exe"}},
+			}
+			ins.setCmd(cand.PID, `C:\Tools\Tool\tool.exe --spawn `+tc.host+` --run C:\Tools\Tool\payload.bin`)
+			snap := newAutoSnapshot()
+			snap.set(root, host, cand)
+			cfg := autoConfig(config.Rule{Process: root.Path, Action: "proxy", Proxy: "socks"})
+			e := newAutoEngine(t, cfg, ins, snap)
+			e.auto.enqueue(cand)
+			waitDecidedUnmatched(t, e, cand)
+		})
+	}
+}
+
 // --- no false positives ---------------------------------------------------
 
 func TestAutoNoFalsePositives(t *testing.T) {

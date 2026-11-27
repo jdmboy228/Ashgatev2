@@ -2,6 +2,7 @@
 package rules
 
 import (
+	"regexp"
 	"sort"
 	"strings"
 	"unicode"
@@ -432,40 +433,47 @@ func VersionMask(p string) (mask string, ok bool) {
 // A rule naming one of them never covers a companion by folder: the sibling
 // would be another application.
 var sharedRootSuffixes = map[string]bool{
-	``:                             true,
-	`\program files`:               true,
-	`\program files (x86)`:         true,
-	`\program files\common files`:  true,
+	``:                                  true,
+	`\program files`:                    true,
+	`\program files (x86)`:              true,
+	`\program files\common files`:       true,
 	`\program files (x86)\common files`: true,
-	`\programdata`:                 true,
-	`\programdata\microsoft`:       true,
-	`\users`:                       true,
-	`\users\public`:                true,
-	`\windows`:                     true,
-	`\windows\system32`:            true,
-	`\windows\syswow64`:            true,
-	`\windows\installer`:           true,
+	`\program files\windowsapps`:        true,
+	`\programdata`:                      true,
+	`\programdata\microsoft`:            true,
+	`\programdata\package cache`:        true,
+	`\users`:                            true,
+	`\users\public`:                     true,
+	`\windows`:                          true,
+	`\windows\system32`:                 true,
+	`\windows\syswow64`:                 true,
+	`\windows\installer`:                true,
+	`\windows\winsxs`:                   true,
+	`\windows\servicing`:                true,
+	`\windows\inf`:                      true,
 }
 
 // sharedUserDirs are per-user folders that hold unrelated programs; a rule
 // for one exe there must not cover its neighbours.
 var sharedUserDirs = map[string]bool{
-	``:                           true,
-	`\desktop`:                   true,
-	`\downloads`:                 true,
-	`\documents`:                 true,
-	`\onedrive`:                  true,
-	`\onedrive\desktop`:          true,
-	`\onedrive\downloads`:        true,
-	`\onedrive\documents`:        true,
-	`\appdata`:                   true,
-	`\appdata\local`:             true,
-	`\appdata\roaming`:           true,
-	`\appdata\local\programs`:    true,
-	`\appdata\local\temp`:        true,
-	`\appdata\local\microsoft`:   true,
-	`\appdata\local\packages`:    true,
-	`\appdata\roaming\microsoft`: true,
+	``:                               true,
+	`\desktop`:                       true,
+	`\downloads`:                     true,
+	`\documents`:                     true,
+	`\onedrive`:                      true,
+	`\onedrive\desktop`:              true,
+	`\onedrive\downloads`:            true,
+	`\onedrive\documents`:            true,
+	`\appdata`:                       true,
+	`\appdata\local`:                 true,
+	`\appdata\roaming`:               true,
+	`\appdata\locallow`:              true,
+	`\appdata\local\programs`:        true,
+	`\appdata\local\programs\common`: true,
+	`\appdata\local\temp`:            true,
+	`\appdata\local\microsoft`:       true,
+	`\appdata\local\packages`:        true,
+	`\appdata\roaming\microsoft`:     true,
 }
 
 // CompanionDir returns the normalized install folder of a rule's executable
@@ -574,6 +582,46 @@ var pathTokenStop = map[string]bool{
 	"web": true, "view": true, "webview": true, "browser": true,
 	"electron": true, "portable": true, "release": true, "debug": true,
 	"build": true, "dist": true, "lib": true, "src": true, "box": true,
+	// System and user folders that hold unrelated programs.
+	"programs": true, "programdata": true, "desktop": true, "downloads": true,
+	"documents": true, "public": true, "default": true, "windowsapps": true,
+	"packages": true, "resources": true, "current": true,
+	"application": true, "applications": true,
+	"system": true, "low": true, "log": true, "logs": true, "doc": true,
+	"docs": true, "help": true, "asar": true, "unpacked": true,
+	"locales": true, "locale": true, "assets": true, "binaries": true,
+	"plugins": true, "plugin": true, "modules": true, "config": true,
+	"settings": true, "profile": true, "profiles": true, "userdata": true,
+	"store": true, "library": true, "installer": true, "installed": true,
+	"setup": true, "install": true, "dev": true, "beta": true, "stable": true,
+	"software": true, "canary": true, "nightly": true, "preview": true,
+	"alpha": true, "insiders": true, "crashpad": true, "handler": true,
+	"worker": true, "monitor": true, "manager": true, "console": true,
+	"steamapps": true, "vendor": true, "third": true, "party": true,
+	"redist": true, "studio": true,
+	// Corporate suffixes of publisher names in install folders.
+	"corporation": true, "incorporated": true, "limited": true, "company": true,
+	"gmbh": true, "sarl": true, "inc": true, "ltd": true, "llc": true,
+	"technologies": true, "solutions": true, "international": true, "group": true,
+	"digital": true, "entertainment": true,
+}
+
+// guidBlock matches a GUID in braces, such as the installer package folder
+// name `{02bd05cf-...}v10.1` under ProgramData\Package Cache.
+var guidBlock = regexp.MustCompile(`\{[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\}`)
+
+// storeFamilyTail matches the version tail of a Store package-family folder:
+// `_1.6.19.0_x64__8wekyb3d8bbwe`. The tail holds the publisher hash that
+// would otherwise leak into the tokens as "wekyb" and "bbwe".
+var storeFamilyTail = regexp.MustCompile(`_[0-9].*__[0-9A-Za-z]{8,}`)
+
+// stripStoreFamilyTail cuts the version tail of a Store package-family
+// folder name, keeping the product part before it.
+func stripStoreFamilyTail(seg string) string {
+	if loc := storeFamilyTail.FindStringIndex(seg); loc != nil {
+		return seg[:loc[0]]
+	}
+	return seg
 }
 
 // PathTokens returns the meaningful words of a path or program name: the
@@ -588,6 +636,14 @@ func PathTokens(path string) []string {
 	s = strings.TrimPrefix(s, `\??\`)
 	s = strings.TrimPrefix(s, `\\?\`)
 	s = stripUserProfileName(s)
+	// Installer package folders and Store package families carry a GUID or a
+	// publisher hash that means nothing about the product.
+	s = guidBlock.ReplaceAllString(s, " ")
+	segs := strings.Split(s, `\`)
+	for i, seg := range segs {
+		segs[i] = stripStoreFamilyTail(seg)
+	}
+	s = strings.Join(segs, `\`)
 
 	var b strings.Builder
 	var prev rune
@@ -604,8 +660,10 @@ func PathTokens(path string) []string {
 		b.WriteRune(r)
 		prev = r
 	}
+	// Split on every rune that is not a letter or a digit: separators,
+	// punctuation such as "(x86)" and any stray brace or bracket disappear.
 	fields := strings.FieldsFunc(b.String(), func(r rune) bool {
-		return r == '\\' || r == '/' || r == '_' || r == '-' || r == '.' || unicode.IsSpace(r)
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
 	})
 
 	seen := make(map[string]bool, len(fields))
@@ -619,6 +677,22 @@ func PathTokens(path string) []string {
 		out = append(out, t)
 	}
 	sort.Strings(out)
+	return out
+}
+
+// ProductTokens returns the meaningful words of a path without the tokens
+// that name a large software vendor. Two unrelated products of one vendor,
+// such as Yandex Browser and Yandex Music, share the vendor token but are not
+// the same product, so a product match must ignore it.
+func ProductTokens(path string) []string {
+	tokens := PathTokens(path)
+	out := make([]string, 0, len(tokens))
+	for _, t := range tokens {
+		if commonVendorTokens[t] {
+			continue
+		}
+		out = append(out, t)
+	}
 	return out
 }
 
@@ -643,6 +717,17 @@ var commonVendorTokens = map[string]bool{
 	"nvidia": true, "intel": true, "amd": true, "valve": true,
 	"adobe": true, "jetbrains": true, "ubisoft": true, "mozilla": true,
 	"amazon": true, "opera": true, "blizzard": true, "activision": true,
+	"yandex": true, "logitech": true, "realtek": true, "samsung": true,
+	"unity": true, "msi": true, "tencent": true, "netease": true,
+	"mihoyo": true, "hoyoverse": true, "qualcomm": true, "broadcom": true,
+	"dell": true, "hp": true, "lenovo": true, "asus": true, "acer": true,
+	"gigabyte": true, "razer": true, "corsair": true, "sony": true, "lg": true,
+	"canon": true, "epson": true, "citrix": true, "vmware": true, "sap": true,
+	"ibm": true, "autodesk": true, "corel": true, "kaspersky": true,
+	"avast": true, "avg": true, "eset": true, "bitdefender": true,
+	"malwarebytes": true, "norton": true, "mcafee": true, "sophos": true,
+	"avira": true, "comodo": true, "rockstar": true, "bethesda": true,
+	"capcom": true, "sega": true,
 }
 
 // commonVendorPhrases are multi-word vendor names; their tokens must appear
@@ -653,6 +738,9 @@ var commonVendorPhrases = [][]string{
 	{"riot", "games"},
 	{"epic", "games"},
 	{"meta", "platforms"},
+	{"mail", "ru"},
+	{"square", "enix"},
+	{"take", "two"},
 }
 
 // IsCommonVendor reports that name looks like a large, well-known software
@@ -710,6 +798,71 @@ func IsSystemPath(path string) bool {
 	}
 	rest := p[2:]
 	return rest == `\windows` || strings.HasPrefix(rest, `\windows\`)
+}
+
+// CommandLineMatches reports that cmd names one of the directories, or one of
+// the executables, with a path or word boundary. The command line is normally
+// read from Windows as typed, so it is lower-cased and its slashes are turned
+// into backslashes here; dirs and exes are already normalized.
+func CommandLineMatches(cmd string, dirs, exes []string) bool {
+	cmd = strings.ReplaceAll(strings.ToLower(cmd), "/", `\`)
+	if cmd == "" {
+		return false
+	}
+	for _, d := range dirs {
+		if d == "" {
+			continue
+		}
+		for off := 0; ; {
+			i := strings.Index(cmd[off:], d)
+			if i < 0 {
+				break
+			}
+			i += off
+			end := i + len(d)
+			if (i == 0 || cmdWordBoundary(cmd[i-1])) && (end == len(cmd) || cmdPathBoundary(cmd[end])) {
+				return true
+			}
+			off = i + 1
+		}
+	}
+	for _, e := range exes {
+		if e == "" {
+			continue
+		}
+		for off := 0; ; {
+			i := strings.Index(cmd[off:], e)
+			if i < 0 {
+				break
+			}
+			i += off
+			end := i + len(e)
+			if (i == 0 || cmdWordBoundary(cmd[i-1])) && (end == len(cmd) || cmdWordBoundary(cmd[end])) {
+				return true
+			}
+			off = i + 1
+		}
+	}
+	return false
+}
+
+// cmdPathBoundary reports a character that ends a directory on a command
+// line: the folder is complete and something follows, not a longer name.
+func cmdPathBoundary(b byte) bool {
+	switch b {
+	case '\\', '/', '"', '\'', ' ', '\t', '\r', '\n':
+		return true
+	}
+	return false
+}
+
+// cmdWordBoundary reports a character that ends an executable name.
+func cmdWordBoundary(b byte) bool {
+	switch b {
+	case '\\', '/', '"', '\'', ' ', '\t', '\r', '\n', '=', ',', ';', '(', ')':
+		return true
+	}
+	return false
 }
 
 // serviceOrCOMAncestors start programs on behalf of the system, the task

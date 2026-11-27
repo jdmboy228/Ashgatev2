@@ -564,11 +564,16 @@ func (m *autoMatcher) buildProfile(st *autoState, ridx int, live []rules.Process
 		if name == "" || strings.ContainsAny(name, "*?") || exeSeen[name] {
 			return
 		}
+		// A generic host runs other programs' code: its name on a command line
+		// says nothing about the rule's application.
+		if genericHostExes[name] {
+			return
+		}
 		exeSeen[name] = true
 		prof.exes = append(prof.exes, name)
 	}
 	addTokens := func(raw string) {
-		for _, t := range rules.PathTokens(raw) {
+		for _, t := range rules.ProductTokens(raw) {
 			prof.tokens[t] = struct{}{}
 		}
 	}
@@ -595,6 +600,12 @@ func (m *autoMatcher) buildProfile(st *autoState, ridx int, live []rules.Process
 		addThumb(c)
 	}
 	for _, p := range live {
+		// System and shell processes run on behalf of everything; a helper they
+		// start (cmd.exe, powershell.exe, conhost.exe) must not teach the
+		// profile its own folder or name.
+		if p.PID <= 4 || rules.IsShellOrSystem(p) || rules.IsSystemPath(p.Path) || rules.IsSystemDNS(p.Name) {
+			continue
+		}
 		addDir(p.Path)
 		addExe(p.Name)
 		addExe(p.Path)
@@ -680,10 +691,10 @@ func (m *autoMatcher) rankOf(prof *ruleProfile, cand rules.Process, meta *proces
 	}
 	if len(prof.dirs) > 0 || len(prof.exes) > 0 {
 		if !*cmdDone {
-			*cmd = strings.ReplaceAll(strings.ToLower(m.ins.CommandLine(cand.PID, cand.Started)), "/", `\`)
+			*cmd = m.ins.CommandLine(cand.PID, cand.Started)
 			*cmdDone = true
 		}
-		if commandLineMatches(*cmd, prof.dirs, prof.exes) {
+		if rules.CommandLineMatches(*cmd, prof.dirs, prof.exes) {
 			return 3, "ссылка в командной строке"
 		}
 	}
@@ -712,12 +723,23 @@ func (m *autoMatcher) rankOf(prof *ruleProfile, cand rules.Process, meta *proces
 	return 0, ""
 }
 
+// genericHostExes are interpreters and utilities many unrelated programs
+// start. Learning one of them from a rule's process tree would make any
+// process whose command line mentions it look like a companion.
+var genericHostExes = map[string]bool{
+	"cmd.exe": true, "powershell.exe": true, "pwsh.exe": true, "conhost.exe": true,
+	"wscript.exe": true, "cscript.exe": true, "rundll32.exe": true, "regsvr32.exe": true,
+	"msiexec.exe": true, "node.exe": true, "java.exe": true, "javaw.exe": true,
+	"python.exe": true, "pythonw.exe": true, "ffmpeg.exe": true, "curl.exe": true,
+	"tar.exe": true, "git.exe": true, "bash.exe": true, "sh.exe": true,
+}
+
 // candTokens is the path's tokens plus the image name's, so a process whose
 // path is unreadable still matches by name.
 func candTokens(p rules.Process) []string {
-	out := rules.PathTokens(p.Path)
+	out := rules.ProductTokens(p.Path)
 	if p.Name != "" {
-		out = append(out, rules.PathTokens(p.Name)...)
+		out = append(out, rules.ProductTokens(p.Name)...)
 	}
 	return out
 }
@@ -749,69 +771,6 @@ func withinStartWindow(started int64, times []int64) bool {
 		if d <= int64(autoTimeWindow) {
 			return true
 		}
-	}
-	return false
-}
-
-// commandLineMatches reports that cmd names one of the directories, or an
-// executable, with a path or word boundary. The command line is lower-case
-// and uses backslashes.
-func commandLineMatches(cmd string, dirs, exes []string) bool {
-	if cmd == "" {
-		return false
-	}
-	for _, d := range dirs {
-		if d == "" {
-			continue
-		}
-		for off := 0; ; {
-			i := strings.Index(cmd[off:], d)
-			if i < 0 {
-				break
-			}
-			i += off
-			end := i + len(d)
-			if (i == 0 || cmdWordBoundary(cmd[i-1])) && (end == len(cmd) || cmdPathBoundary(cmd[end])) {
-				return true
-			}
-			off = i + 1
-		}
-	}
-	for _, e := range exes {
-		if e == "" {
-			continue
-		}
-		for off := 0; ; {
-			i := strings.Index(cmd[off:], e)
-			if i < 0 {
-				break
-			}
-			i += off
-			end := i + len(e)
-			if (i == 0 || cmdWordBoundary(cmd[i-1])) && (end == len(cmd) || cmdWordBoundary(cmd[end])) {
-				return true
-			}
-			off = i + 1
-		}
-	}
-	return false
-}
-
-// cmdPathBoundary reports a character that ends a directory on a command
-// line: the folder is complete and something follows, not a longer name.
-func cmdPathBoundary(b byte) bool {
-	switch b {
-	case '\\', '/', '"', '\'', ' ', '\t', '\r', '\n':
-		return true
-	}
-	return false
-}
-
-// cmdWordBoundary reports a character that ends an executable name.
-func cmdWordBoundary(b byte) bool {
-	switch b {
-	case '\\', '/', '"', '\'', ' ', '\t', '\r', '\n', '=', ',', ';', '(', ')':
-		return true
 	}
 	return false
 }
