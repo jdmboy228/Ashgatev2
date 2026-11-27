@@ -7,12 +7,17 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"net"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
+	"ashgate/internal/bootstrap"
 	"ashgate/internal/mobilecfg"
 	"ashgate/internal/vless"
 )
@@ -62,7 +67,38 @@ var (
 	running       io.Closer
 	activeProfile mobilecfg.Profile
 	gen           uint64
+	cancelBoot    context.CancelFunc
 )
+
+// resolveServerIP резолвит доменное имя сервера через DoH по IP (internal/bootstrap),
+// чтобы имя VPN-сервера не утекало в системный DNS провайдера.
+func resolveServerIP(ctx context.Context, host, assetDir string) (string, error) {
+	if host == "" || net.ParseIP(host) != nil {
+		return "", nil
+	}
+	if assetDir != "" {
+		bootstrap.Default.SetFile(filepath.Join(filepath.Dir(assetDir), "dnscache.json"))
+	}
+	rctx, cancel := context.WithTimeout(ctx, 12*time.Second)
+	defer cancel()
+	ips, err := bootstrap.Default.LookupIP(rctx, host)
+	if err != nil || len(ips) == 0 {
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+		why := "нет адреса"
+		if err != nil {
+			why = err.Error()
+		}
+		return "", fmt.Errorf("VLESS: не удалось узнать адрес сервера %s без DNS провайдера (%s). Укажите в ссылке IP-адрес сервера", host, why)
+	}
+	for _, ip := range ips {
+		if ip.To4() != nil {
+			return ip.String(), nil
+		}
+	}
+	return ips[0].String(), nil
+}
 
 func formatError(p mobilecfg.Profile, err error) error {
 	if errors.Is(err, context.Canceled) {
@@ -83,7 +119,7 @@ func Start(profileJSON string, fd int, assetDir string) error {
 	if err := json.Unmarshal([]byte(profileJSON), &p); err != nil {
 		return errors.New("Профиль повреждён")
 	}
-	raw, err := mobilecfg.XrayJSON(p)
+	host, err := mobilecfg.ServerHost(p)
 	if err != nil {
 		return err
 	}
@@ -91,16 +127,46 @@ func Start(profileJSON string, fd int, assetDir string) error {
 	startMu.Lock()
 	defer startMu.Unlock()
 
+	bootCtx, bootCancel := context.WithCancel(context.Background())
 	mu.Lock()
 	gen++
 	myGen := gen
 	prev := running
 	running = nil
 	activeProfile = mobilecfg.Profile{}
+	oldBoot := cancelBoot
+	cancelBoot = bootCancel
 	mu.Unlock()
+	if oldBoot != nil {
+		oldBoot()
+	}
+	defer func() {
+		bootCancel()
+		mu.Lock()
+		if gen == myGen {
+			cancelBoot = nil
+		}
+		mu.Unlock()
+	}()
 
 	if prev != nil {
 		_ = prev.Close()
+	}
+
+	mu.Lock()
+	if gen != myGen {
+		mu.Unlock()
+		return errors.New("Подключение отменено")
+	}
+	mu.Unlock()
+
+	resolvedIP, err := resolveServerIP(bootCtx, host, assetDir)
+	if err != nil {
+		return formatError(p, err)
+	}
+	raw, err := mobilecfg.XrayJSONWithAddress(p, resolvedIP)
+	if err != nil {
+		return err
 	}
 
 	mu.Lock()
@@ -184,7 +250,12 @@ func Stop() {
 	r := running
 	running = nil
 	activeProfile = mobilecfg.Profile{}
+	boot := cancelBoot
+	cancelBoot = nil
 	mu.Unlock()
+	if boot != nil {
+		boot()
+	}
 	if r != nil {
 		_ = r.Close()
 	}

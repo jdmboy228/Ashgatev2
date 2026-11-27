@@ -45,9 +45,8 @@ var (
 	errPlainExtra   = errors.New("Поле extra отправляет загрузку без защиты (downloadSettings). Нужен reality или tls")
 )
 
-// checkLink refuses what cannot be used or would travel unencrypted. The
-// download leg of XHTTP has its own security, set in extra.downloadSettings;
-// the struct reads extra the way Xray does.
+// checkLink отклоняет неподдерживаемые транспорты и незашифрованные соединения.
+// downloadSettings проверяется рекурсивно на любой глубине extra.
 func checkLink(v vless.Params) error {
 	if v.Network != "xhttp" {
 		return errNotXHTTP
@@ -58,20 +57,51 @@ func checkLink(v vless.Params) error {
 	if len(v.Extra) == 0 {
 		return nil
 	}
-	var extra struct {
-		DownloadSettings *struct {
-			Security string `json:"security"`
-		} `json:"downloadSettings"`
-	}
-	if err := json.Unmarshal(v.Extra, &extra); err != nil {
+	var raw any
+	if err := json.Unmarshal(v.Extra, &raw); err != nil {
 		return errPlainExtra
 	}
-	if d := extra.DownloadSettings; d != nil {
-		if s := strings.ToLower(d.Security); s != "tls" && s != "reality" {
-			return errPlainExtra
-		}
+	if !checkExtraDownloadSettings(raw) {
+		return errPlainExtra
 	}
 	return nil
+}
+
+func checkExtraDownloadSettings(node any) bool {
+	switch m := node.(type) {
+	case map[string]any:
+		for k, val := range m {
+			if strings.EqualFold(k, "downloadSettings") && val != nil {
+				obj, ok := val.(map[string]any)
+				if !ok {
+					return false
+				}
+				var sec string
+				for dk, dv := range obj {
+					if strings.EqualFold(dk, "security") {
+						s, ok := dv.(string)
+						if !ok {
+							return false
+						}
+						sec = strings.ToLower(s)
+					}
+				}
+				if sec != "tls" && sec != "reality" {
+					return false
+				}
+			}
+			if !checkExtraDownloadSettings(val) {
+				return false
+			}
+		}
+	case []any:
+		for _, item := range m {
+			if !checkExtraDownloadSettings(item) {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // FromLink reads a vless:// link. Only XHTTP is accepted.
@@ -122,9 +152,14 @@ func Proxy(kind, name, host string, port int, user, pass string) (Profile, error
 		return Profile{}, errors.New("Тип прокси должен быть SOCKS5 или HTTP")
 	}
 	host = strings.TrimSpace(host)
+	hasOpen := strings.HasPrefix(host, "[")
+	hasClose := strings.HasSuffix(host, "]")
+	if hasOpen != hasClose {
+		return Profile{}, errors.New("Неверный адрес прокси")
+	}
 	if h := strings.TrimSuffix(strings.TrimPrefix(host, "["), "]"); net.ParseIP(h) != nil {
 		host = h
-	} else if !validHostname(host) {
+	} else if hasOpen || !validHostname(host) {
 		return Profile{}, errors.New("Неверный адрес прокси")
 	}
 	if port < 1 || port > 65535 {
@@ -203,11 +238,12 @@ var (
 	}
 )
 
-// LANRanges are private and link-local addresses. They mean something only
-// on the phone's own network, so they never go to the proxy.
+// LANRanges — частные, link-local, loopback, multicast и broadcast адреса.
+// Они имеют смысл только в локальной сети телефона и не должны идти в прокси.
 var LANRanges = []string{
 	"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16",
-	"fc00::/7", "fe80::/10",
+	"127.0.0.0/8", "224.0.0.0/4", "255.255.255.255/32",
+	"fc00::/7", "fe80::/10", "::1/128", "ff00::/8",
 }
 
 // MTU of the TUN. VpnService must be given the same value; 1400 fits
@@ -247,8 +283,37 @@ func DirectDomains() []string {
 //  5. addresses of the local network go direct;
 //  6. an HTTP proxy cannot carry UDP, so the rest of UDP is dropped;
 //  7. everything else goes to the proxy.
+// ServerHost возвращает хост прокси-сервера, который нужно зарезолвить до старта Xray.
+func ServerHost(p Profile) (string, error) {
+	switch p.Kind {
+	case KindVLESS:
+		parsed, err := vless.ParseLink(p.Link)
+		if err != nil {
+			return "", err
+		}
+		host, _, err := splitAddress(parsed.Address)
+		return host, err
+	case KindSOCKS5, KindHTTP:
+		checked, err := Proxy(p.Kind, p.Name, p.Host, p.Port, p.User, p.Pass)
+		if err != nil {
+			return "", err
+		}
+		return checked.Host, nil
+	default:
+		return "", errors.New("Неизвестный тип профиля")
+	}
+}
+
+// XrayJSON строит JSON-документ Xray для профиля (с исходным адресом из профиля).
 func XrayJSON(p Profile) ([]byte, error) {
-	proxy, err := proxyOutbound(p)
+	return XrayJSONWithAddress(p, "")
+}
+
+// XrayJSONWithAddress строит JSON-документ Xray для профиля. Если resolvedIP не пуст,
+// Xray подключается напрямую по этому IP (без утечки имени сервера в системный DNS),
+// сохраняя исходное доменное имя для TLS/REALITY SNI и HTTP Host.
+func XrayJSONWithAddress(p Profile, resolvedIP string) ([]byte, error) {
+	proxy, err := proxyOutbound(p, resolvedIP)
 	if err != nil {
 		return nil, err
 	}
@@ -336,7 +401,7 @@ func XrayJSON(p Profile) ([]byte, error) {
 	return json.Marshal(doc)
 }
 
-func proxyOutbound(p Profile) (map[string]any, error) {
+func proxyOutbound(p Profile, resolvedIP string) (map[string]any, error) {
 	switch p.Kind {
 	case KindVLESS:
 		parsed, err := vless.ParseLink(p.Link)
@@ -350,7 +415,19 @@ func proxyOutbound(p Profile) (map[string]any, error) {
 		if err != nil {
 			return nil, err
 		}
-		out, err := vless.Outbound(host, port, parsed.Params)
+		dialHost := host
+		params := parsed.Params
+		if resolvedIP != "" && net.ParseIP(host) == nil {
+			dialHost = resolvedIP
+			// Сохраняем SNI/Host, которые Xray иначе вывел бы из адреса подключения.
+			if (params.Security == "tls" || params.Security == "reality") && params.SNI == "" {
+				params.SNI = host
+			}
+			if params.Network == "xhttp" && params.Host == "" && params.SNI == "" {
+				params.Host = host
+			}
+		}
+		out, err := vless.Outbound(dialHost, port, params)
 		if err != nil {
 			return nil, err
 		}
@@ -363,7 +440,11 @@ func proxyOutbound(p Profile) (map[string]any, error) {
 		if err != nil {
 			return nil, err
 		}
-		settings := map[string]any{"address": checked.Host, "port": checked.Port}
+		dialHost := checked.Host
+		if resolvedIP != "" && net.ParseIP(checked.Host) == nil {
+			dialHost = resolvedIP
+		}
+		settings := map[string]any{"address": dialHost, "port": checked.Port}
 		if checked.User != "" {
 			settings["user"] = checked.User
 			settings["pass"] = checked.Pass
@@ -408,36 +489,10 @@ func (p Profile) Mask(msg string) string {
 			secrets = append(secrets, host)
 		}
 		if len(v.Extra) > 0 {
-			var extra struct {
-				DownloadSettings *struct {
-					Address         string `json:"address"`
-					RealitySettings *struct {
-						ServerName string `json:"serverName"`
-						PublicKey  string `json:"publicKey"`
-						ShortID    string `json:"shortId"`
-					} `json:"realitySettings"`
-					TLSSettings *struct {
-						ServerName string `json:"serverName"`
-						Pinned     string `json:"pinnedPeerCertSha256"`
-					} `json:"tlsSettings"`
-					XHTTPSettings *struct {
-						Host string `json:"host"`
-						Path string `json:"path"`
-					} `json:"xhttpSettings"`
-				} `json:"downloadSettings"`
-			}
-			if json.Unmarshal(v.Extra, &extra) == nil && extra.DownloadSettings != nil {
-				d := extra.DownloadSettings
-				secrets = append(secrets, d.Address)
-				if d.RealitySettings != nil {
-					secrets = append(secrets, d.RealitySettings.ServerName, d.RealitySettings.PublicKey, d.RealitySettings.ShortID)
-				}
-				if d.TLSSettings != nil {
-					secrets = append(secrets, d.TLSSettings.ServerName, d.TLSSettings.Pinned)
-				}
-				if d.XHTTPSettings != nil {
-					secrets = append(secrets, d.XHTTPSettings.Host, d.XHTTPSettings.Path)
-				}
+			secrets = append(secrets, string(v.Extra))
+			var extraAny any
+			if json.Unmarshal(v.Extra, &extraAny) == nil {
+				collectExtraStrings(extraAny, &secrets)
 			}
 		}
 	}
@@ -449,4 +504,26 @@ func (p Profile) Mask(msg string) string {
 		}
 	}
 	return msg
+}
+
+func collectExtraStrings(node any, out *[]string) {
+	switch v := node.(type) {
+	case string:
+		if len(v) >= 4 {
+			*out = append(*out, v)
+		}
+	case map[string]any:
+		for k, val := range v {
+			// Ключи-перечисления вроде security/network/mode не маскируем, маскируем значения-секреты.
+			switch strings.ToLower(k) {
+			case "security", "network", "mode", "fingerprint", "alpn":
+				continue
+			}
+			collectExtraStrings(val, out)
+		}
+	case []any:
+		for _, item := range v {
+			collectExtraStrings(item, out)
+		}
+	}
 }

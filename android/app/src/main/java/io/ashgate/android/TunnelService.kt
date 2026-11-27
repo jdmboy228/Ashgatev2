@@ -16,6 +16,7 @@ import android.net.NetworkCapabilities
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
+import android.os.PowerManager
 import android.util.Log
 import io.ashgate.mobile.Mobile
 import org.json.JSONObject
@@ -52,8 +53,10 @@ class TunnelService : VpnService() {
         /** Changes that come together (a network flapping, quick taps) make one restart. */
         private const val RESTART_DELAY_MS = 1000L
 
-        /** Интервал проверки работающего туннеля (оптимизируется на Этапе 2). */
-        private const val HEALTH_INTERVAL_MS = 15_000L
+        /** Адаптивные интервалы проверки живого туннеля для экономии батареи и радиомодуля. */
+        private const val HEALTH_INTERVAL_MS = 60_000L
+        private const val HEALTH_MAX_INTERVAL_MS = 120_000L
+        private const val HEALTH_IDLE_INTERVAL_MS = 180_000L
 
         /** Экспоненциальные задержки автоповтора в состоянии BLOCKED. */
         private val BLOCKED_RETRY_MS = longArrayOf(15_000L, 30_000L, 60_000L, 120_000L)
@@ -138,6 +141,7 @@ class TunnelService : VpnService() {
     private var restart: ScheduledFuture<*>? = null
     private var restartFull = false
     private var healthCheck: ScheduledFuture<*>? = null
+    private var healthOkStreak = 0
     private var blockedRetry: ScheduledFuture<*>? = null
     private var blockedAttempt = 0
 
@@ -335,11 +339,22 @@ class TunnelService : VpnService() {
             return
         }
         blockedAttempt = 0
+        healthOkStreak = 0
         cancelBlockedRetry()
         watch()
         foreground(NoteMode.ON, profile.optString("name"))
         set(State.ON)
         scheduleHealthCheck(seq)
+    }
+
+    private fun nextHealthDelayMs(): Long {
+        val interactive = try {
+            getSystemService(PowerManager::class.java)?.isInteractive ?: true
+        } catch (_: Exception) {
+            true
+        }
+        if (!interactive) return HEALTH_IDLE_INTERVAL_MS
+        return if (healthOkStreak >= 2) HEALTH_MAX_INTERVAL_MS else HEALTH_INTERVAL_MS
     }
 
     private fun scheduleHealthCheck(seq: Int) {
@@ -356,10 +371,11 @@ class TunnelService : VpnService() {
                     return@Runnable
                 }
                 if (!destroyed && active === this && seq == commandSeq.get() && state == State.ON) {
+                    healthOkStreak++
                     scheduleHealthCheck(seq)
                 }
             },
-            HEALTH_INTERVAL_MS,
+            nextHealthDelayMs(),
             TimeUnit.MILLISECONDS,
         )
     }

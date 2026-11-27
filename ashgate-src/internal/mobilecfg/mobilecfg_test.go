@@ -120,6 +120,8 @@ func TestProxy(t *testing.T) {
 		{"http", "proxy.example", 0, "", "", "port 0"},
 		{"http", "proxy.example", 70000, "", "", "port 70000"},
 		{"http", "proxy.example", 3128, "", "secret", "password without a login"},
+		{"http", "[2001:db8::1", 3128, "", "", "unbalanced IPv6 bracket"},
+		{"http", "2001:db8::1]", 3128, "", "", "trailing IPv6 bracket"},
 	}
 	for _, b := range bad {
 		if _, err := Proxy(b.kind, "", b.host, b.port, b.user, b.pass); err == nil {
@@ -230,7 +232,14 @@ func TestRouting(t *testing.T) {
 			t.Fatalf("%s: rule 5 = %v", name, rule(5))
 		}
 		// Only the local network goes direct by address: no geoip:ru.
-		if r := rule(6); !contains(r["ip"].([]any), "192.168.0.0/16") || !contains(r["ip"].([]any), "fc00::/7") || r["outboundTag"] != TagDirect {
+		if r := rule(6); !contains(r["ip"].([]any), "192.168.0.0/16") ||
+			!contains(r["ip"].([]any), "fc00::/7") ||
+			!contains(r["ip"].([]any), "127.0.0.0/8") ||
+			!contains(r["ip"].([]any), "::1/128") ||
+			!contains(r["ip"].([]any), "224.0.0.0/4") ||
+			!contains(r["ip"].([]any), "255.255.255.255/32") ||
+			!contains(r["ip"].([]any), "ff00::/8") ||
+			r["outboundTag"] != TagDirect {
 			t.Fatalf("%s: rule 6 = %v", name, r)
 		}
 		if strings.Contains(fmt.Sprint(rules), "geoip:") {
@@ -290,6 +299,7 @@ func TestRejectsPlainDownload(t *testing.T) {
 		`{"downloadSettings":{"address":"192.0.2.1","port":80,"network":"xhttp","security":"none"}}`,
 		`{"DownloadSettings":{"security":"NONE"}}`,
 		`{"downloadSettings":{"security":1}}`,
+		`{"downloadSettings":{"security":"tls","xhttpSettings":{"extra":{"downloadSettings":{"security":"none"}}}}}`,
 	} {
 		raw := strings.Replace(link(extra), "#Test%20XHTTP", "", 1)
 		if _, err := FromLink(raw); err != errPlainExtra {
@@ -398,14 +408,40 @@ func TestMask(t *testing.T) {
 	if got := s.Mask("auth alice/secret to 192.0.2.10:1080 failed"); got != "auth ***/*** to ***:1080 failed" {
 		t.Fatalf("got %q", got)
 	}
-	// Extra downloadSettings fields, path, and uppercase UUIDs are masked too.
-	extraJSON := `{"downloadSettings":{"address":"203.0.113.55","security":"reality","realitySettings":{"serverName":"dl.example.org","publicKey":"BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB","shortId":"ef56"},"xhttpSettings":{"host":"dl-cdn.example.org","path":"/dl-secret"}}}`
+	// Extra downloadSettings fields, custom string tokens, path, and uppercase UUIDs are masked too.
+	extraJSON := `{"headers":{"X-Custom-Token":"my-secret-header-token"},"downloadSettings":{"address":"203.0.113.55","security":"reality","realitySettings":{"serverName":"dl.example.org","publicKey":"BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB","shortId":"ef56"},"xhttpSettings":{"host":"dl-cdn.example.org","path":"/dl-secret"}}}`
 	withExtra, err := FromLink(strings.Replace(xhttpLink, "#Test%20XHTTP", "&extra="+url.QueryEscape(extraJSON)+"#Test%20XHTTP", 1))
 	if err != nil {
 		t.Fatal(err)
 	}
-	leakMsg := "uuid " + strings.ToUpper(fakeUUID) + " path /api dl 203.0.113.55 sni dl.example.org key BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB sid ef56 host dl-cdn.example.org dlpath /dl-secret"
-	if got := withExtra.Mask(leakMsg); got != "uuid *** path *** dl *** sni *** key *** sid *** host *** dlpath ***" {
+	leakMsg := "uuid " + strings.ToUpper(fakeUUID) + " path /api dl 203.0.113.55 sni dl.example.org key BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB sid ef56 host dl-cdn.example.org dlpath /dl-secret hdr my-secret-header-token"
+	if got := withExtra.Mask(leakMsg); got != "uuid *** path *** dl *** sni *** key *** sid *** host *** dlpath *** hdr ***" {
 		t.Fatalf("got %q", got)
+	}
+}
+
+func TestXrayJSONWithAddressPreservesSNI(t *testing.T) {
+	// При подстановке зарезолвленного IP адрес outbound меняется на IP, а TLS SNI сохраняет исходный домен.
+	tlsLink := "vless://" + fakeUUID + "@vpn.example.org:443?type=xhttp&security=tls&path=%2Fapi#TLS"
+	p, err := FromLink(tlsLink)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := XrayJSONWithAddress(p, "198.51.100.42")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var d map[string]any
+	if err := json.Unmarshal(raw, &d); err != nil {
+		t.Fatal(err)
+	}
+	out := d["outbounds"].([]any)[0].(map[string]any)
+	vnext := out["settings"].(map[string]any)["vnext"].([]any)[0].(map[string]any)
+	if vnext["address"] != "198.51.100.42" {
+		t.Fatalf("address = %v, want 198.51.100.42", vnext["address"])
+	}
+	tlsSettings := out["streamSettings"].(map[string]any)["tlsSettings"].(map[string]any)
+	if tlsSettings["serverName"] != "vpn.example.org" {
+		t.Fatalf("serverName = %v, want vpn.example.org", tlsSettings["serverName"])
 	}
 }

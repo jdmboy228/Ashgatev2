@@ -10,6 +10,7 @@ import (
 
 	xnet "github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/session"
+	xraylog "github.com/xtls/xray-core/common/log"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/policy"
 	"github.com/xtls/xray-core/features/routing"
@@ -348,3 +349,32 @@ func TestRunTrackerClosesLiveSockets(t *testing.T) {
 		t.Fatal("tracked TCP conn remained writable after stop")
 	}
 }
+
+func TestLogHookMarksTunDead(t *testing.T) {
+	r := &runInstance{inst: &instance{}, tr: newRunTracker()}
+	setActiveRun(r)
+	t.Cleanup(func() { clearActiveRun(r) })
+
+	if r.tunDead.Load() {
+		t.Fatal("tunDead must start false")
+	}
+	logHook{}.Handle(fakeMsg("[tun] failed to read a packet: bad file descriptor"))
+	if !r.tunDead.Load() {
+		t.Fatal("logHook did not mark tunDead on TUN read failure")
+	}
+	if err := Check(r); err == nil || err.Error() != "VLESS: локальный интерфейс TUN остановился" {
+		t.Fatalf("Check with dead TUN = %v", err)
+	}
+
+	// Рутинный Info-лог на горячем пути соединений не должен попадать в кольцо диагностики.
+	clearLog()
+	since := time.Now().Add(-time.Second)
+	logHook{}.Handle(&xraylog.GeneralMessage{Severity: xraylog.Severity_Info, Content: "proxy/tun: processing from 10.0.0.1:1234 to example.com:443"})
+	if got := RecentLog(since); got != "" {
+		t.Fatalf("routine TUN info line was stored in diagnostic ring: %q", got)
+	}
+}
+
+type fakeMsg string
+
+func (m fakeMsg) String() string { return string(m) }

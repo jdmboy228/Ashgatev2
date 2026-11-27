@@ -302,6 +302,10 @@ func (c *tcpConn) Close() error {
 		if c.rtimer != nil {
 			c.rtimer.Stop()
 		}
+		if len(c.left) > 0 {
+			buf.ReleaseMulti(c.left)
+			c.left = nil
+		}
 		c.mu.Unlock()
 		c.cancel()
 		common.Interrupt(c.r)

@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	applog "github.com/xtls/xray-core/app/log"
@@ -64,17 +65,54 @@ func init() {
 
 type logHook struct{}
 
+// Severity_Info нужен, т.к. Xray пишет часть ошибок splithttp/REALITY на уровне Info;
+// рутинные Info-сообщения на каждое соединение отбрасываются в Handle до захвата logMu.
 func (logHook) Severity() xraylog.Severity { return xraylog.Severity_Info }
 
 func (logHook) Handle(msg xraylog.Message) {
 	if msg == nil {
 		return
 	}
-	switch msg.(type) {
+	switch m := msg.(type) {
 	case *xraylog.AccessMessage, *xraylog.DNSLog:
 		return
+	case *xraylog.GeneralMessage:
+		s := msg.String()
+		// Если цикл чтения TUN-дескриптора в Xray завершился ошибкой, помечаем активный инстанс.
+		if strings.Contains(s, "[tun]") && strings.Contains(strings.ToLower(s), "failed to read") {
+			markActiveTunDead()
+		}
+		// Пропускаем рутинные Info-логи на горячем пути соединений, чтобы не брать logMu,
+		// не удерживать домены в памяти и не вытеснять ошибки handshake из 64-строчного буфера.
+		if m.Severity > xraylog.Severity_Warning && !isDiagnosticInfo(s) {
+			return
+		}
+		pushLog(s)
+		return
 	}
-	pushLog(msg.String())
+	s := msg.String()
+	if strings.Contains(s, "[tun]") && strings.Contains(strings.ToLower(s), "failed to read") {
+		markActiveTunDead()
+	}
+	pushLog(s)
+}
+
+func isDiagnosticInfo(s string) bool {
+	low := strings.ToLower(s)
+	if strings.Contains(low, "processing from ") || strings.Contains(low, "connection ends") || strings.Contains(low, "taking detour") {
+		return false
+	}
+	return strings.Contains(low, "fail") ||
+		strings.Contains(low, "error") ||
+		strings.Contains(low, "unexpected status") ||
+		strings.Contains(low, "bad status") ||
+		strings.Contains(low, "reality") ||
+		strings.Contains(low, "splithttp") ||
+		strings.Contains(low, "x509:") ||
+		strings.Contains(low, "certificate") ||
+		strings.Contains(low, "handshake") ||
+		strings.Contains(low, "refused") ||
+		strings.Contains(low, "timeout")
 }
 
 func loadAndStart(raw []byte) (*instance, error) {
@@ -107,11 +145,13 @@ func Run(raw []byte) (io.Closer, error) {
 		clearActiveTracker(tr)
 		return nil, err
 	}
+	r := &runInstance{inst: inst, tr: tr}
+	setActiveRun(r)
 	// Capture GeneralMessage dial/handshake failures in the in-memory ring
 	// buffer even when the config's log section is "none" (nothing ever goes
 	// to stdout or logcat).
 	xraylog.RegisterHandler(logHook{})
-	return &runInstance{inst: inst, tr: tr}, nil
+	return r, nil
 }
 
 const (
@@ -272,6 +312,9 @@ func Check(c io.Closer) error {
 	if !ok || r == nil || r.inst == nil {
 		return errors.New("VLESS: локальный мост не запущен")
 	}
+	if r.tunDead.Load() {
+		return errors.New("VLESS: локальный интерфейс TUN остановился")
+	}
 	var lastErr error
 	for try := 0; try < 2; try++ {
 		if try > 0 {
@@ -281,12 +324,18 @@ func Check(c io.Closer) error {
 			case <-time.After(ProbePause):
 			}
 		}
+		if r.tunDead.Load() {
+			return errors.New("VLESS: локальный интерфейс TUN остановился")
+		}
 		start := time.Now()
 		err := probeOnce(r.tr.ctx, r.inst, try)
 		if r.tr.ctx.Err() != nil {
 			return r.tr.ctx.Err()
 		}
 		if err == nil {
+			if r.tunDead.Load() {
+				return errors.New("VLESS: локальный интерфейс TUN остановился")
+			}
 			return nil
 		}
 		lastErr = TunnelError(start, err)
@@ -297,15 +346,45 @@ func Check(c io.Closer) error {
 	return lastErr
 }
 
+var (
+	activeRunMu sync.Mutex
+	activeRun   *runInstance
+)
+
+func setActiveRun(r *runInstance) {
+	activeRunMu.Lock()
+	activeRun = r
+	activeRunMu.Unlock()
+}
+
+func clearActiveRun(r *runInstance) {
+	activeRunMu.Lock()
+	if activeRun == r {
+		activeRun = nil
+	}
+	activeRunMu.Unlock()
+}
+
+func markActiveTunDead() {
+	activeRunMu.Lock()
+	r := activeRun
+	activeRunMu.Unlock()
+	if r != nil {
+		r.tunDead.Store(true)
+	}
+}
+
 type runInstance struct {
-	inst *instance
-	tr   *runTracker
-	once sync.Once
+	inst    *instance
+	tr      *runTracker
+	tunDead atomic.Bool
+	once    sync.Once
 }
 
 func (r *runInstance) Close() error {
 	var err error
 	r.once.Do(func() {
+		clearActiveRun(r)
 		clearActiveTracker(r.tr)
 		r.tr.cancel()
 		// Сначала принудительно закрываем активные сокеты, чтобы не блокироваться внутри inst.Close().
