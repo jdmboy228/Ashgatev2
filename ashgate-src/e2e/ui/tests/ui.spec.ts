@@ -160,6 +160,7 @@ async function liveness(scope: string, label: string) {
     // expanding a drawer must not let a shifted index hit «Отвязать».
     '[data-act="ap-sub-remove"]', '[data-act="ap-sub-mask"]',
     '[data-act="ap-comp-del"]', '[data-act="ap-radar-capture"]',
+    '[data-act="ap-hint-attach"]', '[data-act="ap-hint-dismiss"]',
   ].join(",");
   const buttons = page.locator(`${scope} button:visible`);
   const n = await buttons.count();

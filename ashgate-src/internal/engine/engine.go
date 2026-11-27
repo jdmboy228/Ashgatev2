@@ -332,17 +332,19 @@ func (e *Engine) Apply(cfg *config.Config) error {
 	if err != nil {
 		return err
 	}
-	e.snap.Store(snap)
-	// A process the new rules cover leaves the unmatched list at once.
-	e.direct.pruneMatched(snap.rules)
 	e.verbose.Store(strings.EqualFold(cfg.Log.Level, "debug"))
 	e.mu.Lock()
+	e.snap.Store(snap)
 	e.directTCP = newAgeMap[tcpKey, *directProcEntry]()
 	e.directUDP = newAgeMap[udpKey, *directProcEntry]()
 	e.directPorts = nil
 	e.blockTCP = newAgeSet[tcpKey]()
 	e.blockUDP = newAgeSet[udpKey]()
 	e.unknownUDP = newAgeSet[udpKey]()
+	// Prune under e.mu after publishing snap and clearing direct caches so no
+	// concurrent decide() on the old snapshot can re-insert a matched program.
+	// Lock order (e.mu -> direct.mu) matches decide() -> direct.record().
+	e.direct.pruneMatched(snap.rules)
 	var stale []*udpFlow
 	for k, f := range e.udp {
 		f.mu.Lock()
@@ -683,6 +685,10 @@ func (e *Engine) fastPath(pkt []byte, h *packet.Header) (Result, bool) {
 		} else if e.closedTCP.has(key) {
 			return Result{Action: ActionDrop}, true
 		} else if dp, ok := e.directTCP.get(key); ok {
+			if dp != nil && dp.evicted.Load() {
+				e.directTCP.del(key)
+				return Result{}, false
+			}
 			if dp != nil {
 				dp.addBytes(int64(len(pkt)), e.now().UnixMilli())
 			}
@@ -720,6 +726,10 @@ func (e *Engine) fastPath(pkt []byte, h *packet.Header) (Result, bool) {
 			return Result{Action: ActionUDP, UDP: datagram(pkt, h, flow)}, true
 		}
 		if dp, ok := e.directUDP.get(key); ok {
+			if dp != nil && dp.evicted.Load() {
+				e.directUDP.del(key)
+				return Result{}, false
+			}
 			if dp != nil {
 				dp.addBytes(int64(len(pkt)), e.now().UnixMilli())
 			}
@@ -1002,10 +1012,6 @@ func (e *Engine) unknownDropLocked() {
 // is the rule match that routed the process.
 func (e *Engine) startUDP(pkt []byte, h *packet.Header, meta Meta, proc rules.Process, p config.Proxy, snap *snapshot, parent string, stat *ruleStat, kind string, killSwitch, sys bool) Result {
 	key := udpKey{Src: h.Src, Dst: h.Dst}
-	var sub *subProcStat
-	if !sys {
-		sub = stat.procFor(proc, kind)
-	}
 	if h.Frag {
 		e.blockUDP.add(key)
 		e.dropFragment(h)
@@ -1021,6 +1027,10 @@ func (e *Engine) startUDP(pkt []byte, h *packet.Header, meta Meta, proc rules.Pr
 		e.blockUDP.add(key)
 		e.log(logbuf.Event{Process: display(proc), PID: proc.PID, Proto: "UDP", Dest: h.Dst.String(), Via: p.Name, Status: "blocked", Error: "http proxy cannot carry this udp flow"})
 		return Result{Action: ActionDrop}
+	}
+	var sub *subProcStat
+	if !sys {
+		sub = stat.procFor(proc, kind)
 	}
 	relay := h.Dst
 	if h.Dst.Port == 53 && (snap.dns.Mode == "proxy" || sys) {

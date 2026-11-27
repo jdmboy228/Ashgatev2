@@ -389,15 +389,27 @@ func TestGroupValidation(t *testing.T) {
 }
 
 func TestMaskMatchingEverythingRejected(t *testing.T) {
-	for _, p := range []string{"*", "*.exe", `*\*.exe`, "?*"} {
+	for _, p := range []string{"*", "*.exe", `*\*.exe`, "?*", `C:\*`, `D:\*.exe`, `?:\*`, `c:/*.exe`} {
 		c := Default()
 		c.Rules = []Rule{{Process: p, Action: "direct"}}
 		if err := c.Validate(); err == nil {
-			t.Fatalf("%q accepted", p)
+			t.Fatalf("process %q accepted", p)
+		}
+		c2 := Default()
+		c2.Rules = []Rule{{Process: "app.exe", Action: "direct", Companions: []string{p}}}
+		if err := c2.Validate(); err == nil {
+			t.Fatalf("companion %q accepted", p)
+		}
+	}
+	for _, bad := range []string{"svchost", "svchost.exe", `C:\Windows\System32\svchost.exe`, "  ", `""`} {
+		c := Default()
+		c.Rules = []Rule{{Process: "app.exe", Action: "direct", Companions: []string{bad}}}
+		if err := c.Validate(); err == nil {
+			t.Fatalf("companion %q accepted", bad)
 		}
 	}
 	c := Default()
-	c.Rules = []Rule{{Process: `*\Discord\*.exe`, Action: "direct"}}
+	c.Rules = []Rule{{Process: `*\Discord\*.exe`, Action: "direct", Companions: []string{`C:\Apps\Helper\helper-*.exe`}}}
 	if err := c.Validate(); err != nil {
 		t.Fatal(err)
 	}
@@ -622,5 +634,25 @@ func TestRuleCompanionsDeepCopy(t *testing.T) {
 	}
 	if len(eff[0].Companions) != 2 {
 		t.Fatalf("EffectiveRules lost companions: %#v", eff[0].Companions)
+	}
+}
+
+func TestRuleCompanionsSaveLoadRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	cfg := Default()
+	cfg.Rules = []Rule{{
+		Process:    `C:\LDPlayer\dnplayer.exe`,
+		Action:     "direct",
+		Companions: []string{`C:\Program Files\ldplayer9box\Ld9BoxHeadless.exe`, "helper.exe"},
+	}}
+	if err := Save(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	got, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Rules) != 1 || strings.Join(got.Rules[0].Companions, ",") != strings.Join(cfg.Rules[0].Companions, ",") {
+		t.Fatalf("loaded companions = %#v, want %#v", got.Rules, cfg.Rules[0].Companions)
 	}
 }

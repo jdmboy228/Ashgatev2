@@ -384,21 +384,52 @@ func VersionMask(p string) (mask string, ok bool) {
 	return strings.Join(segs, sep), true
 }
 
-// sharedRoots are folders that hold unrelated programs. A rule naming one
-// of them never covers a companion by folder: the sibling would be another
-// application.
-var sharedRoots = map[string]bool{
-	`c:`:               true,
-	`c:\program files`: true, `c:\program files (x86)`: true,
-	`c:\program files\common files`: true, `c:\program files (x86)\common files`: true,
-	`c:\programdata`: true, `c:\programdata\microsoft`: true,
-	`c:\users`: true, `c:\windows`: true, `c:\windows\system32`: true,
-	`c:\windows\syswow64`: true, `c:\windows\installer`: true,
+// sharedRootSuffixes are drive-agnostic folders that hold unrelated programs.
+// A rule naming one of them never covers a companion by folder: the sibling
+// would be another application.
+var sharedRootSuffixes = map[string]bool{
+	``:                             true,
+	`\program files`:               true,
+	`\program files (x86)`:         true,
+	`\program files\common files`:  true,
+	`\program files (x86)\common files`: true,
+	`\programdata`:                 true,
+	`\programdata\microsoft`:       true,
+	`\users`:                       true,
+	`\users\public`:                true,
+	`\windows`:                     true,
+	`\windows\system32`:            true,
+	`\windows\syswow64`:            true,
+	`\windows\installer`:           true,
 }
 
-// sharedUserDirs are the per-user folders people drop portable programs
-// into; a rule for one exe there must not cover its neighbours.
-var sharedUserDirs = []string{`\desktop`, `\downloads`, `\documents`}
+// sharedUserDirs are per-user folders that hold unrelated programs; a rule
+// for one exe there must not cover its neighbours.
+var sharedUserDirs = map[string]bool{
+	``:                           true,
+	`\desktop`:                   true,
+	`\downloads`:                 true,
+	`\documents`:                 true,
+	`\onedrive`:                  true,
+	`\onedrive\desktop`:          true,
+	`\onedrive\downloads`:        true,
+	`\onedrive\documents`:        true,
+	`\appdata`:                   true,
+	`\appdata\local`:             true,
+	`\appdata\roaming`:           true,
+	`\appdata\local\programs`:    true,
+	`\appdata\local\temp`:        true,
+	`\appdata\local\microsoft`:   true,
+	`\appdata\local\packages`:    true,
+	`\appdata\roaming\microsoft`: true,
+}
+
+// CompanionDir returns the normalized install folder of a rule's executable
+// path or mask, or "" when it names no application-specific folder (bare name,
+// shared system/user root, UNC share root, or too shallow).
+func CompanionDir(raw string) string {
+	return companionDir(NormalizePath(raw))
+}
 
 // companionDir returns the install folder of a rule's executable, or "" when
 // the rule names no folder of its own: a bare name, a folder too shallow to
@@ -418,18 +449,29 @@ func companionDir(match string) string {
 		match = match[:j]
 	}
 	match = strings.TrimSuffix(match, `\`)
-	if len(match) <= 3 || sharedRoots[match] {
+	if len(match) <= 3 {
 		return ""
 	}
-	if u := userHomeDir(match); u != "" {
-		rest := strings.ToLower(match[len(u):])
-		if rest == "" || rest == `\appdata` || rest == `\appdata\local` || rest == `\appdata\roaming` {
+	// UNC paths (\\server\share) need at least a subdirectory under the share.
+	if strings.HasPrefix(match, `\\`) {
+		parts := strings.Split(strings.TrimPrefix(match, `\\`), `\`)
+		if len(parts) < 3 || parts[0] == "" || parts[1] == "" {
 			return ""
 		}
-		for _, d := range sharedUserDirs {
-			if rest == d {
-				return ""
-			}
+		return match
+	}
+	// Drive-agnostic shared root check (handles Windows/Program Files on D:, etc.).
+	noDrive := match
+	if len(noDrive) >= 2 && noDrive[1] == ':' {
+		noDrive = noDrive[2:]
+	}
+	if sharedRootSuffixes[noDrive] {
+		return ""
+	}
+	if u := userHomeDir(noDrive); u != "" {
+		rest := noDrive[len(u):]
+		if sharedUserDirs[rest] {
+			return ""
 		}
 	}
 	// A folder directly on a drive (D:\Games) holds unrelated programs.
@@ -439,10 +481,10 @@ func companionDir(match string) string {
 	return match
 }
 
-// userHomeDir returns the `c:\users\<name>` prefix of a normalized path, or
-// "" when it is not under a user profile.
+// userHomeDir returns the `\users\<name>` prefix of a drive-stripped
+// normalized path, or "" when it is not under a user profile.
 func userHomeDir(p string) string {
-	const root = `c:\users\`
+	const root = `\users\`
 	if !strings.HasPrefix(p, root) {
 		return ""
 	}

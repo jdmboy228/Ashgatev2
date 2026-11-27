@@ -947,23 +947,31 @@ func validDomain(d string) bool {
 }
 
 // matchesEverything reports a process mask made only of wildcards, such as
-// "*" or "*.exe": it would route every program on the PC.
+// "*", "*.exe", or "C:\*": it would route every program on the PC or drive.
 func matchesEverything(process string) bool {
 	p := strings.ToLower(strings.Trim(strings.TrimSpace(process), `"`))
 	if !strings.ContainsAny(p, "*?") {
 		return false
+	}
+	// Strip an optional drive prefix (C:, ?:, etc.) so "C:\*" and "?:\*.exe"
+	// are recognized as matching everything on the drive.
+	if len(p) >= 2 && p[1] == ':' && ((p[0] >= 'a' && p[0] <= 'z') || p[0] == '?' || p[0] == '*') {
+		p = p[2:]
 	}
 	p = strings.NewReplacer("*", "", "?", "", ".exe", "", `\`, "", "/", "", ".", "").Replace(p)
 	return p == ""
 }
 
 // maskBase is the lower-case file name at the end of a process mask, so a
-// full path and a bare name are checked the same way.
+// full path and a bare name (with or without .exe) are checked the same way.
 func maskBase(process string) string {
-	base := strings.ToLower(process)
+	base := strings.ToLower(strings.Trim(strings.TrimSpace(process), `"`))
 	base = strings.ReplaceAll(base, "/", `\`)
 	if idx := strings.LastIndex(base, `\`); idx >= 0 {
 		base = base[idx+1:]
+	}
+	if base != "" && !strings.Contains(base, ".") && !strings.HasSuffix(base, "*") {
+		base += ".exe"
 	}
 	return base
 }

@@ -7,6 +7,7 @@ import (
 
 	"ashgate/internal/config"
 	"ashgate/internal/engine"
+	"ashgate/internal/logbuf"
 	"ashgate/internal/process"
 	"ashgate/internal/rules"
 )
@@ -298,5 +299,74 @@ func TestTopCandidateSkipsIdleAndOtherRule(t *testing.T) {
 	}
 	if topCandidate([]companionCandidate{{Name: "weak.exe", Score: 44, Conns: 5, Bytes: 1024}}) != nil {
 		t.Fatal("expected nil for candidate below score threshold")
+	}
+}
+
+func TestBuildRuleMembersGlobCompanionAndDedup(t *testing.T) {
+	const ruleExe = `C:\Apps\Discord\app-*\Discord.exe`
+	const compMask = `C:\Apps\Discord\app-*\DiscordHelper.exe`
+	cfg := &config.Config{Rules: []config.Rule{{
+		Process:    ruleExe,
+		Companions: []string{compMask, compMask, "helper", "helper.exe"},
+	}}}
+	key := ruleKey(ruleExe)
+	// Neither version is currently live, but stats saw traffic from two versions.
+	stats := map[string]engine.RuleStat{key: {Procs: []engine.RuleProcStat{
+		{Name: "DiscordHelper.exe", Path: `C:\Apps\Discord\app-1.0\DiscordHelper.exe`, Kind: rules.MatchCompanion, Flows: 1, Up: 100, Down: 200},
+		{Name: "DiscordHelper.exe", Path: `C:\Apps\Discord\app-2.0\DiscordHelper.exe`, Kind: rules.MatchCompanion, Flows: 2, Up: 300, Down: 400},
+	}}}
+	got := buildRuleMembers(cfg, stats, nil)[key]
+	if len(got) != 2 {
+		t.Fatalf("want 2 deduplicated companion rows, got %d: %+v", len(got), got)
+	}
+	var merged *ruleMemberView
+	for i := range got {
+		if got[i].Pattern == compMask {
+			merged = &got[i]
+		}
+	}
+	if merged == nil || merged.Flows != 3 || merged.Up != 400 || merged.Down != 600 {
+		t.Fatalf("glob companion stats not merged: %+v", got)
+	}
+}
+
+func TestRankCandidatesSkipsSharedUserDirAndPrefersLivePID(t *testing.T) {
+	now := time.Now()
+	// Rule in Downloads must NOT put C:\Users\me\Downloads in ruleDirs (no false +60 cmdline boost).
+	rule := config.Rule{Process: `C:\Users\me\Downloads\portable.exe`, Action: "proxy"}
+	ins := &fakeInspector{cmds: map[uint32]string{
+		// Live PID 200 references Downloads in its cmdline.
+		200: `other.exe --cwd "C:\Users\me\Downloads"`,
+		// Stale exited PID 100 would have matched if not overwritten by live runningProcs PID.
+		100: `other.exe --from-old-pid`,
+	}}
+	direct := []engine.DirectProc{{
+		Name: "other.exe", Path: `C:\Tools\Other\other.exe`, PID: 100, Started: 111,
+		Conns: 1, Bytes: 512, LastSeen: now.UnixMilli(),
+	}}
+	running := []rules.Process{{
+		Name: "other.exe", Path: `C:\Tools\Other\other.exe`, PID: 200, Started: 222,
+	}}
+	got := rankCandidates(rule, []config.Rule{rule}, nil, direct, running, ins, now)
+	if len(got) != 1 {
+		t.Fatalf("got %+v", got)
+	}
+	if got[0].PID != 200 {
+		t.Fatalf("PID = %d, want live running PID 200", got[0].PID)
+	}
+	if hasReason(got[0], "Запущен с путём программы") {
+		t.Fatalf("shared Downloads folder gave false cmdline match: %+v", got[0])
+	}
+}
+
+func TestEventsToViewsNewestFirst(t *testing.T) {
+	t0 := time.Date(2026, 11, 27, 12, 0, 1, 0, time.UTC)
+	evs := []logbuf.Event{
+		{Time: t0, Process: "first.exe", Dest: "1.1.1.1:80"},
+		{Time: t0.Add(time.Second), Process: "second.exe", Dest: "2.2.2.2:80"},
+	}
+	views := eventsToViews(evs)
+	if len(views) != 2 || views[0].Process != "second.exe" || views[1].Process != "first.exe" {
+		t.Fatalf("eventsToViews order = %+v, want newest first", views)
 	}
 }

@@ -92,6 +92,7 @@ type controller struct {
 	hintsCache map[string]ruleHintView
 	hintsAt    time.Time
 	hintsBusy  bool
+	hintsGen   uint64
 	// startMu serializes start, stop, and shutdown.
 	startMu sync.Mutex
 	// sessWg tracks session watcher goroutines launched by start.
@@ -418,7 +419,7 @@ func (c *controller) api(w http.ResponseWriter, r *http.Request) {
 			procs = snapshotProcs()
 		}
 		var direct []engine.DirectProc
-		if sess != nil {
+		if sess != nil && sess.Running() {
 			direct, _, _ = sess.DirectSnapshot()
 		}
 		cands := rankCandidates(*found, eff, ruleProcs, direct, procs, ins, time.Now())
@@ -440,6 +441,9 @@ func (c *controller) api(w http.ResponseWriter, r *http.Request) {
 		var generation uint64
 		if sess != nil {
 			procs, evs, generation = sess.DirectSnapshot()
+			if !sess.Running() {
+				procs = nil
+			}
 		}
 		same := since != 0 && since == generation
 		var events []eventView
@@ -685,16 +689,20 @@ func (c *controller) snapshotSince(since uint64) stateView {
 	defer c.mu.Unlock()
 	cfg := cloneCfg(c.cfg)
 	now := time.Now()
+	running := c.sess != nil && c.sess.Running()
 	var stats map[string]engine.RuleStat
 	var directCount int
 	if c.sess != nil {
 		stats = c.sess.RuleStats()
-		procs, _, _ := c.sess.DirectSnapshot()
-		directCount = countDirect(procs, now)
+		if running {
+			directCount = c.sess.DirectCount(now, directRecent)
+		}
 	}
 	members := buildRuleMembers(cfg, stats, c.liveMembers)
 	hints := c.hintsCache
-	running := c.sess != nil && c.sess.Running()
+	if !running {
+		hints = nil
+	}
 	var tcp, udp int
 	var up, down int64
 	var active int64
@@ -747,7 +755,7 @@ func (c *controller) snapshotSince(since uint64) stateView {
 		Checks:      checks,
 		Bridges:     bridges,
 		KillSwitch:  c.ksSnapshot(killWanted(cfg)),
-		RuleStats:   c.ruleStatsLocked(now),
+		RuleStats:   c.ruleStatsLocked(now, stats),
 		Subs:        c.subViewsLocked(),
 		Alive:       c.alive,
 		RuleMasks:   ruleMasks(cfg),
@@ -1002,6 +1010,7 @@ func (c *controller) replaceLocked(next *config.Config) error {
 	c.cfg = cp
 	c.hintsCache = nil
 	c.hintsAt = time.Time{}
+	c.hintsGen++
 	for name := range c.checks {
 		if _, ok := cp.ProxyByName(name); !ok {
 			delete(c.checks, name) // deleted or renamed
@@ -1175,12 +1184,12 @@ func eventViews(logs *logbuf.Buffer) []eventView {
 	return out
 }
 
-// eventsToViews converts events in the order given. The direct-traffic feed
-// is already oldest first.
+// eventsToViews converts events newest first, matching eventViews and the
+// Connections table order. The direct-traffic ring returns them oldest first.
 func eventsToViews(evs []logbuf.Event) []eventView {
 	out := make([]eventView, 0, len(evs))
-	for _, e := range evs {
-		out = append(out, eventToView(e))
+	for i := len(evs) - 1; i >= 0; i-- {
+		out = append(out, eventToView(evs[i]))
 	}
 	return out
 }

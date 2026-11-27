@@ -2,6 +2,8 @@ package gui
 
 import (
 	"time"
+
+	"ashgate/internal/engine"
 )
 
 // ruleStatView is one rule's live traffic as the Apps tab shows it.
@@ -22,8 +24,9 @@ const rateEvery = time.Second
 const errShown = time.Minute
 
 // ruleStatsLocked turns the engine's counters into rows with speeds.
+// cur is the snapshot already read by the caller (or read here if nil).
 // Callers hold c.mu.
-func (c *controller) ruleStatsLocked(now time.Time) map[string]ruleStatView {
+func (c *controller) ruleStatsLocked(now time.Time, cur map[string]engine.RuleStat) map[string]ruleStatView {
 	out := map[string]ruleStatView{}
 	if c.sess == nil {
 		return out
@@ -32,7 +35,9 @@ func (c *controller) ruleStatsLocked(now time.Time) map[string]ruleStatView {
 		c.statSess = c.sess
 		c.statPrev, c.statAt, c.statRates = nil, time.Time{}, nil
 	}
-	cur := c.sess.RuleStats()
+	if cur == nil {
+		cur = c.sess.RuleStats()
+	}
 	if dt := now.Sub(c.statAt); c.statPrev == nil || dt >= rateEvery {
 		rates := map[string][2]int64{}
 		if c.statPrev != nil && dt > 0 {

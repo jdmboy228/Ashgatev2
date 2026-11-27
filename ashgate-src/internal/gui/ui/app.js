@@ -1305,11 +1305,15 @@ async function refresh() {
 }
 // pollDirect keeps the unmatched feed current while «Без правила» is open.
 // The server skips the event list when the log generation is unchanged.
+let directSeq = 0;
+let directShownSeq = 0;
 async function pollDirect() {
   if (DEMO) return;
+  const seq = ++directSeq;
   try {
     const res = await getJSON("/api/direct?gen=" + (directState.gen || 0));
-    if (!res) return;
+    if (!res || seq < directShownSeq || !logUnmatched) return;
+    directShownSeq = seq;
     directState.procs = Array.isArray(res.procs) ? res.procs : [];
     if (!res.eventsSame) {
       directState.events = Array.isArray(res.events) ? res.events : [];
@@ -1988,6 +1992,7 @@ function onClick(e) {
     logUnmatched = !logUnmatched;
     paused = false;
     frozen = null;
+    directShownSeq = ++directSeq;
     if (logUnmatched) directState = { procs: [], events: [], gen: 0 };
     built = "";
     render();
@@ -2002,7 +2007,8 @@ function onClick(e) {
     if (logUnmatched) {
       askConfirm("Очистить ленту?", "Строки трафика без правила исчезнут с экрана.", "Очистить", true, () => {
         frozen = [];
-        if (!DEMO) post("/api/direct/clear").then(() => { directState.events = []; directState.gen = 0; fillLog(); }).catch((err) => showToast(err.message));
+        directShownSeq = ++directSeq;
+        if (!DEMO) post("/api/direct/clear").then(() => { directShownSeq = ++directSeq; directState.events = []; directState.gen = 0; fillLog(); }).catch((err) => showToast(err.message));
         else { directState.events = []; fillLog(); }
       });
       return;

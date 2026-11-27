@@ -1,8 +1,11 @@
 package engine
 
 import (
+	"fmt"
 	"reflect"
+	"sync"
 	"testing"
+	"time"
 
 	"ashgate/internal/config"
 	"ashgate/internal/packet"
@@ -73,9 +76,12 @@ func TestDirectMarksSystem(t *testing.T) {
 		t.Fatal(err)
 	}
 	e.HandlePacket(pkt, Meta{}, true)
-	procs, _, _ := e.DirectSnapshot()
+	procs, evs, _ := e.DirectSnapshot()
 	if len(procs) != 1 || !procs[0].System {
 		t.Fatalf("procs %+v", procs)
+	}
+	if len(evs) != 0 {
+		t.Fatalf("system process polluted unmatched event feed: %+v", evs)
 	}
 }
 
@@ -191,4 +197,194 @@ func TestClearDirectEvents(t *testing.T) {
 	if len(procs) != 1 {
 		t.Fatalf("clear removed the programs: %+v", procs)
 	}
+	// After clear, throttle map must be reset so the same destination logs again immediately.
+	e.HandlePacket(pkt, Meta{}, true)
+	// First packet on cached directUDP won't re-record; a fresh source port triggers record().
+	pkt2, err := packet.BuildUDP(packet.V4(10, 0, 0, 9, 40031), packet.V4(1, 2, 3, 4, 123), []byte{2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.HandlePacket(pkt2, Meta{}, true)
+	_, evs2, _ := e.DirectSnapshot()
+	if len(evs2) != 1 {
+		t.Fatalf("expected immediate re-log after clear, got %d events", len(evs2))
+	}
+}
+
+func TestAgeMapRotationAndPromotion(t *testing.T) {
+	m := newAgeMap[string, int]()
+	m.set("keep", 1)
+	m.set("drop", 2)
+	m.rotate()
+	if v, ok := m.get("keep"); !ok || v != 1 {
+		t.Fatalf("keep after 1st rotate: (%d, %v)", v, ok)
+	}
+	m.rotate()
+	if v, ok := m.get("keep"); !ok || v != 1 {
+		t.Fatalf("promoted key lost after 2nd rotate: (%d, %v)", v, ok)
+	}
+	if _, ok := m.get("drop"); ok {
+		t.Fatal("untouched key survived 2 rotations")
+	}
+}
+
+func TestDirectTrackerRingWrapThrottleEvictionAndSweep(t *testing.T) {
+	var dt directTracker
+	dt.init()
+	base := time.Date(2026, 11, 27, 12, 0, 0, 0, time.UTC)
+
+	// Ring wrap-around (> maxDirectEvents=200) must keep newest 200 oldest-first.
+	proc := rules.Process{Name: "app.exe", Path: `C:\App\app.exe`, PID: 100}
+	for i := 0; i < maxDirectEvents+25; i++ {
+		dt.record(proc, "TCP", fmt.Sprintf("1.2.3.4:%d", 1000+i), 64, base.Add(time.Duration(i)*time.Millisecond))
+	}
+	procs, evs, _ := dt.snapshot()
+	if len(evs) != maxDirectEvents {
+		t.Fatalf("ring len = %d, want %d", len(evs), maxDirectEvents)
+	}
+	if evs[0].Dest != "1.2.3.4:1025" || evs[len(evs)-1].Dest != fmt.Sprintf("1.2.3.4:%d", 1000+maxDirectEvents+24) {
+		t.Fatalf("ring bounds = [%s .. %s]", evs[0].Dest, evs[len(evs)-1].Dest)
+	}
+	// SampleDests bounded to maxDirectDests=4 with newest destinations.
+	if len(procs) != 1 || len(procs[0].SampleDests) != maxDirectDests {
+		t.Fatalf("sampleDests = %v", procs[0].SampleDests)
+	}
+
+	// Throttle: duplicate (proc, dest) within 2s is suppressed, after 2s is recorded.
+	dt.clearEvents()
+	t0 := base.Add(time.Minute)
+	dt.record(proc, "TCP", "9.9.9.9:443", 100, t0)
+	dt.record(proc, "TCP", "9.9.9.9:443", 100, t0.Add(time.Second))
+	_, evs, _ = dt.snapshot()
+	if len(evs) != 1 {
+		t.Fatalf("throttle failed: got %d events, want 1", len(evs))
+	}
+	dt.record(proc, "TCP", "9.9.9.9:443", 100, t0.Add(directEventEvery))
+	_, evs, _ = dt.snapshot()
+	if len(evs) != 2 {
+		t.Fatalf("post-throttle event missing: got %d", len(evs))
+	}
+
+	// Eviction beyond maxDirectProcs marks evicted entry so fastPath drops stale pointer.
+	firstEntry := dt.procs[rules.NormalizePath(proc.Path)]
+	for i := 0; i < maxDirectProcs+10; i++ {
+		p := rules.Process{Name: fmt.Sprintf("p%d.exe", i), Path: fmt.Sprintf(`C:\Churn\p%d.exe`, i), PID: uint32(200 + i)}
+		dt.record(p, "UDP", "8.8.8.8:443", 50, t0.Add(time.Duration(i+10)*time.Second))
+	}
+	if !firstEntry.evicted.Load() {
+		t.Fatal("evicted entry was not marked evicted")
+	}
+	if got := dt.countRecent(t0.Add(time.Duration(maxDirectProcs+15)*time.Second), 2*time.Minute); got == 0 || got > maxDirectProcs {
+		t.Fatalf("countRecent = %d", got)
+	}
+	// Sweep drops idle entries past directIdle.
+	dt.sweep(t0.Add(20 * time.Minute))
+	procs, _, _ = dt.snapshot()
+	if len(procs) != 0 {
+		t.Fatalf("sweep left %d idle procs", len(procs))
+	}
+}
+
+func TestEvictedDirectEntryReRegistersOnFastPath(t *testing.T) {
+	proc := rules.Process{Name: "active.exe", Path: `C:\Apps\active.exe`, PID: 500}
+	e, _ := newEngine(t, testConfig(), fixedRes{p: proc, ok: true}, &fakeDial{}, nil)
+
+	pkt, err := packet.BuildTCP(packet.V4(10, 0, 0, 9, 45000), packet.V4(1, 2, 3, 4, 80), 0x10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.HandlePacket(pkt, Meta{}, true)
+
+	// Simulate eviction (e.g. > maxDirectProcs churn).
+	e.direct.mu.Lock()
+	for k, entry := range e.direct.procs {
+		entry.evicted.Store(true)
+		delete(e.direct.procs, k)
+	}
+	e.direct.mu.Unlock()
+
+	// Next packet on the cached flow must see evicted=true and re-register active.exe.
+	if res := e.HandlePacket(pkt, Meta{}, true); res.Action != ActionPass {
+		t.Fatalf("action %v", res.Action)
+	}
+	procs, _, _ := e.DirectSnapshot()
+	if len(procs) != 1 || procs[0].Name != "active.exe" || procs[0].Bytes != int64(len(pkt)) {
+		t.Fatalf("re-registered procs = %+v", procs)
+	}
+}
+
+func TestStartUDPNoGhostSubProcOnUnsupportedAndMaxSubProcsEvictsIdle(t *testing.T) {
+	cfg := &config.Config{
+		Proxies:        []config.Proxy{{Name: "http", Type: "http", Address: "127.0.0.1:8080"}},
+		Rules:          []config.Rule{{Process: "app.exe", Action: "proxy", Proxy: "http"}},
+		DNS:            config.DNS{Mode: "original"},
+		UDPUnsupported: "block",
+	}
+	proc := rules.Process{Name: "app.exe", Path: `C:\App\app.exe`, PID: 10}
+	e, _ := newEngine(t, cfg, fixedRes{p: proc, ok: true}, &fakeDial{}, &memInj{})
+	udp, err := packet.BuildUDP(packet.V4(10, 0, 0, 2, 42000), packet.V4(1, 2, 3, 4, 443), []byte("quic"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res := e.HandlePacket(udp, Meta{}, true); res.Action != ActionDrop {
+		t.Fatalf("expected drop on http unsupported udp, got %v", res.Action)
+	}
+	if st := e.RuleStats()["app.exe"]; len(st.Procs) != 0 {
+		t.Fatalf("dropped udp created ghost subProc entry: %+v", st.Procs)
+	}
+
+	// Verify maxSubProcs evicts the oldest idle entry instead of dropping new sub-processes.
+	rs := &ruleStat{}
+	for i := 0; i < maxSubProcs; i++ {
+		p := rules.Process{Name: fmt.Sprintf("s%d.exe", i), Path: fmt.Sprintf(`C:\App\s%d.exe`, i)}
+		sub := rs.procFor(p, rules.MatchChild)
+		if sub == nil {
+			t.Fatalf("procFor returned nil at %d", i)
+		}
+		sub.lastSeen.Store(int64(1000 + i))
+	}
+	newer := rs.procFor(rules.Process{Name: "newest.exe", Path: `C:\App\newest.exe`}, rules.MatchChild)
+	if newer == nil {
+		t.Fatal("procFor failed to evict oldest idle sub-process")
+	}
+	if _, stillOldest := rs.procs[`c:\app\s0.exe`]; stillOldest {
+		t.Fatal("oldest idle sub-process was not evicted")
+	}
+}
+
+func TestDirectTrackerConcurrentRace(t *testing.T) {
+	cfg := testConfig()
+	proc := rules.Process{Name: "race.exe", Path: `C:\Apps\race.exe`, PID: 77}
+	e, _ := newEngine(t, cfg, fixedRes{p: proc, ok: true}, &fakeDial{}, &memInj{})
+
+	var wg sync.WaitGroup
+	wg.Add(4)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 60; i++ {
+			pkt, _ := packet.BuildUDP(packet.V4(10, 0, 0, 2, uint16(43000+i%10)), packet.V4(1, 2, 3, 4, uint16(5000+i%5)), []byte("x"))
+			e.HandlePacket(pkt, Meta{}, true)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 40; i++ {
+			_, _, _ = e.DirectSnapshot()
+			_ = e.DirectCount(time.Now(), 2*time.Minute)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 20; i++ {
+			e.ClearDirectEvents()
+			e.direct.sweep(time.Now())
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 15; i++ {
+			_ = e.Apply(cfg)
+		}
+	}()
+	wg.Wait()
 }

@@ -127,6 +127,14 @@ func (s *Session) DirectSnapshot() ([]engine.DirectProc, []logbuf.Event, uint64)
 	return s.eng.DirectSnapshot()
 }
 
+// DirectCount returns the number of non-system unmatched programs active within window.
+func (s *Session) DirectCount(now time.Time, window time.Duration) int {
+	if s == nil || s.eng == nil {
+		return 0
+	}
+	return s.eng.DirectCount(now, window)
+}
+
 // ClearDirectEvents empties the unmatched-traffic feed.
 func (s *Session) ClearDirectEvents() {
 	if s == nil || s.eng == nil {

@@ -94,7 +94,21 @@ func (s *ruleStat) procFor(proc rules.Process, kind string) *subProcStat {
 	sub := s.procs[key]
 	if sub == nil {
 		if len(s.procs) >= maxSubProcs {
-			return nil
+			oldKey := ""
+			var oldest int64
+			for k, p := range s.procs {
+				if p.flows.Load() != 0 {
+					continue
+				}
+				ls := p.lastSeen.Load()
+				if oldKey == "" || ls < oldest {
+					oldest, oldKey = ls, k
+				}
+			}
+			if oldKey == "" {
+				return nil
+			}
+			delete(s.procs, oldKey)
 		}
 		sub = &subProcStat{name: display(proc), path: proc.Path, kind: kind}
 		s.procs[key] = sub

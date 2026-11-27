@@ -387,3 +387,43 @@ func TestCompanionDirOfMask(t *testing.T) {
 		t.Fatalf("mask folder too wide: %+v", d)
 	}
 }
+
+func TestCompanionDirSharedAndNonCDrives(t *testing.T) {
+	// Shared roots on any drive, per-user shared folders, OneDrive folders,
+	// and UNC share roots must not produce a companion folder.
+	reject := []string{
+		`D:\Program Files\Common Files\tool.exe`,
+		`D:\Windows\System32\tool.exe`,
+		`C:\Users\alice\AppData\Local\Programs\launcher.exe`,
+		`C:\Users\alice\AppData\Local\Temp\setup.exe`,
+		`C:\Users\alice\AppData\Local\Microsoft\tool.exe`,
+		`C:\Users\alice\AppData\Local\Packages\tool.exe`,
+		`C:\Users\alice\AppData\Roaming\Microsoft\tool.exe`,
+		`C:\Users\alice\OneDrive\Desktop\portable.exe`,
+		`C:\Users\alice\OneDrive\Downloads\portable.exe`,
+		`C:\Users\Public\tool.exe`,
+		`\\fileserver\share\tool.exe`,
+		`D:\Games\tool.exe`,
+	}
+	for _, p := range reject {
+		if dir := CompanionDir(p); dir != "" {
+			t.Errorf("CompanionDir(%q) = %q, want empty", p, dir)
+		}
+	}
+	// Application-specific folders under those roots are accepted.
+	accept := []struct{ in, want string }{
+		{`C:\Users\alice\AppData\Local\Programs\MyApp\app.exe`, `c:\users\alice\appdata\local\programs\myapp`},
+		{`D:\Games\MyGame\bin\game.exe`, `d:\games\mygame\bin`},
+		{`\\fileserver\share\MyApp\app.exe`, `\\fileserver\share\myapp`},
+	}
+	for _, tc := range accept {
+		if got := CompanionDir(tc.in); got != tc.want {
+			t.Errorf("CompanionDir(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+	// Case-insensitive folder matching.
+	s := Compile([]config.Rule{{Process: `d:\games\launcher\launcher.exe`, Action: "proxy", Proxy: "v"}})
+	if d := s.Match(Process{Name: "HELPER.EXE", Path: `D:\GAMES\LAUNCHER\Bin\HELPER.EXE`}); d.Action != "proxy" || d.MatchKind != MatchFolder {
+		t.Fatalf("case-insensitive folder match: %+v", d)
+	}
+}

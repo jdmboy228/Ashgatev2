@@ -85,11 +85,20 @@ func buildRuleMembers(cfg *config.Config, stats map[string]engine.RuleStat, live
 		}
 		var list []ruleMemberView
 		var comps []*rules.Set
+		seenComp := map[string]bool{}
 		for _, raw := range r.Companions {
 			comp := strings.Trim(strings.TrimSpace(raw), `"`)
 			if comp == "" {
 				continue
 			}
+			ck := procKey("", comp)
+			if rules.IsPath(comp) {
+				ck = rules.NormalizePath(comp)
+			}
+			if seenComp[ck] {
+				continue
+			}
+			seenComp[ck] = true
 			v := ruleMemberView{Name: displayBase(comp), Kind: "companion", Pattern: comp}
 			if rules.IsPath(comp) {
 				v.Path = comp
@@ -100,11 +109,11 @@ func buildRuleMembers(cfg *config.Config, stats map[string]engine.RuleStat, live
 			list = append(list, v)
 			comps = append(comps, rules.Compile([]config.Rule{{Process: comp, Action: "direct"}}))
 		}
-		savedFor := func(m liveMember) int {
+		savedFor := func(name, path string) int {
 			for i, set := range comps {
 				// Only a companion itself, not a process that merely lives in
 				// its folder: that one is a child and keeps its own row.
-				dec := set.Match(rules.Process{Name: m.Name, Path: m.Path})
+				dec := set.Match(rules.Process{Name: name, Path: path})
 				if dec.Action != "" && (dec.MatchKind == rules.MatchExact || dec.MatchKind == rules.MatchCompanion) {
 					return i
 				}
@@ -112,7 +121,7 @@ func buildRuleMembers(cfg *config.Config, stats map[string]engine.RuleStat, live
 			return -1
 		}
 		for _, m := range live[key] {
-			if i := savedFor(m); i >= 0 {
+			if i := savedFor(m.Name, m.Path); i >= 0 {
 				v := &list[i]
 				v.Alive = true
 				if m.Path != "" {
@@ -133,15 +142,24 @@ func buildRuleMembers(cfg *config.Config, stats map[string]engine.RuleStat, live
 			if p.Kind == rules.MatchExact {
 				continue
 			}
-			idx := -1
-			for i := range list {
-				if sameProc(list[i].Path, list[i].Name, p.Path, p.Name) {
-					idx = i
-					break
+			// Match against compiled saved companions first so glob companions
+			// (e.g. app-*\helper.exe) merge stats even when not currently live.
+			idx := savedFor(p.Name, p.Path)
+			if idx < 0 {
+				for i := range list {
+					if sameProc(list[i].Path, list[i].Name, p.Path, p.Name) {
+						idx = i
+						break
+					}
 				}
 			}
 			if idx >= 0 {
-				list[idx].Flows, list[idx].Up, list[idx].Down = p.Flows, p.Up, p.Down
+				list[idx].Flows += p.Flows
+				list[idx].Up += p.Up
+				list[idx].Down += p.Down
+				if list[idx].Path == "" && p.Path != "" {
+					list[idx].Path = p.Path
+				}
 				if list[idx].Kind == "" {
 					list[idx].Kind = memberKind(p.Kind)
 				}
@@ -245,50 +263,6 @@ func sameProc(pathA, nameA, pathB, nameB string) bool {
 	}
 	na := nameKey(nameA)
 	return na != "" && na == nameKey(nameB)
-}
-
-// dirOf is the install folder of a path or mask, normalized. A mask names
-// the folder before its first wildcard.
-func dirOf(p string) string {
-	p = rules.NormalizePath(p)
-	if p == "" {
-		return ""
-	}
-	if i := strings.IndexAny(p, "*?"); i >= 0 {
-		p = p[:i]
-		if j := strings.LastIndex(p, `\`); j >= 0 {
-			p = p[:j]
-		}
-		return strings.TrimSuffix(p, `\`)
-	}
-	if j := strings.LastIndex(p, `\`); j > 0 {
-		return p[:j]
-	}
-	return ""
-}
-
-// commonDirs hold unrelated programs, so a match there says nothing about
-// the application. Mirrors rules' shared-folder list, which is unexported.
-var commonDirs = map[string]bool{
-	`c:`: true, `c:\windows`: true, `c:\windows\system32`: true,
-	`c:\windows\syswow64`: true, `c:\windows\installer`: true,
-	`c:\program files`: true, `c:\program files (x86)`: true,
-	`c:\program files\common files`: true, `c:\program files (x86)\common files`: true,
-	`c:\programdata`: true, `c:\programdata\microsoft`: true, `c:\users`: true,
-}
-
-// genericDir reports a folder too broad to tie a process to one application.
-func genericDir(dir string) bool {
-	if dir == "" || len(dir) < 8 || commonDirs[dir] {
-		return true
-	}
-	if strings.HasPrefix(dir, `c:\users\`) {
-		rest := strings.TrimPrefix(dir, `c:\users\`)
-		if !strings.Contains(rest, `\`) {
-			return true // the profile itself
-		}
-	}
-	return false
 }
 
 // commonVendors sign platforms widely used by many programs; a shared
@@ -405,11 +379,13 @@ func rankCandidates(rule config.Rule, allRules []config.Rule, ruleRunning []rule
 		if v.Path == "" {
 			v.Path = p.Path
 		}
-		if v.PID == 0 {
+		// Prefer the live running process's PID and start time over an older
+		// (possibly exited) PID recorded earlier in directProcs.
+		if p.PID != 0 {
 			v.PID = p.PID
-		}
-		if c.started == 0 {
-			c.started = p.Started
+			if p.Started != 0 {
+				c.started = p.Started
+			}
 		}
 		if len(c.parents) == 0 {
 			c.parents = p.Parents
@@ -435,8 +411,8 @@ func rankCandidates(rule config.Rule, allRules []config.Rule, ruleRunning []rule
 	var ruleDirs []string
 	dirSeen := map[string]bool{}
 	for _, p := range rulePaths {
-		d := dirOf(p)
-		if d == "" || genericDir(d) || dirSeen[d] {
+		d := rules.CompanionDir(p)
+		if d == "" || dirSeen[d] {
 			continue
 		}
 		dirSeen[d] = true
@@ -659,6 +635,7 @@ func (c *controller) refreshHints() {
 		return
 	}
 	c.hintsBusy = true
+	gen := c.hintsGen
 	rs := c.cfg.EffectiveRules()
 	alive := make(map[string]bool, len(c.alive))
 	for k, v := range c.alive {
@@ -737,8 +714,11 @@ func (c *controller) refreshHints() {
 			}
 		}
 		c.mu.Lock()
-		c.hintsCache = hints
-		c.hintsAt, c.hintsBusy = time.Now(), false
+		if c.hintsGen == gen {
+			c.hintsCache = hints
+			c.hintsAt = time.Now()
+		}
+		c.hintsBusy = false
 		c.mu.Unlock()
 	}()
 }

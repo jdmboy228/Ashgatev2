@@ -55,9 +55,10 @@ function apVersionMask(p) {
 function apCompanionError(p) {
   p = String(p || "").trim().replace(/^"+|"+$/g, "");
   if (!p) return "Укажите имя процесса, путь или маску";
-  if (/^svchost\.exe$/i.test(baseName(p))) return "Не указывайте svchost.exe — для системного DNS есть «Системный резолвер» в настройках";
+  if (/^svchost(\.exe)?$/i.test(baseName(p))) return "Не указывайте svchost.exe — для системного DNS есть «Системный резолвер» в настройках";
   if (/[*?]/.test(p)) {
-    const rest = p.toLowerCase().replace(/[*?]/g, "").replace(/\.exe/g, "").replace(/[\\/.]/g, "");
+    let rest = p.toLowerCase().replace(/^[a-z?*]:/i, "");
+    rest = rest.replace(/[*?]/g, "").replace(/\.exe/g, "").replace(/[\\/.]/g, "");
     if (!rest) return "Маска совпадает со всеми программами";
   }
   return "";
@@ -450,10 +451,10 @@ function apRuleHTML(i, inGroup) {
 // apSubListHTML is the drawer under a rule: its saved companions and the
 // processes it catches. It is a view of live data, not part of config.
 function apSubListHTML(i, members) {
-  return `<div class="ap-sublist">${members.map((m) => apSubRowHTML(i, m)).join("")}
+  return `<div class="ap-sublist">${members.map((m, idx) => apSubRowHTML(i, m, idx)).join("")}
     <button type="button" class="ap-sub-add" data-act="ap-companions" data-i="${i}">${icon("plus", 14)}Подключить процесс / Найти трафик…</button></div>`;
 }
-function apSubRowHTML(i, m) {
+function apSubRowHTML(i, m, idx) {
   const kind = m.kind === "companion" || m.kind === "folder" ? m.kind : "child";
   const origin = kind === "companion" ? "привязан" : kind === "folder" ? "папка" : "дочерний";
   const label = m.name || apLabel(m.path || m.pattern || "");
@@ -462,6 +463,10 @@ function apSubRowHTML(i, m) {
   if (m.flows > 0 || (m.up || 0) + (m.down || 0) > 0) {
     stateText = `${m.flows ? m.flows + " пот. · " : ""}${fmtBytes((m.up || 0) + (m.down || 0))}`;
   } else stateText = m.alive ? "запущен" : "не запущен";
+  // Live traffic goes into apTele so an open drawer updates in place without
+  // rebuilding #ap-body every second (which would swallow clicks).
+  const teleKey = `m:${i}:${idx}`;
+  apTele[teleKey] = esc(stateText);
   const maskBtn = kind === "companion" && m.mask
     ? `<button type="button" class="ap-sub-mask" data-act="ap-sub-mask" data-i="${i}" data-pat="${esc(m.pattern || m.path || m.name || "")}" data-mask="${esc(m.mask)}" title="Обобщить путь для обновлений: ${esc(m.mask)}">версия</button>`
     : "";
@@ -472,7 +477,7 @@ function apSubRowHTML(i, m) {
     <span class="ap-sub-ic">${appIconHTML(full, "width:20px;height:20px;border-radius:6px;font-size:9px")}</span>
     <span class="ap-sub-nm" title="${esc(full)}">${esc(label)}</span>
     <em class="ap-origin ${kind === "companion" ? "bound" : kind === "folder" ? "folder" : "child"}">${origin}</em>
-    <span class="ap-sub-traffic">${esc(stateText)}</span>
+    <span class="ap-sub-traffic" data-tele="${teleKey}"></span>
     ${maskBtn}${remove}
   </div>`;
 }
@@ -974,7 +979,7 @@ function apWindowsHTML() {
 function apEditHTML() {
   const m = modal;
   const r = cfg().rules[m.index] || {};
-  const n = (r.companions || []).length || apRuleMembers(r).length;
+  const n = (r.companions || []).length;
   return `<div class="scrim"><form class="dialog narrow ap-dlg" id="dlg">
     <div class="ap-dlg-h"><span class="ic">${icon("edit", 16)}</span><div><h2>Путь процесса</h2><div class="dsub">${esc(apLabel(r.process))}</div></div></div>
     <div class="body"><label class="lbl" for="ap-edit-v">Имя файла, путь или маска</label>
@@ -1028,6 +1033,7 @@ function apOpenCompanions(i) {
     fetching: false,
     error: "",
     candidates: [],
+    candSig: "",
     showAll: false,
     capture: false,
     baseline: null,
@@ -1053,18 +1059,40 @@ function apLoadCompanions(m) {
   getJSON("/api/companions/candidates?rule=" + encodeURIComponent(apKey(r.process)))
     .then((res) => {
       if (modal !== m) return;
-      m.candidates = res && Array.isArray(res.candidates) ? res.candidates : [];
+      const next = res && Array.isArray(res.candidates) ? res.candidates : [];
+      const wasLoading = m.loading;
+      const hadErr = !!m.error;
+      m.candidates = next;
       m.loading = false;
       m.error = "";
-      renderModal();
+      if (m.capture && m.baseline === null) m.baseline = apBaselineOf(next);
+      const sig = JSON.stringify(next);
+      if (!wasLoading && !hadErr && sig === m.candSig) return;
+      m.candSig = sig;
+      if (!apPatchRadar(m)) renderModal();
     })
     .catch((err) => {
       if (modal !== m) return;
       m.loading = false;
       m.error = err.message || "Не удалось получить список";
-      renderModal();
+      if (!apPatchRadar(m)) renderModal();
     })
     .finally(() => { m.fetching = false; });
+}
+// apPatchRadar updates only the radar list and counter inside the open
+// companions dialog so 1.5 s refreshes never destroy the manual input field.
+function apPatchRadar(m) {
+  const dlg = document.getElementById("dlg");
+  if (!dlg || !dlg.classList.contains("ap-comp-dlg")) return false;
+  const list = dlg.querySelector(".ap-radar-list");
+  const cnt = dlg.querySelector("[data-radar-count]");
+  if (!list || !cnt) return false;
+  const cands = apRadarCandidates(m);
+  cnt.textContent = String(cands.length);
+  const capBtn = dlg.querySelector('[data-act="ap-radar-capture"]');
+  if (capBtn) capBtn.disabled = !!(m.loading && !(m.candidates || []).length);
+  setHTML(list, apRadarRowsHTML(m, cands));
+  return true;
 }
 function apBaselineOf(cands) {
   const out = {};
@@ -1096,6 +1124,7 @@ function apCompanionModalClick(id, act) {
   if (!m || m.kind !== "ap-companions") return;
   switch (id) {
     case "ap-radar-capture":
+      if (m.loading && !(m.candidates || []).length) return;
       m.capture = !m.capture;
       m.baseline = m.capture ? apBaselineOf(m.candidates || []) : null;
       return renderModal();
@@ -1175,19 +1204,21 @@ function apAttachedHTML(m, r) {
   return `<div class="ap-comp-sec"><div class="ap-sec-h"><span class="t">Привязанные процессы</span><span class="c">${list.length}</span></div>
     ${rows || `<div class="ap-none">Пока нет привязанных процессов</div>`}</div>`;
 }
+function apRadarRowsHTML(m, cands) {
+  if (m.loading && !(m.candidates || []).length) return `<div class="ap-none">Ищу программы, которые ходят напрямую…</div>`;
+  if (m.error) return `<div class="ap-none">${esc(m.error)}</div>`;
+  if (!cands.length) {
+    return `<div class="ap-none">Ничего не найдено. Включите «Показать системные и без трафика» или нажмите «Засечь новый трафик» и откройте программу.</div>`;
+  }
+  return cands.map((c) => apRadarItemHTML(m, c)).join("");
+}
 function apRadarHTML(m) {
   const cands = apRadarCandidates(m);
-  let rows;
-  if (m.loading && !(m.candidates || []).length) rows = `<div class="ap-none">Ищу программы, которые ходят напрямую…</div>`;
-  else if (m.error) rows = `<div class="ap-none">${esc(m.error)}</div>`;
-  else if (!cands.length) {
-    rows = `<div class="ap-none">Ничего не найдено. Включите «Показать системные и без трафика» или нажмите «Засечь новый трафик» и откройте программу.</div>`;
-  } else {
-    rows = cands.map((c) => apRadarItemHTML(m, c)).join("");
-  }
-  return `<div class="ap-comp-sec"><div class="ap-sec-h"><span class="t">Радар: идут напрямую сейчас</span><span class="c">${cands.length}</span></div>
+  const rows = apRadarRowsHTML(m, cands);
+  const capDis = m.loading && !(m.candidates || []).length ? " disabled" : "";
+  return `<div class="ap-comp-sec"><div class="ap-sec-h"><span class="t">Радар: идут напрямую сейчас</span><span class="c" data-radar-count>${cands.length}</span></div>
     <div class="ap-radar-head">
-      <button type="button" class="btn sm${m.capture ? " pri ap-capture-on" : ""}" data-act="ap-radar-capture">${icon(m.capture ? "pause" : "activity", 14)}${m.capture ? "Остановить замер" : "Засечь новый трафик"}</button>
+      <button type="button" class="btn sm${m.capture ? " pri ap-capture-on" : ""}" data-act="ap-radar-capture"${capDis}>${icon(m.capture ? "pause" : "activity", 14)}${m.capture ? "Остановить замер" : "Засечь новый трафик"}</button>
       <button type="button" class="ap-radar-check${m.showAll ? " on" : ""}" data-act="ap-radar-all" role="checkbox" aria-checked="${m.showAll ? "true" : "false"}">${icon(m.showAll ? "checkbox" : "square", 16)}<span>Показать системные и без трафика</span></button>
     </div>
     <div class="ap-radar-list">${rows}</div>
@@ -1200,13 +1231,16 @@ function apRadarItemHTML(m, c) {
   const delta = m.capture && (c.dBytes > 0 || c.dConns > 0)
     ? `<span class="ap-delta">${c.dBytes > 0 ? "+" + fmtBytes(c.dBytes) : ""}${c.dBytes > 0 && c.dConns > 0 ? " · " : ""}${c.dConns > 0 ? "+" + c.dConns + " соед." : ""}</span>`
     : "";
+  const action = c.system
+    ? `<em class="ap-origin sys" title="Системные процессы Windows не привязываются к правилам приложений">системный</em>`
+    : `<button type="button" class="btn sm pri" data-act="ap-radar-attach" data-pat="${esc(c.mask || c.path || c.name || "")}">+ Подключить</button>`;
   return `<div class="ap-radar-item${c.system ? " sys" : ""}${m.capture && (c.dBytes > 0 || c.dConns > 0) ? " hot" : ""}">
     ${appIconHTML(full || name, "width:28px;height:28px;border-radius:7px;font-size:11px")}
     <div class="txt"><span class="nm">${esc(name)}</span>${full ? `<span class="sub" title="${esc(full)}">${esc(full)}</span>` : ""}
       ${reasons ? `<span class="ap-reasons ap-comp-chips">${reasons}</span>` : ""}
       ${c.otherRule ? `<span class="ap-other">уже в правиле «${esc(apLabel(c.otherRule))}»</span>` : ""}</div>
     <div class="ap-radar-tr">${c.conns || 0} соед. · ${fmtBytes(c.bytes || 0)}${delta}</div>
-    <button type="button" class="btn sm pri" data-act="ap-radar-attach" data-pat="${esc(c.mask || c.path || c.name || "")}">+ Подключить</button>
+    ${action}
   </div>`;
 }
 function apManualHTML(m) {
@@ -1230,7 +1264,7 @@ function apInput(el) {
   switch (el.id) {
     case "ap-add-q": m.q = el.value; apAutoPath(m); return true;
     case "ap-add-path":
-      if (el.value !== m.path) { m.path = el.value; m.auto = false; }
+      if (el.value !== m.path) { m.path = el.value; m.auto = false; m.exact = ""; }
       return true;
     case "ap-add-route":
     case "ap-gnew-route": { const r = apReadRoute(el.id); m.action = r.action; m.proxy = r.proxy; return false; }
@@ -1250,7 +1284,7 @@ function apReadModal() {
     const q = v("ap-add-q");
     const p = v("ap-add-path");
     if (q !== null) modal.q = q;
-    if (p !== null && p !== modal.path) { modal.path = p; modal.auto = false; }
+    if (p !== null && p !== modal.path) { modal.path = p; modal.auto = false; modal.exact = ""; }
     if (document.getElementById("ap-add-route")) { const r = apReadRoute("ap-add-route"); modal.action = r.action; modal.proxy = r.proxy; }
   } else if (modal.kind === "ap-group") {
     const n = v("ap-gnew-name");

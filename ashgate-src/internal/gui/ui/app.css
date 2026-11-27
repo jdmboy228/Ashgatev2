@@ -490,7 +490,7 @@ table.table { min-width: 560px; }
 .ap-folder { border-radius: 8px; background: var(--neutral); display: grid; place-items: center; color: var(--tx); }
 .ap-name { min-width: 0; flex: 1; display: flex; flex-direction: column; }
 .ap-name .nm { display: flex; align-items: center; gap: 8px; min-width: 0; font-weight: 600; color: var(--tx); overflow: hidden; }
-.ap-name .nm > span { flex: 0 0 auto; max-width: 70%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ap-name .nm > span { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* An error badge matters more than the children chip. */
 .ap-name .nm:has(em.bad) .chip { display: none; }
 .ap-name em.bad { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-style: normal; font-size: 12px; line-height: 16px; font-weight: 400; padding: 2px 8px; border-radius: 8px; color: var(--err); background: var(--err-bg); }
@@ -868,16 +868,17 @@ table.table { min-width: 560px; }
 }
 .ap-members > .ap-unit-wrap > .ap-sublist { background: transparent; border: 0; border-top: 1px solid var(--div); padding-left: 44px; }
 .ap-sub-row {
-  display: grid; grid-template-columns: 20px minmax(0, 1fr) auto auto auto auto; gap: 8px; align-items: center;
+  display: flex; gap: 8px; align-items: center;
   min-height: 30px; padding: 2px 6px; border-radius: 8px; min-width: 0;
 }
 .ap-sub-row:hover { background: var(--sub-h); }
-.ap-sub-ic { display: flex; align-items: center; justify-content: center; flex: none; min-width: 0; }
-.ap-sub-nm { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--tx); font-size: 13px; }
+.ap-sub-ic { display: flex; align-items: center; justify-content: center; flex: none; width: 20px; }
+.ap-sub-nm { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--tx); font-size: 13px; }
 .ap-origin { flex: none; font-style: normal; font-size: 11px; line-height: 16px; height: 18px; padding: 0 7px; border-radius: 9px; white-space: nowrap; }
 .ap-origin.bound { color: var(--c-teal); background: #3DD6C41F; }
 .ap-origin.child { color: var(--c-blue); background: #4CC2FF1F; }
 .ap-origin.folder { color: var(--c-orange); background: #FF7A451F; }
+.ap-origin.sys { color: var(--tx3); background: var(--neutral); }
 .ap-sub-traffic { flex: none; font-size: 12px; line-height: 16px; color: var(--tx3); white-space: nowrap; font-variant-numeric: tabular-nums; }
 .ap-sub-mask {
   flex: none; height: 20px; padding: 0 7px; border-radius: 8px; border: 1px solid var(--stroke);
@@ -900,7 +901,7 @@ table.table { min-width: 560px; }
 }
 @container page (max-width: 519.98px) {
   .ap-sublist, .ap-members > .ap-unit-wrap > .ap-sublist { padding-left: 8px; padding-right: 8px; }
-  .ap-sub-row { grid-template-columns: 20px minmax(0, 1fr) auto auto; }
+  .ap-sub-row .ap-origin { display: none; }
 }
 
 /* ---- proactive hint bar under a quiet rule ---- */

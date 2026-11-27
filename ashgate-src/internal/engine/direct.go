@@ -110,6 +110,7 @@ type directProcEntry struct {
 	firstSeen   int64
 	sampleDests []string
 	system      bool
+	evicted     atomic.Bool
 	conns       atomic.Int64
 	bytes       atomic.Int64
 	lastSeen    atomic.Int64
@@ -207,23 +208,25 @@ func (t *directTracker) record(proc rules.Process, proto, dest string, pktBytes 
 	e.lastSeen.Store(nowMs)
 	e.addDest(dest)
 
-	evKey := directEvKey{proc: key, dest: dest}
-	prev, seen := t.lastEv[evKey]
-	if !seen || nowMs-prev >= directEventEvery.Milliseconds() {
-		if !seen && len(t.lastEv) >= maxDirectEvKeys {
-			clear(t.lastEv)
+	if !e.system {
+		evKey := directEvKey{proc: key, dest: dest}
+		prev, seen := t.lastEv[evKey]
+		if !seen || nowMs-prev >= directEventEvery.Milliseconds() {
+			if !seen && len(t.lastEv) >= maxDirectEvKeys {
+				clear(t.lastEv)
+			}
+			t.lastEv[evKey] = nowMs
+			t.pushEventLocked(logbuf.Event{
+				Time:    now,
+				Process: display(proc),
+				Path:    proc.Path,
+				PID:     proc.PID,
+				Proto:   proto,
+				Dest:    dest,
+				Via:     "direct",
+				Status:  "unmatched",
+			})
 		}
-		t.lastEv[evKey] = nowMs
-		t.pushEventLocked(logbuf.Event{
-			Time:    now,
-			Process: display(proc),
-			Path:    proc.Path,
-			PID:     proc.PID,
-			Proto:   proto,
-			Dest:    dest,
-			Via:     "direct",
-			Status:  "unmatched",
-		})
 	}
 	return e
 }
@@ -240,6 +243,9 @@ func (t *directTracker) evictOldestLocked() {
 		}
 	}
 	if oldKey != "" {
+		if old := t.procs[oldKey]; old != nil {
+			old.evicted.Store(true)
+		}
 		delete(t.procs, oldKey)
 	}
 }
@@ -267,6 +273,7 @@ func (t *directTracker) pruneMatched(rs *rules.Set) {
 	defer t.mu.Unlock()
 	for k, e := range t.procs {
 		if rs.Match(rules.Process{Name: e.name, Path: e.path}).Action != "" {
+			e.evicted.Store(true)
 			delete(t.procs, k)
 		}
 	}
@@ -282,9 +289,36 @@ func (t *directTracker) sweep(now time.Time) {
 	for k, e := range t.procs {
 		last := time.UnixMilli(e.lastSeen.Load())
 		if now.Sub(last) > directIdle {
+			e.evicted.Store(true)
 			delete(t.procs, k)
 		}
 	}
+}
+
+// countRecent counts non-system unmatched programs active within window,
+// without allocating or copying the event ring.
+func (t *directTracker) countRecent(now time.Time, window time.Duration) int {
+	if t == nil {
+		return 0
+	}
+	nowMs := now.UnixMilli()
+	winMs := window.Milliseconds()
+	t.mu.Lock()
+	n := 0
+	for _, e := range t.procs {
+		if e.system {
+			continue
+		}
+		ls := e.lastSeen.Load()
+		if ls <= 0 {
+			continue
+		}
+		if age := nowMs - ls; age >= 0 && age <= winMs {
+			n++
+		}
+	}
+	t.mu.Unlock()
+	return n
 }
 
 // snapshot returns the programs (newest first, then by traffic), the events
@@ -294,7 +328,6 @@ func (t *directTracker) snapshot() ([]DirectProc, []logbuf.Event, uint64) {
 		return nil, nil, 0
 	}
 	t.mu.Lock()
-	defer t.mu.Unlock()
 	var procs []DirectProc
 	if len(t.procs) > 0 {
 		procs = make([]DirectProc, 0, len(t.procs))
@@ -312,6 +345,11 @@ func (t *directTracker) snapshot() ([]DirectProc, []logbuf.Event, uint64) {
 				System:      e.system,
 			})
 		}
+	}
+	evs := t.recentEventsLocked()
+	gen := t.gen
+	t.mu.Unlock()
+	if len(procs) > 1 {
 		sort.Slice(procs, func(i, j int) bool {
 			if procs[i].LastSeen != procs[j].LastSeen {
 				return procs[i].LastSeen > procs[j].LastSeen
@@ -322,7 +360,7 @@ func (t *directTracker) snapshot() ([]DirectProc, []logbuf.Event, uint64) {
 			return procs[i].Name < procs[j].Name
 		})
 	}
-	return procs, t.recentEventsLocked(), t.gen
+	return procs, evs, gen
 }
 
 // recentEventsLocked copies the ring oldest first. Callers hold t.mu.
@@ -345,7 +383,7 @@ func (t *directTracker) recentEventsLocked() []logbuf.Event {
 	return out
 }
 
-// clearEvents empties the feed and bumps its generation.
+// clearEvents empties the feed, resets its throttle map, and bumps its generation.
 func (t *directTracker) clearEvents() {
 	if t == nil {
 		return
@@ -357,6 +395,7 @@ func (t *directTracker) clearEvents() {
 	}
 	t.pos = 0
 	t.full = false
+	clear(t.lastEv)
 	t.gen++
 }
 
@@ -366,6 +405,14 @@ func (e *Engine) DirectSnapshot() ([]DirectProc, []logbuf.Event, uint64) {
 		return nil, nil, 0
 	}
 	return e.direct.snapshot()
+}
+
+// DirectCount returns the number of non-system unmatched programs active within window.
+func (e *Engine) DirectCount(now time.Time, window time.Duration) int {
+	if e == nil {
+		return 0
+	}
+	return e.direct.countRecent(now, window)
 }
 
 // ClearDirectEvents empties the unmatched-traffic feed.

@@ -1234,6 +1234,16 @@ func TestCompanionCandidatesAPI(t *testing.T) {
 	if rr.Code != http.StatusNotFound {
 		t.Fatalf("unknown rule: %d", rr.Code)
 	}
+
+	postReq := httptest.NewRequest(http.MethodPost, "/api/companions/candidates?rule="+url.QueryEscape(key), strings.NewReader("{}"))
+	postReq.Host = "127.0.0.1:5000"
+	postReq.Header.Set(tokenHeader, c.token)
+	postReq.Header.Set("Content-Type", "application/json")
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, postReq)
+	if rr.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("POST candidates: %d, want 405", rr.Code)
+	}
 }
 
 func TestDirectAPI(t *testing.T) {

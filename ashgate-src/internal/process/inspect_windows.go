@@ -90,6 +90,9 @@ func (ins *Inspector) FileMetadata(path string) FileMeta {
 	meta.Company, meta.Product, meta.Description = readVersionStrings(path)
 
 	ins.mu.Lock()
+	if ins.files == nil {
+		ins.files = make(map[string]metaCacheEntry)
+	}
 	if len(ins.files) >= maxMetaCacheEntries {
 		clear(ins.files)
 	}
@@ -100,6 +103,8 @@ func (ins *Inspector) FileMetadata(path string) FileMeta {
 
 // CommandLine returns the command line of a running process using only
 // PROCESS_QUERY_LIMITED_INFORMATION (Windows 8.1+). Returns "" on failure.
+// When started is non-zero, it is compared against the process creation time
+// so a reused PID never returns another process's command line.
 func (ins *Inspector) CommandLine(pid uint32, started int64) string {
 	if pid <= 4 {
 		return ""
@@ -114,9 +119,12 @@ func (ins *Inspector) CommandLine(pid uint32, started int64) string {
 	}
 	ins.mu.Unlock()
 
-	cmd := queryCommandLine(pid)
+	cmd, _ := queryCommandLineErr(pid, started)
 
 	ins.mu.Lock()
+	if ins.cmds == nil {
+		ins.cmds = make(map[cmdCacheKey]cmdCacheEntry)
+	}
 	if len(ins.cmds) >= maxCmdCacheEntries {
 		for k, v := range ins.cmds {
 			if now.Sub(v.at) >= cmdCacheTTL {
@@ -151,7 +159,7 @@ const (
 	cmsgSignerInfoParam                  = 6
 	certNameSimpleDisplayType            = 4
 	processCommandLineInformation        = 60
-	maxCommandLineBufferBytes            = 64 * 1024
+	maxCommandLineBufferBytes            = 128 * 1024
 )
 
 // cmsgSignerInfoHead matches the leading fields of WinCrypt CMSG_SIGNER_INFO.
@@ -297,9 +305,13 @@ func readVersionStrings(path string) (company, product, desc string) {
 
 	prefixes := []string{"040904b0", "040904e4"}
 	if transPtr, transLen, ok := verQuery(buf, `\VarFileInfo\Translation`); ok && transLen >= 4 {
-		lang := *(*uint16)(transPtr)
-		cp := *(*uint16)(unsafe.Add(transPtr, 2))
-		prefixes = append([]string{fmt.Sprintf("%04x%04x", lang, cp)}, prefixes...)
+		var fromTable []string
+		for off := uintptr(0); off+4 <= uintptr(transLen) && len(fromTable) < 16; off += 4 {
+			lang := *(*uint16)(unsafe.Add(transPtr, off))
+			cp := *(*uint16)(unsafe.Add(transPtr, off+2))
+			fromTable = append(fromTable, fmt.Sprintf("%04x%04x", lang, cp))
+		}
+		prefixes = append(fromTable, prefixes...)
 	}
 
 	queryField := func(field string) string {
@@ -335,21 +347,28 @@ func verQuery(buf []byte, subBlock string) (unsafe.Pointer, uint32, bool) {
 	return ptr, length, true
 }
 
-// queryCommandLine fetches a process's command line via ProcessCommandLineInformation.
-func queryCommandLine(pid uint32) string {
-	cmd, _ := queryCommandLineErr(pid)
-	return cmd
-}
-
 // queryCommandLineErr queries ProcessCommandLineInformation using the canonical
 // two-step size probe (required on Windows Server builds where an oversized or
-// static buffer fails with STATUS_INFO_LENGTH_MISMATCH).
-func queryCommandLineErr(pid uint32) (string, error) {
+// static buffer fails with STATUS_INFO_LENGTH_MISMATCH). When started > 0, it
+// verifies the process creation time matches started to guard against PID reuse.
+func queryCommandLineErr(pid uint32, started int64) (string, error) {
+	if pid <= 4 {
+		return "", fmt.Errorf("system pid %d", pid)
+	}
 	h, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
 	if err != nil {
 		return "", fmt.Errorf("OpenProcess(%d): %w", pid, err)
 	}
 	defer windows.CloseHandle(h)
+
+	if started != 0 {
+		var create, exit, kernel, user windows.Filetime
+		if err := windows.GetProcessTimes(h, &create, &exit, &kernel, &user); err == nil {
+			if ct := create.Nanoseconds(); ct != 0 && ct != started {
+				return "", fmt.Errorf("pid %d reused (created=%d want=%d)", pid, ct, started)
+			}
+		}
+	}
 
 	const headerSize = uint32(unsafe.Sizeof(windows.NTUnicodeString{}))
 	var retLen uint32
@@ -395,8 +414,8 @@ func queryCommandLineErr(pid uint32) (string, error) {
 	end := base + uintptr(len(buf))
 	ptr := uintptr(unsafe.Pointer(us.Buffer))
 	byteLen := uintptr(us.Length)
-	if ptr < base || ptr+byteLen > end {
+	if ptr < base || ptr > end || byteLen > end-ptr {
 		return "", fmt.Errorf("out-of-bounds buffer ptr=%x range=[%x,%x) len=%d", ptr, base, end, byteLen)
 	}
-	return strings.TrimSpace(us.String()), nil
+	return strings.TrimSpace(windows.UTF16ToString(unsafe.Slice((*uint16)(us.Buffer), us.Length/2))), nil
 }
