@@ -117,13 +117,58 @@ function clientUnit() {
 function clientRule(): any {
   return readConfig().rules.find((r: any) => /ashgate-e2e-client/i.test(String(r.process)));
 }
+// Rule and group menus are portal popovers: they are drawn in #ap-portal on
+// <body>, never inside a card, so a card's overflow or a scrolled list can
+// never clip them.
+function portalMenu() {
+  return page.locator("#ap-portal .ap-pop.menu");
+}
+async function closePortal() {
+  if (await page.locator("#ap-portal:visible").count()) {
+    await page.keyboard.press("Escape");
+    await expect(page.locator("#ap-portal"), "Escape did not close the portal menu").toBeHidden();
+  }
+}
+// dismissMenus closes an open row menu and portal popover: Escape closes the
+// row menu first, so it may take two presses.
+async function dismissMenus() {
+  for (let i = 0; i < 2; i++) {
+    if (!(await page.locator("#menu:visible").count()) && !(await page.locator("#ap-portal:visible").count())) return;
+    await page.keyboard.press("Escape");
+  }
+}
+// ruleUnit is one rule's wrapper; the companion drawer is its sibling, so it
+// is found from the wrapper and not from the card.
+function ruleUnit(name: string) {
+  return page.locator(".ap-unit-wrap", { has: page.locator(".ap-card:not(.group)", { hasText: name }) }).first();
+}
+// activeOrder is the text of the active units in display order: the page
+// sorts them by tier (traffic, waiting, not running), alphabetically inside
+// a tier, so no timer can shuffle equal cards.
+async function activeOrder(): Promise<string[]> {
+  return page.locator('[data-ap-list="active"] > [data-unit-key]').evaluateAll((els) =>
+    els.map((e) => (e.textContent || "").toLowerCase().replace(/\s+/g, " ").trim()));
+}
+async function expectAbove(above: string, below: string, why: string) {
+  const order = await activeOrder();
+  const a = order.findIndex((t) => t.includes(above));
+  const b = order.findIndex((t) => t.includes(below));
+  expect(a, `${why}: «${above}» is not in «Активные правила»`).toBeGreaterThanOrEqual(0);
+  expect(b, `${why}: «${below}» is not in «Активные правила»`).toBeGreaterThanOrEqual(0);
+  expect(a, `${why}: «${above}» must sort above «${below}» — ${JSON.stringify(order)}`).toBeLessThan(b);
+}
+// openRuleMenu opens a card's «…» menu (a rule's or a group's) in the portal.
+async function openRuleMenu(card: import("@playwright/test").Locator) {
+  await closePortal();
+  await card.locator('[data-act="ap-menu"]').first().click();
+  await expect(portalMenu(), "the menu did not open in #ap-portal").toBeVisible();
+  return portalMenu();
+}
 async function openCompanions() {
   const card = clientUnit().locator(".ap-card:not(.group)").first();
   await expect(card, "the ashgate-e2e-client rule card is missing").toBeVisible();
-  if (!(await card.locator(".ap-pop.menu").count())) {
-    await card.locator('[data-act="ap-menu"]').click();
-  }
-  const item = card.locator('.ap-pop.menu [data-act="ap-companions"]');
+  const menu = await openRuleMenu(card);
+  const item = menu.locator('[data-act="ap-companions"]');
   await expect(item, "the rule menu has no «Связанные процессы / Найти трафик…» item").toBeVisible();
   await item.click();
   await expect(dlg()).toBeVisible();
@@ -166,6 +211,8 @@ async function liveness(scope: string, label: string) {
   const n = await buttons.count();
   for (let i = 0; i < n; i++) {
     const b = buttons.nth(i);
+    // A menu opened by the previous button must not cover the next one.
+    await dismissMenus();
     if (!(await b.isVisible()) || (await b.isDisabled()) || (await b.evaluate((el, s) => el.matches(s), skip))) continue;
     const name = ((await b.getAttribute("aria-label")) || (await b.innerText()) || (await b.getAttribute("data-act")) || "button").trim();
     let requests = 0;
@@ -187,13 +234,14 @@ async function liveness(scope: string, label: string) {
     page.off("request", onReq);
     page.off("request", onState);
     const mut = await page.evaluate(() => (window as any).__mut as number);
-    const opened = (await dlg().count()) > 0 || (await page.locator("#menu:visible").count()) > 0 || (await page.locator("#toast:visible").count()) > 0;
+    const opened = (await dlg().count()) > 0 || (await page.locator("#menu:visible").count()) > 0 ||
+      (await page.locator("#ap-portal:visible").count()) > 0 || (await page.locator("#toast:visible").count()) > 0;
     if (mut === 0 && requests - stateReqs.length === 0 && !opened) {
       findings.push({ kind: "button does nothing", text: name, where: label });
     }
     // Undo: close what opened, flip switches back.
     if (await dlg().count()) await closeDialog();
-    if (await page.locator("#menu:visible").count()) await page.keyboard.press("Escape");
+    await dismissMenus();
     if (await page.locator("#menu:visible").count()) await page.mouse.click(5, 300);
     if (await b.evaluate((el) => el.matches('.toggle, .ap-switch, [data-act="pause"], [data-act="errors-only"], [data-act="ap-select"]')).catch(() => false)) {
       await b.click().catch(() => {});
@@ -213,8 +261,9 @@ test.describe.serial("Ashgate window", () => {
 
   // A dialog left open by a failed step must not block every later test.
   test.afterEach(async () => {
-    if (page && (await dlg().count())) await closeDialog().catch(() => {});
-    if (page && (await page.locator("#menu:visible").count())) await page.keyboard.press("Escape").catch(() => {});
+    if (!page) return;
+    if (await dlg().count()) await closeDialog().catch(() => {});
+    await dismissMenus().catch(() => {});
   });
 
   test.afterAll(async () => {
@@ -535,6 +584,150 @@ test.describe.serial("Ashgate window", () => {
     expect(app.problems.slice(consoleBefore), "console errors while driving the companions dialog").toEqual([]);
   });
 
+  // There is no manual priority any more: a card's place is its real state
+  // (traffic, running and waiting, not running), and every menu is a portal
+  // popover on <body>, fixed and opaque above the cards.
+  test("apps: tiers, portal menu, no priority controls, process tree", async () => {
+    await nav("rules");
+    const consoleBefore = app.problems.length;
+    const PRIORITY = ['[data-act="ap-up"]', '[data-act="ap-down"]', '[data-act="ap-gup"]', '[data-act="ap-gdown"]'].join(",");
+
+    // The test servers run for the whole UI run; the copied client does not.
+    // One rule is «running and waiting», the other «not running», and the
+    // waiting one must sort above it with no timer and no priority setting.
+    await page.locator('[data-act="ap-add"]').first().click();
+    await expect(dlg()).toBeVisible();
+    await dlg().locator("#ap-add-q").fill("ashgate-e2e-servers");
+    await expect(dlg().locator("#ap-add-path"), "the path found for the name was dropped").toHaveValue(/ashgate-e2e-servers\.exe$/i);
+    const route = dlg().locator("#ap-add-route");
+    const value = await route.locator("option", { hasText: "Подписка e2e" }).first().getAttribute("value");
+    await route.selectOption(value || "");
+    await dlg().locator('button[type="submit"]').click();
+    await expect(dlg()).toHaveCount(0);
+    const servers = ruleUnit("ashgate-e2e-servers");
+    await expect(servers.locator(".ap-card").first()).toBeVisible();
+    await expectAbove("ashgate-e2e-servers", "ashgate-e2e-client", "a running app must sort above a stopped one");
+
+    // No manual priority anywhere: no move buttons, nothing draggable, no
+    // «сверху вниз» / «Перетащите карточку» text.
+    expect(await page.locator(PRIORITY).count(), "priority buttons are back on the Apps page").toBe(0);
+    expect(await page.locator('#page [draggable="true"]').count(), "cards are draggable again").toBe(0);
+    const pageText = (await page.locator("#page").innerText()).toLowerCase();
+    expect(pageText).not.toContain("сверху вниз");
+    expect(pageText).not.toContain("перетащите карточку");
+    await expect(page.locator("#page .ap-pop"), "a popover is rendered inside the page again").toHaveCount(0);
+
+    // The rule menu: fixed, opaque, in #ap-portal, and it wins the hit test
+    // over the card that sits underneath it. The taller window gives the
+    // menu room below its card; «every page renders» put it back anyway.
+    await page.setViewportSize({ width: 1100, height: 1000 });
+    const menu = await openRuleMenu(servers.locator(".ap-card").first());
+    await page.waitForTimeout(300); // the 120 ms opening animation
+    const look = await menu.evaluate((el) => {
+      const cs = getComputedStyle(el);
+      const r = el.getBoundingClientRect();
+      const m = /^rgba?\(([^)]+)\)$/.exec(cs.backgroundColor);
+      const parts = m ? m[1].split(/[ ,/]+/).filter(Boolean) : [];
+      const at = (x: number, y: number) => {
+        const h = document.elementFromPoint(x, y);
+        return h ? { portal: !!h.closest("#ap-portal"), card: !!h.closest(".ap-card"), tag: h.tagName } : null;
+      };
+      const cx = r.left + r.width / 2;
+      return {
+        inPortal: !!el.closest("#ap-portal"), inPage: !!el.closest("#page"),
+        position: cs.position, zIndex: Number(cs.zIndex), opacity: Number(cs.opacity),
+        alpha: parts.length >= 4 ? Number(parts[3]) : 1, bg: cs.backgroundColor,
+        center: at(cx, r.top + r.height / 2), bottom: at(cx, r.bottom - 3),
+      };
+    });
+    expect(look.inPortal, "the menu is not inside #ap-portal").toBe(true);
+    expect(look.inPage, "the menu is still inside #page").toBe(false);
+    expect(look.position, "the menu is not position:fixed").toBe("fixed");
+    expect(look.zIndex, "the menu is below the cards").toBeGreaterThanOrEqual(60);
+    expect(look.opacity, "the menu is translucent").toBe(1);
+    expect(look.alpha, `the menu background ${look.bg} is not opaque`).toBe(1);
+    expect(look.center?.portal, "a click in the middle of the menu hits something else").toBe(true);
+    expect(look.bottom?.portal, "the bottom edge of the menu does not hit the menu").toBe(true);
+
+    // The next card sits under the menu, and the menu must win the hit test
+    // there: the card behind it must not intercept the click.
+    const under = await page.evaluate(() => {
+      const pop = document.querySelector("#ap-portal .ap-pop.menu");
+      const pr = pop!.getBoundingClientRect();
+      let best: { h: number; x: number; y: number; name: string } | null = null;
+      for (const c of Array.from(document.querySelectorAll('[data-ap-list="active"] .ap-card'))) {
+        const r = c.getBoundingClientRect();
+        const top = Math.max(pr.top, r.top);
+        const bottom = Math.min(pr.bottom, r.bottom);
+        const h = bottom - top;
+        if (h < 8) continue;
+        if (best && h <= best.h) continue;
+        const x = Math.min(pr.right - 4, Math.max(pr.left, r.left) + 24);
+        best = { h, x, y: top + Math.min(20, h / 2), name: (c.textContent || "").replace(/\s+/g, " ").slice(0, 40) };
+      }
+      return best;
+    });
+    expect(under, "the open menu covers no card: the overlap cannot be checked").not.toBeNull();
+    const hit = await page.evaluate(({ x, y }) => {
+      const h = document.elementFromPoint(x, y);
+      return h ? { portal: !!h.closest("#ap-portal"), card: !!h.closest(".ap-card"), tag: h.tagName } : null;
+    }, { x: (under as any).x, y: (under as any).y });
+    expect(hit?.portal, `the card «${(under as any).name}» behind the menu wins the hit test (${JSON.stringify(hit)})`).toBe(true);
+    expect(hit?.card).toBe(false);
+
+    // No priority items inside the rule menu either.
+    expect(await menu.locator(PRIORITY).count()).toBe(0);
+    expect(await menu.locator('[draggable="true"]').count()).toBe(0);
+    expect((await menu.innerText()).toLowerCase()).not.toContain("сверху вниз");
+
+    // A telemetry tick must not rebuild the open menu (that replays its
+    // animation and swallows clicks).
+    await menu.evaluate((el) => { (el as any).__keep = "menu"; });
+    await page.waitForTimeout(1200); // at least two state polls
+    expect(await menu.evaluate((el) => (el as any).__keep), "the open menu was rebuilt by a telemetry tick").toBe("menu");
+    await page.keyboard.press("Escape");
+    await expect(page.locator("#ap-portal"), "Escape did not close the rule menu").toBeHidden();
+    await page.setViewportSize({ width: SIZES[0][0], height: SIZES[0][1] });
+
+    // The group menu is the same portal popover and has no priority items.
+    for (const c of await page.locator('.ap-card [data-act="ap-select"]').all()) await c.click();
+    const gnew = page.locator('[data-act="ap-group-new"]').first();
+    await expect(gnew, "no «group» button after selecting two rules").toBeVisible();
+    await gnew.click();
+    await expect(dlg()).toBeVisible();
+    await dlg().locator("#ap-gnew-name").fill("Группа портала");
+    await dlg().locator('button[type="submit"]').click();
+    await expect(dlg()).toHaveCount(0);
+    const gcard = page.locator(".ap-card.group", { hasText: "Группа портала" });
+    await expect(gcard).toBeVisible();
+    const gmenu = await openRuleMenu(gcard);
+    expect(await gmenu.locator(PRIORITY).count(), "priority buttons in the group menu").toBe(0);
+    expect(await gmenu.locator('[draggable="true"]').count()).toBe(0);
+    expect((await gmenu.innerText()).toLowerCase()).not.toContain("сверху вниз");
+    await gmenu.locator('[data-act="ap-gsplit"]').click();
+    await expect(page.locator(".ap-card.group", { hasText: "Группа портала" })).toHaveCount(0);
+
+    // The drawer is a compact process tree: guides, the saved companion
+    // marked «привязан», and its «×» to unbind it.
+    const unit = clientUnit();
+    const pill = unit.locator('[data-act="ap-sub-toggle"]');
+    await expect(pill, "the client rule has no companion pill").toContainText("+1 процесс");
+    await pill.click();
+    const sub = unit.locator(".ap-sublist");
+    await expect(sub).toBeVisible();
+    const row = sub.locator(".ap-sub-row", { hasText: "Ld9BoxHeadless" });
+    await expect(row.locator(".ap-origin"), "the drawer row is not marked «привязан»").toHaveText("привязан");
+    expect(await row.locator(".ap-tree-guides .ap-tc").count(), "the drawer row has no tree guides").toBeGreaterThan(0);
+    await expect(row.locator('button[data-act="ap-sub-remove"]'), "the drawer row has no «×»").toBeVisible();
+    // One live process gets no count chip.
+    await expect(row.locator(".ap-sub-cnt")).toHaveCount(0);
+    await screens("rules-portal-tree");
+    await pill.click();
+    await expect(unit.locator(".ap-sublist")).toHaveCount(0);
+
+    expect(app.problems.slice(consoleBefore), "console errors on the Apps page").toEqual([]);
+  });
+
   test("settings change and save", async () => {
     await nav("settings");
     const toggle = (k: string) => page.locator(`button.toggle[data-act="toggle"][data-key="${k}"]`);
@@ -619,6 +812,31 @@ test.describe.serial("Ashgate window", () => {
       throw new Error("capture did not start: " + text.replace(/\s+/g, " "));
     }
     await screens("page-rules-running");
+    // With capture on, the running app waits for incoming traffic and its
+    // card says so; the stopped app says it is not running, and the waiting
+    // one sorts above it: the three-tier order, judged by real state.
+    await expect(ruleUnit("ashgate-e2e-servers").locator(".ap-tele"), "a running app without traffic must say it waits")
+      .toContainText("Ждёт входящий трафик", { timeout: 30_000 });
+    await expect(ruleUnit("ashgate-e2e-client").locator(".ap-tele"), "a stopped app must say it is not running")
+      .toContainText("Не запущено");
+    await expectAbove("ashgate-e2e-servers", "ashgate-e2e-client", "the waiting app must stay above the stopped one");
+
+    // A group with a waiting app in it waits too.
+    for (const c of await page.locator('.ap-card [data-act="ap-select"]').all()) await c.click();
+    const gnew = page.locator('[data-act="ap-group-new"]').first();
+    await expect(gnew, "no «group» button after selecting two rules").toBeVisible();
+    await gnew.click();
+    await expect(dlg()).toBeVisible();
+    await dlg().locator("#ap-gnew-name").fill("Ждущие e2e");
+    await dlg().locator('button[type="submit"]').click();
+    await expect(dlg()).toHaveCount(0);
+    const gcard = page.locator(".ap-card.group", { hasText: "Ждущие e2e" });
+    await expect(gcard.locator(".ap-tele"), "a group of a waiting app must say it waits").toContainText("Ждёт входящий трафик");
+    // Put the list back for the restart check.
+    const gmenu = await openRuleMenu(gcard);
+    await gmenu.locator('[data-act="ap-gsplit"]').click();
+    await expect(gcard, "the group was not split again").toHaveCount(0);
+
     await page.locator("#side-power").click();
     await expect(page.locator(".side-card.run")).toHaveCount(0, { timeout: 20_000 });
   });

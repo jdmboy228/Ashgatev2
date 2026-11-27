@@ -19,3 +19,13 @@ func List() ([]App, error) { return nil, nil }
 
 // Snapshot is empty outside Windows.
 func Snapshot() []rules.Process { return nil }
+
+// Snapshotter matches the Windows incremental snapshotter; outside Windows
+// there is nothing to cache.
+type Snapshotter struct{}
+
+// NewSnapshotter returns an empty Snapshotter.
+func NewSnapshotter() *Snapshotter { return &Snapshotter{} }
+
+// Snapshot is empty outside Windows.
+func (s *Snapshotter) Snapshot() []rules.Process { return Snapshot() }

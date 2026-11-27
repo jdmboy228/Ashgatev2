@@ -27,13 +27,68 @@ type ruleMemberView struct {
 	Path    string `json:"path,omitempty"`
 	Pattern string `json:"pattern,omitempty"`
 	Kind    string `json:"kind"` // "companion" | "auto" | "child" | "folder"
-	Alive   bool   `json:"alive"`
-	Flows   int64  `json:"flows"`
-	Up      int64  `json:"up"`
-	Down    int64  `json:"down"`
-	Mask    string `json:"mask,omitempty"`
+	PID     uint32 `json:"pid,omitempty"`
+	PPID    uint32 `json:"ppid,omitempty"`
+	// ParentPID and ParentKey describe the nearest member ancestor: the PID
+	// itself, and its normalized procKey. ParentKey is empty for a direct
+	// child of the rule's root or when no member ancestor exists, so the page
+	// can always build an acyclic tree.
+	ParentPID uint32 `json:"parentPid,omitempty"`
+	ParentKey string `json:"parentKey,omitempty"`
+	// Count is how many live instances collapsed into this image row; it is
+	// omitted for a single instance.
+	Count int   `json:"count,omitempty"`
+	Alive bool  `json:"alive"`
+	Flows int64 `json:"flows"`
+	Up    int64 `json:"up"`
+	Down  int64 `json:"down"`
+	Mask  string `json:"mask,omitempty"`
 	// Reason is the signal that auto-attributed the process, if it was.
 	Reason string `json:"reason,omitempty"`
+}
+
+// applyLive copies a live process identity onto a row so the page can draw the
+// process tree. A count of one is left out of the JSON. When merge is true
+// (e.g. a glob companion matched several distinct live images), instance counts
+// sum cleanly and a shallower root attachment wins.
+func (v *ruleMemberView) applyLive(m liveMember, merge bool) {
+	add := m.Count
+	if add <= 0 {
+		add = 1
+	}
+	if !merge {
+		if m.PID != 0 {
+			v.PID = m.PID
+		}
+		if m.PPID != 0 {
+			v.PPID = m.PPID
+		}
+		v.ParentPID = m.ParentPID
+		v.ParentKey = rules.NormalizePath(m.ParentKey)
+		if add > 1 {
+			v.Count = add
+		} else {
+			v.Count = 0
+		}
+		return
+	}
+	prev := v.Count
+	if prev == 0 {
+		prev = 1
+	}
+	if m.PID != 0 && v.PID == 0 {
+		v.PID = m.PID
+	}
+	if m.PPID != 0 && v.PPID == 0 {
+		v.PPID = m.PPID
+	}
+	if v.ParentKey != "" && m.ParentKey == "" {
+		v.ParentPID = m.ParentPID
+		v.ParentKey = ""
+	}
+	if total := prev + add; total > 1 {
+		v.Count = total
+	}
 }
 
 // companionCandidate is a running or recently direct program the user can
@@ -166,6 +221,12 @@ func buildRuleMembers(cfg *config.Config, stats map[string]engine.RuleStat, live
 				if p.Name != "" {
 					v.Name = p.Name
 				}
+				if v.PID == 0 {
+					v.PID = p.PID
+				}
+				if v.PPID == 0 {
+					v.PPID = p.PPID
+				}
 				continue
 			}
 			i := autoFor(p.Name, p.Path)
@@ -188,7 +249,14 @@ func buildRuleMembers(cfg *config.Config, stats map[string]engine.RuleStat, live
 			} else if v.Name == "" {
 				v.Name = displayBase(p.Path)
 			}
+			if v.PID == 0 {
+				v.PID = p.PID
+			}
+			if v.PPID == 0 {
+				v.PPID = p.PPID
+			}
 		}
+		liveApplied := map[int]bool{}
 		for _, m := range live[key] {
 			if i := savedFor(m.Name, m.Path); i >= 0 {
 				v := &list[i]
@@ -199,19 +267,27 @@ func buildRuleMembers(cfg *config.Config, stats map[string]engine.RuleStat, live
 				if m.Name != "" {
 					v.Name = m.Name
 				}
+				v.applyLive(m, liveApplied[i])
+				liveApplied[i] = true
 				continue
 			}
 			// A process the auto matcher already attributed keeps its auto
-			// row; a live match only confirms it is running.
+			// row; a live match confirms it and fills in its identity.
 			if i := autoFor(m.Name, m.Path); i >= 0 {
-				list[i].Alive = true
+				v := &list[i]
+				v.Alive = true
+				v.applyLive(m, liveApplied[i])
+				liveApplied[i] = true
 				continue
 			}
 			name := m.Name
 			if name == "" {
 				name = displayBase(m.Path)
 			}
-			list = append(list, ruleMemberView{Name: name, Path: m.Path, Kind: memberKind(m.Kind), Alive: true})
+			v := ruleMemberView{Name: name, Path: m.Path, Kind: memberKind(m.Kind), Alive: true}
+			v.applyLive(m, false)
+			liveApplied[len(list)] = true
+			list = append(list, v)
 		}
 		for _, p := range stats[key].Procs {
 			if p.Kind == rules.MatchExact {
@@ -262,6 +338,7 @@ func buildRuleMembers(cfg *config.Config, stats map[string]engine.RuleStat, live
 		if len(list) == 0 {
 			continue
 		}
+		sanitizeParents(list)
 		sortRuleMembers(list)
 		out[key] = list
 	}
@@ -269,6 +346,62 @@ func buildRuleMembers(cfg *config.Config, stats map[string]engine.RuleStat, live
 		return nil
 	}
 	return out
+}
+
+// sanitizeParents clears any ParentKey that names no row of the same list,
+// names the row itself, or closes a cycle. The page must always receive a
+// valid forest, even when a saved companion and a live process disagree about
+// who is whose parent.
+func sanitizeParents(list []ruleMemberView) {
+	if len(list) == 0 {
+		return
+	}
+	byKey := make(map[string]int, len(list))
+	for i := range list {
+		k := procKey(list[i].Path, list[i].Name)
+		if k == "" {
+			continue
+		}
+		if _, ok := byKey[k]; !ok {
+			byKey[k] = i
+		}
+	}
+	// Detect on the original keys first, then clear: clearing a link while
+	// walking would hide the rest of a cycle from the entries above it.
+	bad := make([]bool, len(list))
+	for i := range list {
+		k := list[i].ParentKey
+		if k == "" {
+			continue
+		}
+		j, ok := byKey[k]
+		if !ok || j == i {
+			bad[i] = true
+			continue
+		}
+		seen := map[int]bool{}
+		for cur := i; ; {
+			if seen[cur] {
+				bad[i] = true
+				break
+			}
+			seen[cur] = true
+			pk := list[cur].ParentKey
+			if pk == "" {
+				break
+			}
+			next, ok := byKey[pk]
+			if !ok {
+				break // the dangling row clears itself on its own turn
+			}
+			cur = next
+		}
+	}
+	for i := range list {
+		if bad[i] {
+			list[i].ParentKey, list[i].ParentPID = "", 0
+		}
+	}
 }
 
 // memberKind normalizes an engine or live match kind for the page.

@@ -6,12 +6,22 @@
 const AP_GROUP_PRESETS = ["Связь и звонки", "Мессенджеры", "Рабочие инструменты", "Браузеры", "Игры"];
 let apQuery = "";
 let apSelected = new Set(); // rule indices chosen for grouping
-let apOpen = ""; // open popover: "route:r3", "menu:r3", "route:g:Name", "menu:g:Name"
-let apDrag = null; // unit key being dragged
+// apOpen is the open popover, keyed by a stable target so a reordered list
+// still finds its rule: "route:r:<key>", "menu:r:<key>", "route:g:<name>",
+// "menu:g:<name>". The popover itself lives in #ap-portal, never in a card.
+let apOpen = "";
 // apTele holds each row's live telemetry markup. Rows carry an empty cell
 // that is filled in place, so traffic updating every second does not
 // rebuild the list (that used to swallow clicks).
 let apTele = {};
+// apHotUntil keeps a rule in the active tier for 2.5 s after its last flow:
+// a brief pause in traffic must not move a card up and down every tick.
+const apHotUntil = new Map();
+// apExpandedShells holds rule keys whose folded service shells are shown.
+const apExpandedShells = new Set();
+// AP_QUIET_SHELLS are helper shells that rarely deserve a row of their own:
+// two or more dormant ones fold into one summary line.
+const AP_QUIET_SHELLS = new Set(["cmd.exe", "conhost.exe", "powershell.exe", "pwsh.exe", "wscript.exe", "cscript.exe", "openconsole.exe", "crashpad_handler.exe", "werfault.exe"]);
 // apExpanded holds rule keys whose companion/child list is open. It is a
 // view setting only and is never saved to config.json.
 const apExpanded = new Set();
@@ -126,8 +136,9 @@ function apEffective(r) {
   };
 }
 
-// Units are what the list shows and moves: a standalone rule or a whole
-// group, in config order. A group sits where its first rule is.
+// Units are what the list shows: a standalone rule or a whole group, in
+// config order. A group sits where its first rule is. stableKey names the
+// unit's DOM node across redraws, so a live update never rebuilds it.
 function apUnits() {
   const rules = cfg().rules || [];
   const units = [];
@@ -136,20 +147,10 @@ function apUnits() {
     if (r.group && apGroup(r.group)) {
       if (seen.has(r.group)) return;
       seen.add(r.group);
-      units.push({ key: "g:" + r.group, group: apGroup(r.group), members: rules.map((x, j) => (x.group === r.group ? j : -1)).filter((j) => j >= 0) });
-    } else units.push({ key: "r:" + i, index: i });
+      units.push({ key: "g:" + r.group, stableKey: "g:" + r.group, group: apGroup(r.group), members: rules.map((x, j) => (x.group === r.group ? j : -1)).filter((j) => j >= 0) });
+    } else units.push({ key: "r:" + i, stableKey: "r:" + apKey(r.process), index: i });
   });
   return units;
-}
-// apFlatten rewrites cfg().rules from units, keeping group members together.
-function apFlatten(units) {
-  const rules = cfg().rules;
-  const out = [];
-  units.forEach((u) => {
-    if (u.group) u.members.forEach((j) => out.push(rules[j]));
-    else out.push(rules[u.index]);
-  });
-  cfg().rules = out;
 }
 
 // apPruneGroups drops groups that no rule belongs to any more. An empty
@@ -201,11 +202,11 @@ function apRouteBadge(target, action, proxy, bad) {
   const p = (cfg().proxies || []).find((x) => x.name === proxy);
   const t = apRouteText(action, proxy);
   const ep = action === "proxy" ? (p ? proxyAddrText(p) : "не выбран") : "";
-  const open = apOpen === "route:" + target;
   const label = action === "proxy" ? (proxy || "не выбран") : t.kind;
   const tip = action === "proxy" ? `${proxy} · ${t.kind} · ${ep}` : t.kind;
-  return `<div class="ap-pop-wrap"><button class="ap-route k-${apRouteKind(action, p)}${bad ? " bad" : ""}" type="button" data-act="ap-route" data-target="${esc(target)}" title="${esc(tip)}">${apRouteIcon(action, p)}<b>${esc(label)}</b>${icon("chev", 12)}</button>${open ? apRoutePopover(target, action, proxy) : ""}</div>`;
+  return `<div class="ap-pop-wrap"><button class="ap-route k-${apRouteKind(action, p)}${bad ? " bad" : ""}" type="button" data-act="ap-route" data-target="${esc(target)}" title="${esc(tip)}">${apRouteIcon(action, p)}<b>${esc(label)}</b>${icon("chev", 12)}</button></div>`;
 }
+// apRoutePopover is drawn in #ap-portal by apRenderPortal.
 function apRoutePopover(target, action, proxy) {
   const items = apRoutes().map((r) => {
     const on = r.action === action && (r.action !== "proxy" || r.proxy === proxy);
@@ -220,7 +221,7 @@ function apRoutePopover(target, action, proxy) {
     return `<button type="button" class="${on ? "on" : ""}" data-act="ap-route-set" data-target="${esc(target)}" data-action="${r.action}" data-proxy="${esc(r.proxy)}"><span class="ri k-${apRouteKind(r.action, r.p)}">${apRouteIcon(r.action, r.p)}</span><span class="txt"><span class="nm">${esc(name)}</span><span class="sub">${esc(sub)}</span></span><span class="end">${side}${on ? icon("check", 14) : ""}</span></button>`;
   }).join("");
   const title = target.startsWith("g:") ? "Назначить прокси группе" : "Назначить прокси";
-  return `<div class="ap-pop route"><div class="cap">${title}</div>${items}${(cfg().proxies || []).length ? "" : `<button type="button" data-act="goto" data-page="proxies"><span class="ri">${icon("plus", 14)}</span><span class="txt"><span class="nm">Добавить прокси</span></span></button>`}</div>`;
+  return `<div class="ap-pop route portal"><div class="cap">${title}</div>${items}${(cfg().proxies || []).length ? "" : `<button type="button" data-act="goto" data-page="proxies"><span class="ri">${icon("plus", 14)}</span><span class="txt"><span class="nm">Добавить прокси</span></span></button>`}</div>`;
 }
 
 // ---------- telemetry ----------
@@ -237,6 +238,33 @@ function apStat(r) {
 function apRate(n) {
   // "132,0 КБ" -> "132 КБ": the rate column stays narrow.
   return bytes(n || 0).replace(/,0 /, " ") + "/с";
+}
+// apRuleTier orders a rule inside «Активные правила»:
+//   0 — traffic is flowing right now,
+//   1 — the app runs and waits for incoming traffic,
+//   2 — the app is not running.
+// A rule that just went quiet stays in tier 0 for 2.5 s (apHotUntil), so a
+// short pause does not make the card jump up and down every poll.
+function apRuleTier(r, now) {
+  const k = apKey(r.process);
+  const alive = apAlive(r);
+  const st = apStat(r);
+  const flows = (st && st.flows) || 0;
+  if (!alive) { apHotUntil.delete(k); return 2; }
+  if (flows > 0) { apHotUntil.set(k, now + 2500); return 0; }
+  if ((apHotUntil.get(k) || 0) > now) return 0;
+  return 1;
+}
+// apUnitTier is a group's tier: its best enabled member's.
+function apUnitTier(u, now) {
+  const rules = cfg().rules || [];
+  if (!u.group) return apRuleTier(rules[u.index], now);
+  const tiers = u.members.map((j) => rules[j]).filter((r) => r && apOn(r.enabled)).map((r) => apRuleTier(r, now));
+  return tiers.length ? Math.min(...tiers) : 2;
+}
+// apUnitSortName is the display name units are sorted by.
+function apUnitSortName(u) {
+  return u.group ? u.group.name : apLabel((cfg().rules || [])[u.index].process);
 }
 // apStatus describes a rule's state for its dot, badge and telemetry.
 function apStatus(r) {
@@ -258,11 +286,11 @@ function apStatus(r) {
       error: st.error,
     };
   }
+  if (!apAlive(r)) return { dot: "ok idle", line: "Не запущено", sub: "Правило сработает при запуске" };
   if (st && st.flows) {
     return { dot: "ok", flows: st.flows, down: st.downRate, up: st.upRate, sub: bytes((st.up || 0) + (st.down || 0)) };
   }
-  if (!apAlive(r)) return { dot: "ok idle", line: "Не запущено", sub: "Правило сработает при запуске" };
-  return { dot: "ok idle", line: "Нет соединений", sub: st && (st.up || st.down) ? bytes(st.up + st.down) + " за сессию" : "Ждёт подключений приложения" };
+  return { dot: "ok wait", line: "Ждёт входящий трафик", sub: st && (st.up || st.down) ? bytes(st.up + st.down) + " за сессию" : "Запущено в фоне" };
 }
 function apTelemetry(s) {
   if (s.flows) {
@@ -274,7 +302,7 @@ function apTelemetry(s) {
 // ---------- page ----------
 
 function appsHTML() {
-  return `<div class="head"><div><h1>Приложения</h1><p class="sub">Правила проверяются сверху вниз. Остальные программы работают напрямую.</p></div>
+  return `<div class="head"><div><h1>Приложения</h1><p class="sub">Выберите программы для маршрутизации. Остальные приложения работают напрямую.</p></div>
   <div class="head-actions"><label class="field search ap-search">${icon("search")}<input id="ap-q" placeholder="Поиск" value="${esc(apQuery)}" autocomplete="off"></label>
   <button class="btn secondary" data-act="ap-windows" type="button">${icon("window")}Из окон</button>
   <button class="btn pri" data-act="ap-add" type="button">${icon("plus")}Добавить</button>${headMore()}</div></div>
@@ -292,54 +320,393 @@ function apSelectable(r) {
   return !(r.group && apGroup(r.group)) && apOn(r.enabled) && apMatches(r);
 }
 
+// apSkeletonHTML is the stable frame of the Apps tab. It is mounted once:
+// a poll then only moves units inside the two lists and patches their live
+// telemetry cells, so icons, hover, focus and clicks survive every tick.
+function apSkeletonHTML() {
+  return `<div data-ap-top></div>
+  <div class="ap-sec" data-ap-sec="active">
+    <div class="ap-sec-h"><span class="t">Активные правила</span><span class="c" data-ap-count></span><span class="g" data-ap-groups hidden></span></div>
+    <div class="ap-list" data-ap-list="active"></div>
+    <div class="ap-none" data-ap-none="active" hidden></div>
+  </div>
+  <div class="ap-sec off" data-ap-sec="inactive">
+    <div class="ap-sec-h"><span class="t">Отключённые и неактивные</span><span class="c" data-ap-count></span><span class="note">Трафик направляется напрямую в обход прокси</span></div>
+    <div class="ap-list" data-ap-list="inactive"></div>
+    <div class="ap-none" data-ap-none="inactive" hidden></div>
+  </div>
+  <p class="hint" data-ap-hint>${icon("info", 14)} Для системных служб Windows (svchost.exe, DNS) используйте «Настройки → Системный резолвер».</p>`;
+}
+
+// setText writes only when the text changed: a poll must not touch the DOM
+// it has nothing new to say about.
+function setText(el, text) {
+  if (!el) return;
+  if (el.textContent !== text) el.textContent = text;
+}
+
 function fillApps() {
   const host = document.getElementById("ap-body");
-  if (!host || apDrag) return;
+  if (!host) return;
   const rules = cfg().rules || [];
   if (!rules.length) {
-    setHTML(host, `<div class="ap-empty"><h3>Приложений ещё нет</h3><p>Добавьте программу по названию — путь к exe найдётся сам — или выберите её среди открытых окон.</p><div class="row"><button class="btn pri" type="button" data-act="ap-add">${icon("plus")}Добавить приложение</button><button class="btn" type="button" data-act="ap-windows">${icon("window")}Из окон</button></div></div>`);
+    apClosePopover();
+    if (host._apMode !== "empty") {
+      setHTML(host, `<div class="ap-empty"><h3>Приложений ещё нет</h3><p>Добавьте программу по названию — путь к exe найдётся сам — или выберите её среди открытых окон.</p><div class="row"><button class="btn pri" type="button" data-act="ap-add">${icon("plus")}Добавить приложение</button><button class="btn" type="button" data-act="ap-windows">${icon("window")}Из окон</button></div></div>`);
+      host._apMode = "empty";
+    }
     return;
   }
+  if (host._apMode !== "list") {
+    setHTML(host, apSkeletonHTML());
+    host._apMode = "list";
+  }
+  // Snapshot before any DOM change: FLIP animates from these positions.
+  const before = apFlipSnapshot(host);
   apTele = {};
   const units = apUnits();
   const visible = units.filter((u) => u.group
     ? u.group.name.toLowerCase().includes(apQuery.trim().toLowerCase()) || u.members.some((j) => apMatches(rules[j]))
     : apMatches(rules[u.index]));
   const isOn = (u) => (u.group ? apOn(u.group.enabled) : apOn(rules[u.index].enabled));
-  // Running apps first; rules whose app is not running go to the end.
-  const live = (u) => (u.group ? u.members.some((j) => apAlive(rules[j])) : apAlive(rules[u.index]));
-  const onUnits = visible.filter(isOn);
-  const active = onUnits.filter(live).concat(onUnits.filter((u) => !live(u)));
-  const inactive = visible.filter((u) => !isOn(u));
+  const now = Date.now();
+  const byName = (a, b) => apUnitSortName(a).localeCompare(apUnitSortName(b), "ru", { sensitivity: "base" }) || a.stableKey.localeCompare(b.stableKey);
+  // Three tiers: traffic now, running and waiting, not running. Inside a
+  // tier the order is alphabetical, so a tick never shuffles equal cards.
+  const active = visible.filter(isOn).sort((a, b) => apUnitTier(a, now) - apUnitTier(b, now) || byName(a, b));
+  const inactive = visible.filter((u) => !isOn(u)).sort(byName);
   const activeCount = active.reduce((n, u) => n + (u.group ? u.members.filter((j) => apOn(rules[j].enabled)).length : 1), 0);
   const inactiveCount = inactive.reduce((n, u) => n + (u.group ? u.members.length : 1), 0);
   const groupsOn = active.filter((u) => u.group).length;
-  const sel = apSelected.size ? apSelectionBar(rules.filter(apSelectable).length) : "";
-  const body = `${ksNotice()}${apKillBanner()}${sel}
-    <div class="ap-sec"><div class="ap-sec-h"><span class="t">Активные правила</span><span class="c">${activeCount}</span>${groupsOn ? `<span class="g">(${groupsOn} ${plural(groupsOn, "группа", "группы", "групп")})</span>` : ""}</div>
-    ${active.length ? `<div class="ap-list">${active.map((u) => apUnitHTML(u)).join("")}</div>` : `<div class="ap-none">${apQuery ? "Ничего не найдено." : "Нет активных правил. Включите правило ниже или добавьте приложение."}</div>`}</div>
-    <div class="ap-sec off"><div class="ap-sec-h"><span class="t">Отключённые и неактивные</span><span class="c">${Math.max(0, inactiveCount)}</span><span class="note">Трафик направляется напрямую в обход прокси</span></div>
-    ${inactive.length ? `<div class="ap-list">${inactive.map((u) => apUnitHTML(u)).join("")}</div>` : `<div class="ap-none">Все правила включены.</div>`}</div>
-    <p class="hint">${icon("info", 14)} Перетащите карточку, чтобы изменить порядок. Для системных служб Windows (svchost.exe, DNS) используйте «Настройки → Системный резолвер».</p>`;
-  if (setHTML(host, body)) apBindDrag(host);
-  host.querySelectorAll("[data-tele]").forEach((el) => setHTML(el, apTele[el.dataset.tele] || ""));
-  apPlacePopover(host);
+
+  const top = host.querySelector("[data-ap-top]");
+  if (top) setHTML(top, ksNotice() + apKillBanner() + (apSelected.size ? apSelectionBar(rules.filter(apSelectable).length) : ""));
+
+  const secA = host.querySelector('[data-ap-sec="active"]');
+  if (secA) {
+    setText(secA.querySelector("[data-ap-count]"), String(activeCount));
+    const g = secA.querySelector("[data-ap-groups]");
+    if (g) {
+      setText(g, groupsOn ? `(${groupsOn} ${plural(groupsOn, "группа", "группы", "групп")})` : "");
+      g.hidden = !groupsOn;
+    }
+  }
+  const secB = host.querySelector('[data-ap-sec="inactive"]');
+  if (secB) setText(secB.querySelector("[data-ap-count]"), String(Math.max(0, inactiveCount)));
+
+  const listA = host.querySelector('[data-ap-list="active"]');
+  const listB = host.querySelector('[data-ap-list="inactive"]');
+  // Share existing top-level nodes across both lists so toggling a rule
+  // between Active and Inactive reuses the DOM node and FLIP-animates it.
+  const pool = new Map();
+  [listA, listB].forEach((list) => {
+    if (!list) return;
+    Array.from(list.children).forEach((el) => {
+      const k = el.dataset && el.dataset.unitKey;
+      if (k && !pool.has(k)) pool.set(k, el);
+      else el.remove();
+    });
+  });
+  if (listA) apReconcileUnits(listA, active, now, pool);
+  if (listB) apReconcileUnits(listB, inactive, now, pool);
+  pool.forEach((el) => el.remove());
+
+  const noneA = host.querySelector('[data-ap-none="active"]');
+  if (noneA) {
+    setText(noneA, apQuery ? "Ничего не найдено." : "Нет активных правил. Включите правило ниже или добавьте приложение.");
+    noneA.hidden = active.length > 0;
+  }
+  const noneB = host.querySelector('[data-ap-none="inactive"]');
+  if (noneB) {
+    setText(noneB, "Все правила включены.");
+    noneB.hidden = inactive.length > 0;
+  }
+
+  apFlipPlay(host, before);
+  apRenderPortal();
 }
 
-// apPlacePopover lifts the card that owns the open popover and opens the
-// popover upwards when it would run past the bottom of the page.
-function apPlacePopover(host) {
-  if (!host.querySelector) return;
-  const pop = host.querySelector(".ap-pop");
-  if (!pop) return;
-  const card = pop.closest(".ap-card");
-  if (card) card.classList.add("popped");
+// ---------- DOM reconciliation ----------
+
+// apReconcileUnits makes the list's children match units, reusing each
+// existing node by data-unit-key. A node whose structural markup is
+// unchanged is left completely alone; only its [data-tele] cells are
+// patched, so live traffic never rebuilds a card.
+function apReconcileUnits(list, units, now, sharedPool) {
+  const old = sharedPool || new Map();
+  if (!sharedPool) {
+    Array.from(list.children).forEach((el) => {
+      const k = el.dataset && el.dataset.unitKey;
+      if (k && !old.has(k)) old.set(k, el);
+      else el.remove();
+    });
+  }
+  const keep = new Set();
+  let prev = null;
+  units.forEach((u) => {
+    keep.add(u.stableKey);
+    let el = old.get(u.stableKey);
+    if (el && sharedPool) old.delete(u.stableKey);
+    if (!el) el = apNewUnitEl(u);
+    apUpdateUnit(el, u, now);
+    const want = prev ? prev.nextSibling : list.firstChild;
+    if (want !== el) list.insertBefore(el, want);
+    prev = el;
+  });
+  if (!sharedPool) {
+    Array.from(list.children).forEach((el) => {
+      if (!el.dataset || !el.dataset.unitKey || !keep.has(el.dataset.unitKey)) el.remove();
+    });
+  }
+}
+
+function apNewUnitEl(u) {
+  const el = document.createElement("div");
+  el.dataset.unitKey = u.stableKey;
+  el._sig = "";
+  return el;
+}
+
+function apRuleSortName(a, b) {
+  return apLabel(a.process).localeCompare(apLabel(b.process), "ru", { sensitivity: "base" }) || apKey(a.process).localeCompare(apKey(b.process));
+}
+
+function apUpdateUnit(el, u, now) {
+  const rules = cfg().rules || [];
+  if (u.group) {
+    el.className = "ap-group" + (apOn(u.group.enabled) ? "" : " dim");
+    el.dataset.key = u.group.name;
+    let card = el.querySelector("[data-ap-card]");
+    if (!card) {
+      card = document.createElement("div");
+      card.className = "ap-card group";
+      card.dataset.apCard = "";
+      el.insertBefore(card, el.firstChild);
+    }
+    const sig = apGroupCardHTML(u);
+    if (card._sig !== sig) { card.innerHTML = sig; card._sig = sig; }
+    let mem = el.querySelector("[data-ap-members]");
+    if (!u.group.collapsed) {
+      if (!mem) {
+        mem = document.createElement("div");
+        mem.className = "ap-members";
+        mem.dataset.apMembers = "";
+        el.appendChild(mem);
+      }
+      const idxs = u.members.slice().sort((a, b) => apRuleTier(rules[a], now) - apRuleTier(rules[b], now) || apRuleSortName(rules[a], rules[b]));
+      apReconcileUnits(mem, idxs.map((j) => ({ stableKey: "r:" + apKey(rules[j].process), index: j, inGroup: true })), now);
+    } else if (mem) mem.remove();
+    apPatchTele(el);
+    return;
+  }
+  const r = rules[u.index];
+  if (!r) return;
+  const key = apKey(r.process);
+  const open = !!key && apExpanded.has(key) && apRuleMembers(r).length > 0;
+  el.className = "ap-unit-wrap" + (open ? " open" : "");
+  el.dataset.key = key;
+  const sig = apRuleBodyHTML(u.index, !!u.inGroup);
+  if (el._sig !== sig) { el.innerHTML = sig; el._sig = sig; }
+  apPatchTele(el);
+}
+
+function apPatchTele(root) {
+  root.querySelectorAll("[data-tele]").forEach((el) => setHTML(el, apTele[el.dataset.tele] || ""));
+}
+
+// ---------- FLIP ----------
+
+// apFlipSnapshot remembers each unit's top edge; apFlipPlay glides a unit
+// from its old place to the new one, then clears every inline style so no
+// transform or stacking context is left behind.
+function apFlipSnapshot(host) {
+  const tops = new Map();
+  if (!host || !host.querySelectorAll) return tops;
+  if (window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches) return tops;
+  host.querySelectorAll("[data-unit-key]").forEach((el) => tops.set(el, el.getBoundingClientRect().top));
+  return tops;
+}
+
+function apFlipPlay(host, before) {
+  if (!before || !before.size) return;
+  const items = [];
+  before.forEach((oldTop, el) => {
+    if (!el.isConnected) return;
+    const dy = oldTop - el.getBoundingClientRect().top;
+    if (Math.abs(dy) < 1) return;
+    if (el._flipT) { clearTimeout(el._flipT); el._flipT = 0; }
+    el.style.transition = "none";
+    el.style.transform = "translateY(" + dy + "px)";
+    el.classList.add("ap-flipping");
+    items.push(el);
+  });
+  if (!items.length) return;
+  void host.offsetHeight;
+  requestAnimationFrame(() => {
+    items.forEach((el) => {
+      el.style.transition = "transform 280ms cubic-bezier(0.22, 1, 0.36, 1)";
+      el.style.transform = "";
+      const done = () => {
+        el.removeEventListener("transitionend", onEnd);
+        if (el._flipT) { clearTimeout(el._flipT); el._flipT = 0; }
+        el.style.transition = "";
+        el.style.transform = "";
+        el.classList.remove("ap-flipping");
+      };
+      const onEnd = (e) => { if (e.target === el && e.propertyName === "transform") done(); };
+      el.addEventListener("transitionend", onEnd);
+      el._flipT = setTimeout(done, 340);
+    });
+  });
+}
+
+// ---------- portal popovers ----------
+
+// Popovers are rendered in #ap-portal on <body>, above every card, so a
+// card's overflow or a scrolled list can never clip them. apOpen holds the
+// stable target, so a rule that moves under an open menu is still found.
+let apPortalRenderedKey = "";
+let apPortalHTML = "";
+let apPortalBound = false;
+
+function apPortalEl() {
+  let el = document.getElementById("ap-portal");
+  if (!el) {
+    el = document.createElement("div");
+    el.id = "ap-portal";
+    el.hidden = true;
+    document.body.appendChild(el);
+  }
+  return el;
+}
+
+function apClosePopover() {
+  apOpen = "";
+  apPortalRenderedKey = "";
+  apPortalHTML = "";
+  const el = document.getElementById("ap-portal");
+  if (el) { el.hidden = true; el.innerHTML = ""; }
+  apPortalUnbind();
+}
+
+function apPortalTrigger() {
+  if (!apOpen) return null;
+  const at = apOpen.indexOf(":");
+  if (at < 0) return null;
+  const kind = apOpen.slice(0, at);
+  const target = apOpen.slice(at + 1);
+  const act = kind === "route" ? "ap-route" : "ap-menu";
+  const list = document.querySelectorAll('#ap-body [data-act="' + act + '"]');
+  for (const el of list) if (el.dataset.target === target) return el;
+  return null;
+}
+
+// apRuleIndexByTarget finds the rule a "r:<key>" target names right now,
+// so an open menu survives reordering.
+function apRuleIndexByTarget(target) {
+  if (!target.startsWith("r:")) return -1;
+  const key = target.slice(2);
+  return (cfg().rules || []).findIndex((r) => apKey(r.process) === key);
+}
+
+function apPositionPortal(trigger) {
+  const portal = document.getElementById("ap-portal");
+  const pop = portal && portal.firstElementChild;
+  if (!pop || !trigger) return;
+  const r = trigger.getBoundingClientRect();
+  const popW = pop.offsetWidth;
+  const popH = pop.offsetHeight;
+  const left = Math.max(8, Math.min(r.right - popW, window.innerWidth - popW - 8));
+  let top = r.bottom + 4;
+  if (top + popH > window.innerHeight - 8) top = Math.max(8, r.top - popH - 4);
+  pop.style.left = left + "px";
+  pop.style.top = top + "px";
+}
+
+function apPortalOnScroll() {
+  if (!apOpen) return;
+  const trigger = apPortalTrigger();
+  if (!trigger) { apClosePopover(); return; }
   const scroller = document.getElementById("page");
-  if (!scroller || !pop.getBoundingClientRect) return;
-  const box = scroller.getBoundingClientRect();
-  const r = pop.getBoundingClientRect();
-  const room = r.top - box.top;
-  if (r.bottom > box.bottom - 8 && room > r.height + 48) pop.classList.add("up");
+  if (scroller) {
+    const sb = scroller.getBoundingClientRect();
+    const tr = trigger.getBoundingClientRect();
+    if (tr.bottom < sb.top || tr.top > sb.bottom) { apClosePopover(); return; }
+  }
+  apPositionPortal(trigger);
+}
+
+function apPortalBind() {
+  if (apPortalBound) return;
+  apPortalBound = true;
+  const scroller = document.getElementById("page");
+  if (scroller) scroller.addEventListener("scroll", apPortalOnScroll, { passive: true });
+  window.addEventListener("resize", apPortalOnScroll);
+}
+
+function apPortalUnbind() {
+  if (!apPortalBound) return;
+  apPortalBound = false;
+  const scroller = document.getElementById("page");
+  if (scroller) scroller.removeEventListener("scroll", apPortalOnScroll);
+  window.removeEventListener("resize", apPortalOnScroll);
+}
+
+// apRenderPortal draws the open menu or route picker into #ap-portal.
+// Telemetry ticks re-enter here every 500 ms: identical markup is not
+// touched at all, changed markup is swapped with `steady` so the opening
+// animation never replays.
+function apRenderPortal() {
+  if (!apOpen || page !== "rules") {
+    const el = document.getElementById("ap-portal");
+    if (el) { el.hidden = true; el.innerHTML = ""; }
+    apPortalRenderedKey = "";
+    apPortalHTML = "";
+    apPortalUnbind();
+    return;
+  }
+  const trigger = apPortalTrigger();
+  if (!trigger) { apClosePopover(); return; }
+  const at = apOpen.indexOf(":");
+  const kind = apOpen.slice(0, at);
+  const target = apOpen.slice(at + 1);
+  let html = "";
+  if (kind === "route") {
+    const route = apTargetRoute(target);
+    if (!route) { apClosePopover(); return; }
+    html = apRoutePopover(target, route.action, route.proxy);
+  } else if (target.startsWith("g:")) {
+    const g = apGroup(target.slice(2));
+    if (!g) { apClosePopover(); return; }
+    html = apGroupMenu(g);
+  } else {
+    const idx = apRuleIndexByTarget(target);
+    if (idx < 0) { apClosePopover(); return; }
+    const r = cfg().rules[idx];
+    html = apRuleMenu(idx, !!(r.group && apGroup(r.group)));
+  }
+  const el = apPortalEl();
+  const sameKey = apPortalRenderedKey === apOpen;
+  if (!(sameKey && apPortalHTML === html)) {
+    el.innerHTML = html;
+    const pop = el.firstElementChild;
+    if (pop && sameKey) pop.classList.add("steady");
+    apPortalHTML = html;
+  }
+  apPortalRenderedKey = apOpen;
+  el.hidden = false;
+  apPortalBind();
+  apPositionPortal(trigger);
+}
+
+// apTargetRoute is the route shown in the picker for a target.
+function apTargetRoute(target) {
+  if (target.startsWith("g:")) {
+    const g = apGroup(target.slice(2));
+    return g ? { action: g.action, proxy: g.proxy || "" } : null;
+  }
+  const r = (cfg().rules || [])[apRuleIndexByTarget(target)];
+  return r ? { action: r.action, proxy: r.proxy || "" } : null;
 }
 
 function apKillBanner() {
@@ -359,10 +726,6 @@ function apKillBanner() {
 function apSelectionBar(selectable) {
   return `<div class="ap-selbar">${icon("folder", 16)}<div class="txt"><div><b>Выбрано правил: ${apSelected.size}</b> · <button type="button" class="link" data-act="ap-sel-all">Выбрать все активные (${selectable})</button> · <button type="button" class="link dim" data-act="ap-sel-none">Снять выбор</button></div><p>Сгруппируйте их: общий тумблер и один маршрут для всех.</p></div>
   <button class="btn" type="button" data-act="ap-sel-none">Отмена</button><button class="btn pri" type="button" data-act="ap-group-new">${icon("folder", 14)}Сгруппировать (${apSelected.size})</button></div>`;
-}
-
-function apUnitHTML(u) {
-  return u.group ? apGroupHTML(u) : apRuleHTML(u.index, false);
 }
 
 function apPath(process) {
@@ -451,8 +814,11 @@ function apGeneralizeCompanion(ruleIdx, pattern, mask) {
   return apSave(`Путь ${apLabel(mask)} обобщён для обновлений`);
 }
 
-function apRuleHTML(i, inGroup) {
+// apRuleBodyHTML is a rule unit's inner markup: its card, the companion
+// drawer and the hint bar. The wrapper around it is kept across redraws.
+function apRuleBodyHTML(i, inGroup) {
   const r = cfg().rules[i];
+  if (!r) return "";
   const s = apStatus(r);
   const eff = apEffective(r);
   const selected = apSelected.has(i);
@@ -461,50 +827,192 @@ function apRuleHTML(i, inGroup) {
   const open = !!key && apExpanded.has(key);
   // Grouped rules take the group's selection, route and switch.
   const check = inGroup ? "" : `<button class="ap-check${selected ? " on" : ""}" type="button" data-act="ap-select" data-i="${i}" title="${selected ? "Снять выбор" : "Выбрать правило для группировки"}" aria-pressed="${selected}">${selected ? icon("check", 12) : ""}</button>`;
-  const route = inGroup ? "" : apRouteBadge("r" + i, r.action, r.proxy || "", s.bad);
+  const route = inGroup ? "" : apRouteBadge("r:" + key, r.action, r.proxy || "", s.bad);
   apTele["r" + i] = apTelemetry(s);
   const pill = members.length
     ? `<button type="button" class="ap-sub-pill${open ? " open" : ""}" data-act="ap-sub-toggle" data-i="${i}" title="Показать связанные и дочерние процессы">${icon("chevr", 12)}<span>+${members.length} ${apProcWord(members.length)}</span></button>`
     : "";
-  const card = `<div class="ap-card${eff.enabled ? "" : " dim"}${inGroup ? " member" : ""}${selected ? " picked" : ""}" draggable="${inGroup ? "false" : "true"}" data-unit="r:${i}">
+  const card = `<div class="ap-card${eff.enabled ? "" : " dim"}${inGroup ? " member" : ""}${selected ? " picked" : ""}">
     <div class="ap-left">${inGroup ? "" : `<span class="ap-slot">${check}</span>`}<span class="ap-ic">${appIconHTML(apPath(r.process))}<i class="ap-dot ${s.dot}" title="${esc(s.error || (s.flows ? "Трафик идёт через прокси" : s.line))}"></i></span>
       <div class="ap-name"><div class="nm"><span>${esc(apLabel(r.process))}</span>${s.badge ? `<em class="bad">${esc(s.badge)}</em>` : ""}${apVersionBadge(r) ? `<em class="ver" title="Путь содержит папку версии: после обновления приложения правило перестанет совпадать. Обобщить — в меню правила.">версия</em>` : ""}${pill}</div>
       <div class="sub"><span class="path">${esc(apPath(r.process))}</span></div></div></div>
     <div class="ap-tele" data-tele="r${i}"></div>
     <div class="ap-routecell">${route}</div>
     <div class="ap-right">${apSwitch("ap-toggle", `data-i="${i}"`, apOn(r.enabled), apOn(r.enabled) ? "Выключить правило" : "Включить правило")}
-    <div class="ap-pop-wrap"><button class="ap-more" type="button" data-act="ap-menu" data-target="r${i}" aria-label="Параметры правила" title="Дополнительные параметры правила">${icon("more")}</button>${apOpen === "menu:r" + i ? apRuleMenu(i, inGroup) : ""}</div></div>
+    <button class="ap-more" type="button" data-act="ap-menu" data-target="r:${esc(key)}" aria-label="Параметры правила" title="Дополнительные параметры правила">${icon("more")}</button></div>
   </div>`;
   const sub = open && members.length ? apSubListHTML(i, members) : "";
   const hint = apRuleHintHTML(i, key);
-  return `<div class="ap-unit-wrap${open && members.length ? " open" : ""}" data-key="${esc(key)}">${card}${sub}${hint}</div>`;
+  return card + sub + hint;
 }
 
-// apSubListHTML is the drawer under a rule: its saved companions, the
-// processes the auto matcher found, and those it catches. It is a view of
-// live data, not part of config, except the exclude list, which the user
-// edits here.
+// ---------- process tree ----------
+
+// apMemberTree builds the real parent→child forest from the server's member
+// list (parentKey / parentPid, falling back to ppid). A member whose parent
+// is not in the list is a root; a cycle cannot hang the render.
+function apMemberTree(members) {
+  const nodes = members.map((m, idx) => ({
+    m,
+    idx,
+    key: apProcKey(m.path, m.name),
+    pid: Number(m.pid) || 0,
+    children: [],
+    parent: null,
+  }));
+  const byKey = new Map();
+  const byPid = new Map();
+  for (const n of nodes) {
+    if (n.key && !byKey.has(n.key)) byKey.set(n.key, n);
+    if (n.pid > 0 && !byPid.has(n.pid)) byPid.set(n.pid, n);
+  }
+  for (const n of nodes) {
+    const m = n.m;
+    let p = null;
+    const pk = m.parentKey ? apProcKey(m.parentKey, "") : "";
+    if (pk) p = byKey.get(pk) || null;
+    if (!p) {
+      const pp = Number(m.parentPid) || 0;
+      if (pp > 0) p = byPid.get(pp) || null;
+    }
+    if (p === n) p = null;
+    n.parent = p;
+  }
+  // Cycle guard: a node whose ancestor chain returns to it becomes a root.
+  for (const n of nodes) {
+    const seen = new Set([n]);
+    let p = n.parent;
+    while (p) {
+      if (seen.has(p)) { n.parent = null; break; }
+      seen.add(p);
+      p = p.parent;
+    }
+  }
+  const roots = [];
+  for (const n of nodes) {
+    if (n.parent) n.parent.children.push(n); else roots.push(n);
+  }
+  return roots;
+}
+
+function apMemberName(m) {
+  return m.name || apLabel(m.path || m.pattern || "");
+}
+
+// Signal first: flowing traffic, then saved companions / auto matches, then
+// live processes by bytes, then offline shells by name.
+function apMemberRank(m) {
+  if ((m.flows || 0) > 0) return 0;
+  if (m.kind === "companion" || m.kind === "auto") return 1;
+  if (m.alive) return 2;
+  return 3;
+}
+function apCompareMembers(a, b) {
+  const ra = apMemberRank(a.m);
+  const rb = apMemberRank(b.m);
+  if (ra !== rb) return ra - rb;
+  const ma = a.m;
+  const mb = b.m;
+  if (ra === 0) {
+    const d = (mb.flows || 0) - (ma.flows || 0);
+    if (d) return d;
+    return ((mb.up || 0) + (mb.down || 0)) - ((ma.up || 0) + (ma.down || 0));
+  }
+  if (ra === 2) {
+    const d = ((mb.up || 0) + (mb.down || 0)) - ((ma.up || 0) + (ma.down || 0));
+    if (d) return d;
+  }
+  return apMemberName(ma).localeCompare(apMemberName(mb), "ru", { sensitivity: "base" }) ||
+    apProcKey(ma.path, ma.name).localeCompare(apProcKey(mb.path, mb.name));
+}
+function apSortTree(nodes) {
+  nodes.sort(apCompareMembers);
+  for (const n of nodes) apSortTree(n.children);
+}
+
+// apQuietLeaf marks a dormant service shell that has nothing under it:
+// those fold into one summary line when there are two or more.
+function apQuietLeaf(n) {
+  if (n.children.length) return false;
+  const m = n.m;
+  if (m.kind === "companion" || m.kind === "auto") return false;
+  if ((m.flows || 0) > 0 || (m.up || 0) + (m.down || 0) > 0) return false;
+  return AP_QUIET_SHELLS.has(baseName(m.path || m.name || "").toLowerCase());
+}
+// apQuietShell marks every service shell row for muted styling, folded or
+// not; a shell with live children stays in place and is only muted.
+function apQuietShell(n) {
+  const m = n.m;
+  if (m.kind === "companion" || m.kind === "auto") return false;
+  return AP_QUIET_SHELLS.has(baseName(m.path || m.name || "").toLowerCase());
+}
+
+// apFlattenTree turns the forest into rows with their connector guides.
+// Ancestor columns are "pipe" (a sibling continues) or "empty" (the last
+// sibling above is closed); the node's own connector is "mid" or "last".
+function apFlattenTree(nodes, guides, rows, skip) {
+  const vis = skip ? nodes.filter((n) => !skip.has(n)) : nodes;
+  vis.forEach((n, i) => {
+    const last = i === vis.length - 1;
+    rows.push({ node: n, guides: guides.concat([last ? "last" : "mid"]) });
+    if (n.children.length) apFlattenTree(n.children, guides.concat([last ? "empty" : "pipe"]), rows, skip);
+  });
+}
+function apGuidesHTML(guides) {
+  // Very deep trees stop growing columns; the nearest ancestors stay.
+  const g = guides.length > 4 ? guides.slice(guides.length - 4) : guides;
+  return g.map((k) => `<i class="ap-tc ${k}"></i>`).join("");
+}
+
+// apSubListHTML is the drawer under a rule: the live process tree with its
+// saved companions, the processes the auto matcher found, and the exclude
+// list, which the user edits here.
 function apSubListHTML(i, members) {
   const r = (cfg().rules || [])[i];
+  const ruleKey = r ? apKey(r.process) : "";
+  const expandedShells = apExpandedShells.has(ruleKey);
+  const roots = apMemberTree(members);
+  apSortTree(roots);
+  const quiet = [];
+  const collect = (nodes) => nodes.forEach((n) => { if (apQuietLeaf(n)) quiet.push(n); collect(n.children); });
+  collect(roots);
+  const fold = quiet.length >= 2 && !expandedShells;
+  const skip = fold ? new Set(quiet) : null;
+  const rows = [];
+  apFlattenTree(roots, [], rows, skip);
   const ex = r && Array.isArray(r.exclude_companions) ? r.exclude_companions : [];
   const exHTML = ex.length
     ? `<div class="ap-sub-excluded"><span class="lbl">Исключены:</span>${ex.map((pat) => `<button type="button" class="ap-sub-excl-chip" data-act="ap-sub-unexclude" data-i="${i}" data-pat="${esc(pat)}" title="Вернуть в авто-подхват: ${esc(pat)}">${esc(apLabel(pat))} ×</button>`).join("")}</div>`
     : "";
-  return `<div class="ap-sublist">${members.map((m, idx) => apSubRowHTML(i, m, idx)).join("")}
+  let quietBar = "";
+  if (quiet.length >= 2) {
+    if (fold) {
+      const names = quiet.map((n) => apMemberName(n.m)).join(", ");
+      quietBar = `<button type="button" class="ap-sub-quiet-bar" data-act="ap-sub-shells" data-key="${esc(ruleKey)}" title="${esc(names)}">${icon("chevr", 11)}<span>${quiet.length} ${plural(quiet.length, "служебный", "служебных", "служебных")}: ${esc(names)}</span></button>`;
+    } else {
+      quietBar = `<button type="button" class="ap-sub-quiet-bar open" data-act="ap-sub-shells" data-key="${esc(ruleKey)}">${icon("chevr", 11)}<span>Скрыть служебные (${quiet.length})</span></button>`;
+    }
+  }
+  const rowsHTML = rows.map((row) => apSubRowHTML(i, row.node.m, row, apQuietShell(row.node))).join("");
+  return `<div class="ap-sublist">${rowsHTML}${quietBar}
     <button type="button" class="ap-sub-add" data-act="ap-companions" data-i="${i}">${icon("plus", 14)}Подключить процесс / Найти трафик…</button>${exHTML}</div>`;
 }
-function apSubRowHTML(i, m, idx) {
+
+function apSubRowHTML(i, m, row, quiet) {
   const kind = m.kind === "companion" || m.kind === "folder" || m.kind === "auto" ? m.kind : "child";
   const origin = kind === "companion" ? "привязан" : kind === "folder" ? "папка" : kind === "auto" ? "авто" : "дочерний";
-  const label = m.name || apLabel(m.path || m.pattern || "");
+  const label = apMemberName(m);
   const full = m.path || m.pattern || m.name || "";
+  const hot = (m.flows || 0) > 0;
+  const cls = hot ? "hot" : m.alive ? "alive" : "off";
   let stateText;
-  if (m.flows > 0 || (m.up || 0) + (m.down || 0) > 0) {
+  if (hot || (m.up || 0) + (m.down || 0) > 0) {
     stateText = `${m.flows ? m.flows + " пот. · " : ""}${fmtBytes((m.up || 0) + (m.down || 0))}`;
   } else stateText = m.alive ? "запущен" : "не запущен";
   // Live traffic goes into apTele so an open drawer updates in place without
-  // rebuilding #ap-body every second (which would swallow clicks).
-  const teleKey = `m:${i}:${idx}`;
+  // rebuilding #ap-body every tick (which would swallow clicks).
+  const ruleKey = apKey((cfg().rules || [])[i].process);
+  const teleKey = `m:${ruleKey}:${apProcKey(m.path, m.name)}:${m.pid || 0}`;
   apTele[teleKey] = esc(stateText);
   const maskBtn = kind === "companion" && m.mask
     ? `<button type="button" class="ap-sub-mask" data-act="ap-sub-mask" data-i="${i}" data-pat="${esc(m.pattern || m.path || m.name || "")}" data-mask="${esc(m.mask)}" title="Обобщить путь для обновлений: ${esc(m.mask)}">версия</button>`
@@ -518,11 +1026,15 @@ function apSubRowHTML(i, m, idx) {
   const originHTML = kind === "auto"
     ? `<em class="ap-origin auto" title="${esc(m.reason || "Найден автоматически")}">${origin}</em>`
     : `<em class="ap-origin ${kind === "companion" ? "bound" : kind === "folder" ? "folder" : "child"}">${origin}</em>`;
-  return `<div class="ap-sub-row">
-    <span class="ap-sub-ic">${appIconHTML(full, "width:20px;height:20px;border-radius:6px;font-size:9px")}</span>
-    <span class="ap-sub-nm" title="${esc(full)}">${esc(label)}</span>
+  const count = Number(m.count) || 0;
+  const tip = full + (m.pid ? ` · PID ${m.pid}` : "");
+  return `<div class="ap-sub-row ${cls}${quiet ? " quiet-shell" : ""}">
+    <span class="ap-tree-guides" aria-hidden="true">${apGuidesHTML(row.guides)}</span>
+    <i class="ap-sub-dot ${cls}"></i>
+    <span class="ap-sub-ic">${appIconHTML(full, "width:14px;height:14px;border-radius:3px;font-size:8px")}</span>
+    <span class="ap-sub-nm" title="${esc(tip)}">${esc(label)}${count > 1 ? `<span class="ap-sub-cnt">×${count}</span>` : ""}</span>
     ${originHTML}
-    <span class="ap-sub-traffic" data-tele="${teleKey}"></span>
+    <span class="ap-sub-traffic${hot ? " hot" : ""}" data-tele="${esc(teleKey)}"></span>
     ${maskBtn}${exclude}${remove}
   </div>`;
 }
@@ -557,22 +1069,22 @@ function apRuleMenu(i, inGroup) {
   const ksDefault = r.killSwitch === undefined || r.killSwitch === null;
   const box = (on) => `<span class="box${on ? " on" : ""}">${icon(on ? "checkbox" : "square", 16)}</span>`;
   const g = inGroup ? apGroup(r.group) : null;
-  return `<div class="ap-pop menu"><div class="cap">Параметры правила</div>
+  return `<div class="ap-pop menu portal"><div class="cap">Параметры правила</div>
     ${g ? `<button type="button" data-act="ap-ungroup-one" data-i="${i}">${icon("folder", 14)}<span class="txt"><span class="nm">Исключить из группы «${esc(g.name)}»</span></span></button><div class="sep"></div>` : ""}
     <button type="button" data-act="ap-children" data-i="${i}"><span class="txt"><span class="nm">Проксировать дочерние процессы</span><span class="sub">Помощники, обновления, игры из лаунчера</span></span>${box(r.children !== false)}</button>
     <button type="button" data-act="ap-companions" data-i="${i}">${icon("branch", 14)}<span class="txt"><span class="nm">Связанные процессы / Найти трафик…</span><span class="sub">Привязать помощника, который ходит в сеть напрямую</span></span></button>
     <button type="button" data-act="ap-ks" data-i="${i}"><span class="txt"><span class="nm">Kill switch</span><span class="sub">${ksDefault ? "Как в настройках" : "Своя настройка"} · без прокси — без сети</span></span>${box(apRuleKS(r))}</button>
     <div class="ap-proto"><span>Протокол маршрутизации</span><div class="seg"><button type="button" class="${r.tcpOnly ? "" : "on"}" data-act="ap-proto" data-i="${i}" data-value="all">TCP + UDP</button><button type="button" class="${r.tcpOnly ? "on" : ""}" data-act="ap-proto" data-i="${i}" data-value="tcp">Только TCP</button></div></div>
     <div class="sep"></div>
-    <button type="button" data-act="ap-up" data-i="${i}">${icon("up", 14)}<span class="txt"><span class="nm">Выше</span></span></button>
-    <button type="button" data-act="ap-down" data-i="${i}">${icon("down", 14)}<span class="txt"><span class="nm">Ниже</span></span></button>
     ${apVersionBadge(r) ? `<button type="button" data-act="ap-generalize" data-i="${i}">${icon("edit", 14)}<span class="txt"><span class="nm">Обобщить путь для обновлений</span><span class="sub">${esc(apVersionBadge(r))}</span></span></button>` : ""}
     <button type="button" data-act="ap-edit" data-i="${i}">${icon("edit", 14)}<span class="txt"><span class="nm">Изменить путь / маску…</span></span></button>
     <button type="button" data-act="copy-text" data-text="${esc(r.process)}">${icon("copy", 14)}<span class="txt"><span class="nm">Скопировать путь</span></span></button>
     <button type="button" class="danger" data-act="ap-del" data-i="${i}">${icon("trash", 14)}<span class="txt"><span class="nm">Удалить правило</span></span></button></div>`;
 }
 
-function apGroupHTML(u) {
+// apGroupCardHTML is a group card's content. The .ap-card.group element and
+// the .ap-members container around it are kept by the reconciler.
+function apGroupCardHTML(u) {
   const g = u.group;
   const rules = cfg().rules;
   const on = apOn(g.enabled);
@@ -587,100 +1099,39 @@ function apGroupHTML(u) {
     if (st) { flows += st.flows || 0; up += st.upRate || 0; down += st.downRate || 0; total += (st.up || 0) + (st.down || 0); }
     if (apStatus(r).bad) bad = true;
   });
+  const anyAlive = members.some((r) => apOn(r.enabled) && apAlive(r));
+  const count = `${members.length} ${plural(members.length, "приложение", "приложения", "приложений")}`;
   let tele;
   if (!on) tele = `<div class="l1">Группа отключена · —</div><div class="l2">Приложения группы работают напрямую</div>`;
-  else if (g.action !== "proxy") tele = `<div class="l1">${g.action === "direct" ? "Напрямую" : "Блокируется"}</div><div class="l2">${members.length} ${plural(members.length, "приложение", "приложения", "приложений")}</div>`;
-  else if (!state.running) tele = `<div class="l1">Перехват выключен</div><div class="l2">${members.length} ${plural(members.length, "приложение", "приложения", "приложений")}</div>`;
+  else if (g.action !== "proxy") tele = `<div class="l1">${g.action === "direct" ? "Напрямую" : "Блокируется"}</div><div class="l2">${count}</div>`;
+  else if (!state.running) tele = `<div class="l1">Перехват выключен</div><div class="l2">${count}</div>`;
+  else if (!anyAlive) tele = `<div class="l1">Не запущено</div><div class="l2">Правила сработают при запуске</div>`;
   else if (flows) tele = `<div class="l1"><span class="dn">↓ ${esc(apRate(down))}</span><span class="dim">·</span><span class="up">↑ ${esc(apRate(up))}</span></div><div class="l2">${flows} ${plural(flows, "поток", "потока", "потоков")} · ${bytes(total)}</div>`;
-  else tele = `<div class="l1">Нет соединений</div><div class="l2">${members.length} ${plural(members.length, "приложение", "приложения", "приложений")} суммарно</div>`;
+  else tele = `<div class="l1">Ждёт входящий трафик</div><div class="l2">${total ? bytes(total) + " за сессию" : `${count} · в фоне`}</div>`;
   const icons = members.slice(0, 4).map((r) => `<span class="mini" title="${esc(apLabel(r.process))}">${appIconHTML(apPath(r.process), "width:16px;height:16px;font-size:8px")}</span>`).join("");
   const target = "g:" + g.name;
   apTele[target] = tele;
   const open = !g.collapsed;
-  const dot = !on ? "off" : bad ? "err" : g.action === "proxy" ? "ok" : g.action === "direct" ? "info" : "warn";
-  return `<div class="ap-group${on ? "" : " dim"}" draggable="true" data-unit="g:${esc(g.name)}">
-    <div class="ap-card group">
-      <div class="ap-left"><span class="ap-slot"><button class="ap-chev${open ? " open" : ""}" type="button" data-act="ap-collapse" data-group="${esc(g.name)}" title="${open ? "Свернуть группу" : "Развернуть группу"}">${icon("chevr", 16)}</button></span><span class="ap-folder">${icon("folder", 16)}<i class="ap-dot ${dot}"></i></span>
-        <div class="ap-name"><div class="nm"><span>${esc(g.name)}</span></div><div class="sub g"><span class="stack">${icons}</span><span class="names">${esc(members.map((r) => apLabel(r.process)).join(", "))}</span></div></div></div>
-      <div class="ap-tele" data-tele="${esc(target)}"></div>
-      <div class="ap-routecell">${apRouteBadge(target, g.action, g.proxy || "", bad)}</div>
-      <div class="ap-right">${apSwitch("ap-gtoggle", `data-group="${esc(g.name)}"`, on, on ? "Отключить всю группу правил" : "Включить всю группу правил")}
-      <div class="ap-pop-wrap"><button class="ap-more" type="button" data-act="ap-menu" data-target="${esc(target)}" aria-label="Параметры группы" title="Параметры группы">${icon("more")}</button>${apOpen === "menu:" + target ? apGroupMenu(g) : ""}</div></div>
-    </div>
-    ${open ? `<div class="ap-members">${u.members.map((j) => apRuleHTML(j, true)).join("")}</div>` : ""}
-  </div>`;
+  let dot;
+  if (!on) dot = "off";
+  else if (bad) dot = "err";
+  else if (g.action !== "proxy") dot = g.action === "direct" ? "info" : "warn";
+  else if (!state.running) dot = "off";
+  else if (!anyAlive) dot = "ok idle";
+  else if (flows) dot = "ok";
+  else dot = "ok wait";
+  return `<div class="ap-left"><span class="ap-slot"><button class="ap-chev${open ? " open" : ""}" type="button" data-act="ap-collapse" data-group="${esc(g.name)}" title="${open ? "Свернуть группу" : "Развернуть группу"}">${icon("chevr", 16)}</button></span><span class="ap-folder">${icon("folder", 16)}<i class="ap-dot ${dot}"></i></span>
+    <div class="ap-name"><div class="nm"><span>${esc(g.name)}</span></div><div class="sub g"><span class="stack">${icons}</span><span class="names">${esc(members.map((r) => apLabel(r.process)).join(", "))}</span></div></div></div>
+  <div class="ap-tele" data-tele="${esc(target)}"></div>
+  <div class="ap-routecell">${apRouteBadge(target, g.action, g.proxy || "", bad)}</div>
+  <div class="ap-right">${apSwitch("ap-gtoggle", `data-group="${esc(g.name)}"`, on, on ? "Отключить всю группу правил" : "Включить всю группу правил")}
+  <button class="ap-more" type="button" data-act="ap-menu" data-target="${esc(target)}" aria-label="Параметры группы" title="Параметры группы">${icon("more")}</button></div>`;
 }
 function apGroupMenu(g) {
-  return `<div class="ap-pop menu"><div class="cap">Группа «${esc(g.name)}»</div>
+  return `<div class="ap-pop menu portal"><div class="cap">Группа «${esc(g.name)}»</div>
     <button type="button" data-act="ap-grename" data-group="${esc(g.name)}">${icon("edit", 14)}<span class="txt"><span class="nm">Переименовать…</span></span></button>
-    <button type="button" data-act="ap-gup" data-group="${esc(g.name)}">${icon("up", 14)}<span class="txt"><span class="nm">Выше</span></span></button>
-    <button type="button" data-act="ap-gdown" data-group="${esc(g.name)}">${icon("down", 14)}<span class="txt"><span class="nm">Ниже</span></span></button>
     <button type="button" data-act="ap-gsplit" data-group="${esc(g.name)}">${icon("folder", 14)}<span class="txt"><span class="nm">Разгруппировать</span><span class="sub">Приложения станут отдельными правилами</span></span></button>
     <button type="button" class="danger" data-act="ap-gdel" data-group="${esc(g.name)}">${icon("trash", 14)}<span class="txt"><span class="nm">Удалить группу и её правила</span></span></button></div>`;
-}
-
-// ---------- reorder ----------
-
-function apMoveUnit(key, delta) {
-  const units = apUnits();
-  const at = units.findIndex((u) => u.key === key);
-  const to = at + delta;
-  if (at < 0 || to < 0 || to >= units.length) return false;
-  const [u] = units.splice(at, 1);
-  units.splice(to, 0, u);
-  apFlatten(units);
-  return true;
-}
-function apMoveRule(i, delta) {
-  const r = cfg().rules[i];
-  if (!r) return false;
-  if (!r.group) return apMoveUnit("r:" + i, delta);
-  // Inside a group: move among its members only.
-  const rules = cfg().rules;
-  const members = rules.map((x, j) => (x.group === r.group ? j : -1)).filter((j) => j >= 0);
-  const pos = members.indexOf(i);
-  const other = members[pos + delta];
-  if (other === undefined) return false;
-  [rules[i], rules[other]] = [rules[other], rules[i]];
-  return true;
-}
-function apBindDrag(host) {
-  host.querySelectorAll("[data-unit][draggable='true']").forEach((el) => {
-    el.addEventListener("dragstart", (e) => {
-      if (e.target !== el) return;
-      apDrag = el.dataset.unit;
-      el.classList.add("dragging");
-      e.dataTransfer.effectAllowed = "move";
-      e.dataTransfer.setData("text/plain", apDrag);
-    });
-    el.addEventListener("dragover", (e) => {
-      if (!apDrag || apDrag === el.dataset.unit) return;
-      e.preventDefault();
-      host.querySelectorAll(".drop-line").forEach((n) => n.classList.remove("drop-line"));
-      el.classList.add("drop-line");
-    });
-    el.addEventListener("drop", (e) => {
-      e.preventDefault();
-      const from = apDrag;
-      const to = el.dataset.unit;
-      apDrag = null;
-      if (!from || from === to) return;
-      const units = apUnits();
-      const a = units.findIndex((u) => u.key === from);
-      const b = units.findIndex((u) => u.key === to);
-      if (a < 0 || b < 0) return;
-      const [u] = units.splice(a, 1);
-      units.splice(b, 0, u);
-      apFlatten(units);
-      apSelected.clear();
-      apSave("Порядок правил изменён");
-    });
-    el.addEventListener("dragend", () => {
-      apDrag = null;
-      host.querySelectorAll(".drop-line, .dragging").forEach((n) => n.classList.remove("drop-line", "dragging"));
-      fillApps();
-    });
-  });
 }
 
 // ---------- clicks ----------
@@ -690,8 +1141,8 @@ function appsClick(id, act) {
   const rules = cfg().rules || [];
   const target = act.dataset.target || "";
   const gname = act.dataset.group || "";
-  const keepOpen = id === "ap-route" || id === "ap-menu";
-  if (!keepOpen && id !== "ap-children" && id !== "ap-ks" && id !== "ap-proto") apOpen = "";
+  const keepOpen = id === "ap-route" || id === "ap-menu" || id === "ap-children" || id === "ap-ks" || id === "ap-proto";
+  if (!keepOpen) apClosePopover();
   switch (id) {
     case "ap-add": return apOpenAdd();
     case "ap-windows": return apOpenWindows();
@@ -714,7 +1165,7 @@ function appsClick(id, act) {
         if (!proxy) delete g.proxy;
         return apSave(`Маршрут группы «${g.name}»: ${apRouteText(action, proxy).kind} ${proxy}`.trim());
       }
-      const r = rules[Number(target.slice(1))];
+      const r = rules[apRuleIndexByTarget(target)];
       if (!r) return;
       r.action = action;
       if (proxy) r.proxy = proxy; else delete r.proxy;
@@ -731,6 +1182,12 @@ function appsClick(id, act) {
       if (!r) return;
       const key = apKey(r.process);
       if (apExpanded.has(key)) apExpanded.delete(key); else apExpanded.add(key);
+      return fillApps();
+    }
+    case "ap-sub-shells": {
+      const key = act.dataset.key || "";
+      if (!key) return;
+      if (apExpandedShells.has(key)) apExpandedShells.delete(key); else apExpandedShells.add(key);
       return fillApps();
     }
     case "ap-sub-mask":
@@ -780,21 +1237,12 @@ function appsClick(id, act) {
       if (act.dataset.value === "tcp") r.tcpOnly = true; else delete r.tcpOnly;
       return apSave();
     }
-    case "ap-up":
-    case "ap-down":
-      if (apMoveRule(i, id === "ap-up" ? -1 : 1)) { apSelected.clear(); return apSave(); }
-      return fillApps();
-    case "ap-gup":
-    case "ap-gdown":
-      // The selection is by position: any reorder clears it.
-      if (apMoveUnit("g:" + gname, id === "ap-gup" ? -1 : 1)) { apSelected.clear(); return apSave(); }
-      return fillApps();
     case "ap-generalize": {
       const r = rules[i];
       const mask = r && apVersionBadge(r);
       if (!mask) return;
       r.process = mask;
-      apOpen = "";
+      apClosePopover();
       return apSave(`${apLabel(mask)}: путь обобщён для обновлений`);
     }
     case "ap-edit": return apOpenEdit(i);
@@ -847,11 +1295,11 @@ function appsClick(id, act) {
   }
 }
 
-// Close popovers on any click outside them.
+// Close the portal popover on any click outside it and its trigger.
 document.addEventListener("click", (e) => {
   if (!apOpen) return;
-  if (e.target.closest(".ap-pop") || e.target.closest("[data-act='ap-route']") || e.target.closest("[data-act='ap-menu']")) return;
-  apOpen = "";
+  if (e.target.closest(".ap-pop, #ap-portal") || e.target.closest("[data-act='ap-route']") || e.target.closest("[data-act='ap-menu']")) return;
+  apClosePopover();
   if (page === "rules") fillApps();
 });
 
@@ -1092,7 +1540,7 @@ function apOpenCompanions(i) {
     manualQ: "",
   };
   modal = m;
-  apOpen = "";
+  apClosePopover();
   renderModal();
   if (DEMO) { m.loading = false; return; }
   apLoadCompanions(m);

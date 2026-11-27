@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 	"unsafe"
 
 	"ashgate/internal/rules"
@@ -179,6 +180,94 @@ func Snapshot() []rules.Process {
 			p.PPID = entry.ParentProcessID
 		}
 		out = append(out, p)
+	}
+	return WithParents(out)
+}
+
+// fullSnapshotEvery bounds how long a cached image may survive PID reuse.
+// A fresh PID normally has a different image name or parent and is read
+// immediately; this refresh covers the improbable same-name, same-parent
+// reuse, and retries processes whose image could not be opened.
+const fullSnapshotEvery = 15 * time.Second
+
+// cachedProc is one PID as an earlier Snapshotter pass read it. skip marks a
+// process whose image could not be opened, so a protected process is not
+// retried on every tick.
+type cachedProc struct {
+	exeName string
+	ppid    uint32
+	proc    rules.Process
+	skip    bool
+}
+
+// Snapshotter lists processes incrementally. Every call walks the process
+// table once (about a millisecond, no OpenProcess), and only PIDs that are new
+// or changed since the last call are opened. That keeps a poll every 600 ms
+// cheap, unlike Snapshot, which opens every process each time.
+type Snapshotter struct {
+	mu     sync.Mutex
+	cache  map[uint32]cachedProc
+	fullAt time.Time
+}
+
+// NewSnapshotter returns a Snapshotter with an empty cache.
+func NewSnapshotter() *Snapshotter {
+	return &Snapshotter{cache: map[uint32]cachedProc{}}
+}
+
+// Snapshot returns every process with its image path and parent chain, like
+// Snapshot, reusing what a previous call already read.
+func (s *Snapshotter) Snapshot() []rules.Process {
+	snap, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
+	if err != nil {
+		return nil
+	}
+	defer windows.CloseHandle(snap)
+	var entry windows.ProcessEntry32
+	entry.Size = uint32(unsafe.Sizeof(entry))
+	if err = windows.Process32First(snap, &entry); err != nil {
+		return nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.cache == nil {
+		s.cache = map[uint32]cachedProc{}
+	}
+	needFull := time.Since(s.fullAt) >= fullSnapshotEvery
+	next := make(map[uint32]cachedProc, len(s.cache))
+	var out []rules.Process
+	for ; err == nil; err = windows.Process32Next(snap, &entry) {
+		pid := entry.ProcessID
+		if pid <= 4 {
+			continue
+		}
+		name := strings.ToLower(windows.UTF16ToString(entry.ExeFile[:]))
+		ppid := entry.ParentProcessID
+		if !needFull {
+			if c, ok := s.cache[pid]; ok && c.exeName == name && c.ppid == ppid {
+				next[pid] = c
+				if !c.skip {
+					out = append(out, c.proc)
+				}
+				continue
+			}
+		}
+		p := queryImage(pid)
+		if p.Path == "" {
+			next[pid] = cachedProc{exeName: name, ppid: ppid, skip: true}
+			continue
+		}
+		if p.PPID == 0 {
+			p.PPID = ppid
+		}
+		next[pid] = cachedProc{exeName: name, ppid: ppid, proc: p}
+		out = append(out, p)
+	}
+	// Replacing the map drops the PIDs that are gone; nothing lingers.
+	s.cache = next
+	if needFull {
+		s.fullAt = time.Now()
 	}
 	return WithParents(out)
 }
